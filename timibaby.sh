@@ -2906,15 +2906,33 @@ main_menu() {
 
 # --- 1. 定义快捷键函数 ---
 setup_shortcuts() {
+  local TARGET="/usr/local/bin/timibaby"
+
+  # 1) 优先使用软链接（立刻生效，不依赖 .bashrc）
+  if [[ -x "$TARGET" ]]; then
+    ln -sf "$TARGET" /usr/local/bin/my
+    ln -sf "$TARGET" /usr/local/bin/MY
+    ok "快捷指令 'my'/'MY' 已设置（软链接），立即生效"
+    return 0
+  fi
+
+  # 2) 兜底：写 alias 到 /root/.bashrc（需要新开 shell 才生效）
   local SCRIPT_PATH
   SCRIPT_PATH="$(command -v timibaby 2>/dev/null || echo '/usr/local/bin/timibaby')"
-  if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
-  if ! grep -q "alias my=" /root/.bashrc; then
-      echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
-      echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
-      ok "快捷指令 'my' 已设置，下次登录生效"
+  [[ -f /root/.bashrc ]] || touch /root/.bashrc
+
+  if ! grep -qE "alias (my|MY)=" /root/.bashrc; then
+    {
+      echo "alias my='$SCRIPT_PATH'"
+      echo "alias MY='$SCRIPT_PATH'"
+    } >> /root/.bashrc
+    ok "快捷指令 'my'/'MY' 已写入 /root/.bashrc（新开 shell 生效）"
   fi
+
+  # 想“当前会话立刻生效”，你可以主动 source（但仅对当前交互 shell 有意义）
+  # source /root/.bashrc 2>/dev/null || true
 }
+
 
 # --- 2. 启动执行流程 ---
 setup_shortcuts

@@ -61,7 +61,7 @@ main() {
   ln -sf "$INSTALL_PATH" /usr/local/bin/MY
 
   say "安装完成：${INSTALL_PATH}"
-  say "正在启动：sudo ${BIN_NAME}"
+  say "正在启动：${BIN_NAME}"
   exec "$INSTALL_PATH"
 }
 

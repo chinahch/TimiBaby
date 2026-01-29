@@ -2937,17 +2937,52 @@ setup_shortcuts() {
 # --- 2. 启动执行流程 ---
 setup_shortcuts
 
-# 环境基础检查
+# 环境基础检查（保留）
 if [[ ! -x "/usr/local/bin/xray" ]] || [[ ! -f "$CONFIG" ]]; then
-    echo -e "${C_PURPLE}检测到环境缺失，正在初始化...${C_RESET}"
-    ensure_dirs
-    install_dependencies
-    enable_bbr
-    install_xray_if_needed
+  echo -e "${C_PURPLE}检测到环境缺失，正在初始化...${C_RESET}"
+  ensure_dirs
+  install_dependencies
+  enable_bbr
+  install_xray_if_needed
 fi
 
-# 直接进入主菜单，不再进行 check_core_update，避免启动卡顿
-update_ip_async
-load_nat_data
-auto_optimize_cpu
-main_menu
+# 子命令分发：非 menu 时执行完就退出，避免掉进交互菜单
+case "${1:-menu}" in
+  menu)
+    # 直接进入主菜单，不再进行 check_core_update，避免启动卡顿
+    update_ip_async
+    load_nat_data
+    auto_optimize_cpu
+    main_menu
+    ;;
+  add-node)
+    shift
+    cmd_add_node "$@"
+    exit 0
+    ;;
+  list-nodes)
+    shift
+    cmd_list_nodes "$@"
+    exit 0
+    ;;
+  delete-node)
+    shift
+    cmd_delete_node "$@"
+    exit 0
+    ;;
+  maintenance)
+    shift
+    cmd_maintenance "$@"
+    exit 0
+    ;;
+  net)
+    shift
+    cmd_net "$@"
+    exit 0
+    ;;
+  *)
+    echo "Unknown command: $1"
+    echo "Usage: $0 [menu|add-node|list-nodes|delete-node|maintenance|net] ..."
+    exit 1
+    ;;
+esac

@@ -2869,6 +2869,51 @@ list_and_del_routing_rules() {
     ok "关联已解除，${target_inbound} 已恢复直连。"
     restart_xray
 }
+cmd_list_nodes() {
+  local mode="${1:-list}"
+
+  # 你脚本里一般有这些变量（没有的话就按默认）
+  local cfg="${CONFIG:-/usr/local/etc/xray/config.json}"
+  local meta="${META:-/usr/local/etc/xray/nodes_meta.json}"
+
+  case "$mode" in
+    list)
+      if [[ ! -f "$cfg" ]]; then
+        echo "CONFIG not found: $cfg"
+        return 1
+      fi
+      echo "TAG    TYPE    LISTEN:PORT"
+      jq -r '
+        .inbounds // [] |
+        map({
+          tag: (.tag // "-"),
+          type: (.type // .protocol // "-"),
+          listen: (.listen // "::"),
+          port: ((.listen_port // .port // 0) | tostring)
+        }) |
+        .[] | "\(.tag)\t\(.type)\t\(.listen):\(.port)"
+      ' "$cfg" 2>/dev/null || { echo "parse config failed"; return 1; }
+      ;;
+    link|links)
+      if [[ ! -f "$meta" ]]; then
+        echo "META not found: $meta"
+        return 1
+      fi
+      # 你的 META 里一般保存 raw 链接：{ "tag": { ..., "raw": "vless://..." } }
+      jq -r '
+        to_entries[] |
+        .key as $k |
+        (.value.raw // empty) as $raw |
+        select($raw != "") |
+        "\($k)\n\($raw)\n"
+      ' "$meta" 2>/dev/null || { echo "parse meta failed"; return 1; }
+      ;;
+    *)
+      echo "Usage: timibaby list-nodes [list|link]"
+      return 1
+      ;;
+  esac
+}
 
 
 

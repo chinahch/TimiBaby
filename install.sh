@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 一键安装：curl|bash
-# 用法（兼容 /dev/fd 不存在的系统也可用）：
+# 一键安装（兼容 /dev/fd 不存在的系统）：
 #   curl -fsSL https://raw.githubusercontent.com/chinahch/timibaby/main/install.sh -o /tmp/install.sh && sudo bash /tmp/install.sh
 # 或：
-#   wget -qO /tmp/install.sh https://raw.githubusercontent.com/chinahch/timibaby/main/install.sh && sudo bash /tmp/install.sh
-# 或：
 #   curl -fsSL https://raw.githubusercontent.com/chinahch/timibaby/main/install.sh | sudo bash
-#
-# 可选环境变量：
-#   REPO=chinahch/timibaby
-#   BRANCH=main
-#   BIN_NAME=timibaby
+# 或：
+#   wget -qO /tmp/install.sh https://raw.githubusercontent.com/chinahch/timibaby/main/install.sh && sudo bash /tmp/install.sh
 
 REPO_DEFAULT="chinahch/timibaby"
 BRANCH_DEFAULT="main"
@@ -49,7 +43,6 @@ main() {
 
   local repo="${REPO:-$REPO_DEFAULT}"
   local branch="${BRANCH:-$BRANCH_DEFAULT}"
-
   local raw="https://raw.githubusercontent.com/${repo}/${branch}/${SCRIPT_IN_REPO}"
 
   say "Repo: ${repo}  Branch: ${branch}"
@@ -59,19 +52,16 @@ main() {
   tmp="$(mktemp)"
   download "$raw" "$tmp"
 
-  # 基础校验：必须是 bash 脚本
   head -n 1 "$tmp" | grep -Eq 'bash' || die "下载内容看起来不是 bash 脚本（可能 repo/branch/文件名不对）"
 
   install -m 0755 "$tmp" "$INSTALL_PATH"
   rm -f "$tmp"
 
-  # 兼容 my/MY 快捷命令（做成软链接）
   ln -sf "$INSTALL_PATH" /usr/local/bin/my
   ln -sf "$INSTALL_PATH" /usr/local/bin/MY
 
   say "安装完成：${INSTALL_PATH}"
   say "正在启动：sudo ${BIN_NAME}"
-
   exec "$INSTALL_PATH"
 }
 

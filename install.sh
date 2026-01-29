@@ -10,7 +10,7 @@ set -euo pipefail
 #   BRANCH=main
 #   BIN_NAME=timibaby
 
-REPO_DEFAULT="CHANGE_ME/CHANGE_ME"   # TODO: 改成你的 GitHub 用户名/仓库名（例如 mucis-dark/timibaby）
+REPO_DEFAULT="chinahch/timibaby"   # TODO: 改成你的 GitHub 用户名/仓库名（例如 mucis-dark/timibaby）
 BRANCH_DEFAULT="main"
 
 BIN_NAME="${BIN_NAME:-timibaby}"

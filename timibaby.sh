@@ -2869,47 +2869,112 @@ list_and_del_routing_rules() {
     ok "关联已解除，${target_inbound} 已恢复直连。"
     restart_xray
 }
+
+# --- Web/CLI Non-Interactive Commands ---
+
 cmd_list_nodes() {
   local mode="${1:-list}"
-
-  # 你脚本里一般有这些变量（没有的话就按默认）
   local cfg="${CONFIG:-/usr/local/etc/xray/config.json}"
   local meta="${META:-/usr/local/etc/xray/nodes_meta.json}"
 
+  # 取全局偏好与 IP
+  local V4_ADDR V6_ADDR global_pref meta_json
+  V4_ADDR="$(get_public_ipv4_ensure 2>/dev/null || true)"
+  V6_ADDR="$(get_public_ipv6_ensure 2>/dev/null || true)"
+  global_pref="v4"
+  [[ -f "/etc/xray/ip_pref" ]] && global_pref="$(cat /etc/xray/ip_pref 2>/dev/null || echo v4)"
+  meta_json="{}"
+  [[ -f "$meta" ]] && meta_json="$(cat "$meta" 2>/dev/null || echo '{}')"
+
+  # 汇总 tag（Config + Meta）
+  local all_tags
+  all_tags="$( (jq -r '.inbounds[].tag // empty' "$cfg" 2>/dev/null; jq -r 'keys[]' "$meta" 2>/dev/null) | sort -u )"
+
   case "$mode" in
     list)
-      if [[ ! -f "$cfg" ]]; then
-        echo "CONFIG not found: $cfg"
-        return 1
-      fi
-      echo "TAG    TYPE    LISTEN:PORT"
-      jq -r '
-        .inbounds // [] |
-        map({
-          tag: (.tag // "-"),
-          type: (.type // .protocol // "-"),
-          listen: (.listen // "::"),
-          port: ((.listen_port // .port // 0) | tostring)
-        }) |
-        .[] | "\(.tag)\t\(.type)\t\(.listen):\(.port)"
-      ' "$cfg" 2>/dev/null || { echo "parse config failed"; return 1; }
+      echo "=== 节点列表（非交互）==="
+      echo -e "IDX\tTAG\tTYPE\tPORT\tIPVER\tIP\tGEO"
+      local idx=1
+      while read -r tag; do
+        [[ -z "$tag" || "$tag" == "null" ]] && continue
+
+        local type port fixed_ip node_v use_v CURRENT_IP display_type geo
+        type="$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .type // empty' "$cfg" 2>/dev/null)"
+        [[ -z "$type" ]] && type="$(jq -r --arg t "$tag" '.[$t].type // "UNKNOWN"' "$meta" 2>/dev/null)"
+
+        port="$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen_port // empty' "$cfg" 2>/dev/null)"
+        [[ -z "$port" || "$port" == "null" ]] && port="$(jq -r --arg t "$tag" '.[$t].port // "0"' "$meta" 2>/dev/null)"
+
+        fixed_ip="$(jq -r --arg t "$tag" '.[$t].fixed_ip // empty' "$meta" 2>/dev/null)"
+        node_v="$(jq -r --arg t "$tag" '.[$t].ip_version // empty' "$meta" 2>/dev/null)"
+        use_v="${node_v:-$global_pref}"
+
+        CURRENT_IP="$V4_ADDR"
+        [[ "$use_v" == "v6" && -n "$V6_ADDR" ]] && CURRENT_IP="$V6_ADDR"
+        [[ -n "$fixed_ip" && "$fixed_ip" != "null" ]] && CURRENT_IP="$fixed_ip"
+
+        display_type="${type^^}"
+        [[ "$type" == "vless" ]] && display_type="VLESS-REALITY"
+        [[ "$type" == "argo"  ]] && display_type="ARGO-TUNNEL"
+
+        geo="$(get_ip_country "$CURRENT_IP" 2>/dev/null || echo "-")"
+
+        echo -e "${idx}\t${tag}\t${display_type}\t${port}\t${use_v}\t${CURRENT_IP}\t${geo}"
+        ((idx++))
+      done <<< "$all_tags"
       ;;
-    link|links)
-      if [[ ! -f "$meta" ]]; then
-        echo "META not found: $meta"
+    link)
+      # 用法：timibaby list-nodes link <tag>
+      local target_tag="${2:-}"
+      [[ -z "$target_tag" ]] && { echo "Usage: timibaby list-nodes link <tag>"; return 1; }
+
+      # 查类型/端口
+      local t_type t_port
+      t_type="$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag == $t) | .type // empty' "$cfg" 2>/dev/null)"
+      [[ -z "$t_type" ]] && t_type="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].type // "UNKNOWN"' 2>/dev/null)"
+      t_port="$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag == $t) | .listen_port // empty' "$cfg" 2>/dev/null)"
+      [[ -z "$t_port" || "$t_port" == "null" ]] && t_port="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].port // "0"' 2>/dev/null)"
+
+      # IP 选择逻辑（同菜单）
+      local fixed_ip node_v use_v CURRENT_IP
+      fixed_ip="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].fixed_ip // empty' 2>/dev/null)"
+      node_v="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].ip_version // empty' 2>/dev/null)"
+      use_v="${node_v:-$global_pref}"
+
+      CURRENT_IP="$V4_ADDR"
+      [[ "$use_v" == "v6" && -n "$V6_ADDR" ]] && CURRENT_IP="$V6_ADDR"
+      [[ -n "$fixed_ip" && "$fixed_ip" != "null" ]] && CURRENT_IP="$fixed_ip"
+
+      local final_link=""
+      if [[ "$t_type" == "socks" ]]; then
+        local user pass
+        user="$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].username // "user"' "$cfg" 2>/dev/null)"
+        pass="$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].password // "pass"' "$cfg" 2>/dev/null)"
+        final_link="socks://$(printf "%s:%s" "$user" "$pass" | base64 -w0)@${CURRENT_IP}:${t_port}#${target_tag}"
+      elif [[ "$t_type" == "vless" ]]; then
+        local uuid pbk sid sni
+        uuid="$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$cfg" 2>/dev/null)"
+        pbk="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')"
+        sid="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')"
+        sni="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')"
+        final_link="vless://${uuid}@${CURRENT_IP}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
+      elif [[ "$t_type" == "hysteria2" ]]; then
+        local auth obfs sni
+        auth="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth')"
+        obfs="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].obfs')"
+        sni="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni')"
+        final_link="hysteria2://${auth}@${CURRENT_IP}:${t_port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${target_tag}"
+      elif [[ "$t_type" == "argo" ]]; then
+        final_link="$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].raw')"
+      else
+        echo "Unknown node type: $t_type"
         return 1
       fi
-      # 你的 META 里一般保存 raw 链接：{ "tag": { ..., "raw": "vless://..." } }
-      jq -r '
-        to_entries[] |
-        .key as $k |
-        (.value.raw // empty) as $raw |
-        select($raw != "") |
-        "\($k)\n\($raw)\n"
-      ' "$meta" 2>/dev/null || { echo "parse meta failed"; return 1; }
+
+      echo "$final_link"
       ;;
     *)
-      echo "Usage: timibaby list-nodes [list|link]"
+      echo "Usage: timibaby list-nodes [list|link <tag>]"
       return 1
       ;;
   esac

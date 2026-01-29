@@ -2907,7 +2907,7 @@ main_menu() {
 # --- 1. 定义快捷键函数 ---
 setup_shortcuts() {
   local SCRIPT_PATH
-  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo '/root/baby.sh')"
+  SCRIPT_PATH="$(command -v timibaby 2>/dev/null || echo '/usr/local/bin/timibaby')"
   if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
   if ! grep -q "alias my=" /root/.bashrc; then
       echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc

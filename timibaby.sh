@@ -2869,18 +2869,6 @@ list_and_del_routing_rules() {
     ok "关联已解除，${target_inbound} 已恢复直连。"
     restart_xray
 }
-cmd_list_nodes() {
-  local cfg="${CONFIG:-/usr/local/etc/xray/config.json}"
-  [[ -f "$cfg" ]] || cfg="/etc/xray/config.json"
-  [[ -f "$cfg" ]] || { echo "CONFIG not found"; return 1; }
-
-  echo "TAG    TYPE    LISTEN:PORT"
-  jq -r '
-    (.inbounds // [])[] |
-    "\((.tag // "-"))\t\((.type // .protocol // "-"))\t\((.listen // "::")):\((.listen_port // .port // 0)|tostring)"
-  ' "$cfg" 2>/dev/null
-}
-
 
 
 
@@ -2918,83 +2906,30 @@ main_menu() {
 
 # --- 1. 定义快捷键函数 ---
 setup_shortcuts() {
-  local TARGET="/usr/local/bin/timibaby"
-
-  # 1) 优先使用软链接（立刻生效，不依赖 .bashrc）
-  if [[ -x "$TARGET" ]]; then
-    ln -sf "$TARGET" /usr/local/bin/my
-    ln -sf "$TARGET" /usr/local/bin/MY
-    ok "快捷指令 'my'/'MY' 已设置（软链接），立即生效"
-    return 0
-  fi
-
-  # 2) 兜底：写 alias 到 /root/.bashrc（需要新开 shell 才生效）
   local SCRIPT_PATH
-  SCRIPT_PATH="$(command -v timibaby 2>/dev/null || echo '/usr/local/bin/timibaby')"
-  [[ -f /root/.bashrc ]] || touch /root/.bashrc
-
-  if ! grep -qE "alias (my|MY)=" /root/.bashrc; then
-    {
-      echo "alias my='$SCRIPT_PATH'"
-      echo "alias MY='$SCRIPT_PATH'"
-    } >> /root/.bashrc
-    ok "快捷指令 'my'/'MY' 已写入 /root/.bashrc（新开 shell 生效）"
+  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo '/root/baby.sh')"
+  if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
+  if ! grep -q "alias my=" /root/.bashrc; then
+      echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
+      echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
+      ok "快捷指令 'my' 已设置，下次登录生效"
   fi
-
-  # 想“当前会话立刻生效”，你可以主动 source（但仅对当前交互 shell 有意义）
-  # source /root/.bashrc 2>/dev/null || true
 }
-
 
 # --- 2. 启动执行流程 ---
 setup_shortcuts
 
-# 环境基础检查（保留）
+# 环境基础检查
 if [[ ! -x "/usr/local/bin/xray" ]] || [[ ! -f "$CONFIG" ]]; then
-  echo -e "${C_PURPLE}检测到环境缺失，正在初始化...${C_RESET}"
-  ensure_dirs
-  install_dependencies
-  enable_bbr
-  install_xray_if_needed
+    echo -e "${C_PURPLE}检测到环境缺失，正在初始化...${C_RESET}"
+    ensure_dirs
+    install_dependencies
+    enable_bbr
+    install_xray_if_needed
 fi
 
-# 子命令分发：非 menu 时执行完就退出，避免掉进交互菜单
-case "${1:-menu}" in
-  menu)
-    # 直接进入主菜单，不再进行 check_core_update，避免启动卡顿
-    update_ip_async
-    load_nat_data
-    auto_optimize_cpu
-    main_menu
-    ;;
-  add-node)
-    shift
-    cmd_add_node "$@"
-    exit 0
-    ;;
-  list-nodes)
-    shift
-    cmd_list_nodes "$@"
-    exit 0
-    ;;
-  delete-node)
-    shift
-    cmd_delete_node "$@"
-    exit 0
-    ;;
-  maintenance)
-    shift
-    cmd_maintenance "$@"
-    exit 0
-    ;;
-  net)
-    shift
-    cmd_net "$@"
-    exit 0
-    ;;
-  *)
-    echo "Unknown command: $1"
-    echo "Usage: $0 [menu|add-node|list-nodes|delete-node|maintenance|net] ..."
-    exit 1
-    ;;
-esac
+# 直接进入主菜单，不再进行 check_core_update，避免启动卡顿
+update_ip_async
+load_nat_data
+auto_optimize_cpu
+main_menu

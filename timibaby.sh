@@ -95,8 +95,21 @@ detect_init_system() {
 
 # 信号处理
 trap 'disown_temp_tunnel >/dev/null 2>&1; echo; exit 0' INT
-trap '' SIGHUP 2>/dev/null || true
+trap 'exit 0' HUP
+
+# 交互输入保护：一旦 stdin 变为 EOF（例如放后台/SSH 断开），立即退出，避免 while true 空转吃 CPU
+safe_read() {
+  # 用法：safe_read var "prompt"
+  local __var="$1"; shift
+  local __prompt="$1"
+  if ! read -r -p "$__prompt" "$__var"; then
+    echo
+    exit 0
+  fi
+}
+
 daemonize() { setsid "$@" </dev/null >/dev/null 2>&1 & }
+
 
 if [ -z "$BASH_VERSION" ]; then
   echo "本脚本需要 Bash 解释器，请使用 Bash 运行。"
@@ -756,43 +769,92 @@ ensure_dirs() {
 }
 
 # 优化依赖安装：只在需要时调用
+# 优化依赖安装：先装，装不上再 apt-get update（只 update 一次）
 ensure_cmd() {
   local cmd="$1" deb="$2" alp="$3" cen="$4" fed="$5"
   command -v "$cmd" >/dev/null 2>&1 && return 0
+
   case "$(detect_os)" in
     debian|ubuntu)
-      DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb" >/dev/null 2>&1 || true ;;
+      # 先不 update，直接装；失败再记录，留给 ensure_runtime_deps 统一 update+重试
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb" >/dev/null 2>&1 && {
+        command -v "$cmd" >/dev/null 2>&1 && return 0
+      }
+
+      # 失败：记录需要 update 后重试的包（全局数组）
+      declare -gA _APT_RETRY_SEEN 2>/dev/null || true
+      declare -ga _APT_RETRY_PKGS 2>/dev/null || true
+      if [[ -n "${deb:-}" && -z "${_APT_RETRY_SEEN[$deb]:-}" ]]; then
+        _APT_RETRY_SEEN["$deb"]=1
+        _APT_RETRY_PKGS+=("$deb")
+      fi
+      return 1
+      ;;
+
     alpine)
-      apk add --no-cache "$alp" >/dev/null 2>&1 || true ;;
+      apk add --no-cache "$alp" >/dev/null 2>&1 || true
+      command -v "$cmd" >/dev/null 2>&1
+      ;;
+
     centos|rhel)
-      yum install -y "$cen" >/dev/null 2>&1 || true ;;
+      yum install -y "$cen" >/dev/null 2>&1 || true
+      command -v "$cmd" >/dev/null 2>&1
+      ;;
+
     fedora)
-      dnf install -y "$fed" >/dev/null 2>&1 || true ;;
-    *) warn "未识别系统，请手动安装：$cmd" ;;
+      dnf install -y "$fed" >/dev/null 2>&1 || true
+      command -v "$cmd" >/dev/null 2>&1
+      ;;
+
+    *)
+      warn "未识别系统，请手动安装：$cmd"
+      return 1
+      ;;
   esac
-  command -v "$cmd" >/dev/null 2>&1
 }
 
 ensure_runtime_deps() {
   if (( DEPS_CHECKED == 1 )); then return 0; fi
-  # 检查是否全部存在，如果都存在则跳过
+
+  # 依赖清单：补上 unzip（Xray zip 解压必须）
+  local need=(curl jq uuidgen openssl ss lsof unzip)
+
+  # 已齐全则不做任何 update/install
   local all_exist=1
-  for c in curl jq uuidgen openssl ss lsof; do
-      if ! command -v "$c" >/dev/null 2>&1; then all_exist=0; break; fi
+  for c in "${need[@]}"; do
+    if ! command -v "$c" >/dev/null 2>&1; then all_exist=0; break; fi
   done
-  
-  if (( all_exist == 1 )); then DEPS_CHECKED=1; return 0; fi
+  if (( all_exist == 1 )); then
+    DEPS_CHECKED=1
+    return 0
+  fi
 
   say "首次运行，正在补全依赖..."
-  ensure_cmd curl     curl        curl        curl        curl
-  ensure_cmd jq       jq          jq          jq          jq
-  ensure_cmd uuidgen  uuid-runtime util-linux util-linux  util-linux
-  ensure_cmd openssl  openssl      openssl     openssl     openssl
+
+  ensure_cmd curl     curl         curl        curl       curl
+  ensure_cmd jq       jq           jq          jq         jq
+  ensure_cmd uuidgen  uuid-runtime util-linux  util-linux util-linux
+  ensure_cmd openssl  openssl      openssl     openssl    openssl
   ensure_cmd ss       iproute2     iproute2    iproute    iproute
-  ensure_cmd lsof     lsof         lsof        lsof        lsof
+  ensure_cmd lsof     lsof         lsof        lsof       lsof
+  ensure_cmd unzip    unzip        unzip       unzip      unzip
+
+  # 最终严格校验：缺哪个就报哪个（不再假成功）
+  local missing=()
+  for c in "${need[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+
+  if ((${#missing[@]} > 0)); then
+    warn "仍有依赖缺失：${missing[*]}（请检查软件源/DNS/网络后重试）"
+    return 1
+  fi
+
   DEPS_CHECKED=1
+  return 0
 }
+
+
 
 install_dependencies() { ensure_runtime_deps; } # 兼容原名调用
 
@@ -823,37 +885,65 @@ enable_bbr() {
 install_xray_if_needed() {
   local current_bin
   current_bin=$(_xray_bin)
-  
-  # 如果不是强制安装且核心已存在，则跳过
+
+  # 非强制且已存在则跳过
   if [[ "$1" != "--force" ]] && [[ -x "$current_bin" ]]; then
     return 0
   fi
 
-  # 自动获取 GitHub 最新版本号（如获取失败则使用保底版本 1.8.24）
+  # 先确保 unzip/curl/jq 等依赖在（否则解压必炸）
+  ensure_runtime_deps || { err "依赖未就绪，无法安装 Xray"; return 1; }
+
+  # 获取最新版本（失败则保底）
   local LATEST_VER
   LATEST_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/v//')
   [[ -z "$LATEST_VER" || "$LATEST_VER" == "null" ]] && LATEST_VER="1.8.24"
-  
+
   warn "正在安装/更新 Xray 核心 v${LATEST_VER}..."
-  
-  local arch=$(uname -m)
-  local URL=""
+
+  local arch url
+  arch="$(uname -m)"
   case "$arch" in
-    x86_64|amd64) URL="https://github.com/XTLS/Xray-core/releases/download/v${LATEST_VER}/Xray-linux-64.zip" ;;
-    aarch64|arm64) URL="https://github.com/XTLS/Xray-core/releases/download/v${LATEST_VER}/Xray-linux-arm64-v8a.zip" ;;
+    x86_64|amd64)   url="https://github.com/XTLS/Xray-core/releases/download/v${LATEST_VER}/Xray-linux-64.zip" ;;
+    aarch64|arm64)  url="https://github.com/XTLS/Xray-core/releases/download/v${LATEST_VER}/Xray-linux-arm64-v8a.zip" ;;
     *) err "暂不支持的架构：$arch"; return 1 ;;
   esac
 
-  local tmp; tmp=$(mktemp -d)
+  local tmp; tmp="$(mktemp -d)"
   (
-    cd "$tmp" || exit
-    curl -fL -o xray.zip "$URL" || { err "下载失败"; return 1; }
-    unzip -o xray.zip >/dev/null 2>&1
-    install -m 0755 xray /usr/local/bin/xray
+    set -e
+    cd "$tmp"
+
+    curl -fL -o xray.zip "$url"
+
+    # 解压必须成功
+    unzip -o xray.zip >/dev/null
+
+    # 某些 zip 里可能是 ./xray 或 ./Xray，做个兼容探测
+    local bin=""
+    [[ -f "./xray" ]] && bin="./xray"
+    [[ -z "$bin" && -f "./Xray" ]] && bin="./Xray"
+
+    if [[ -z "$bin" ]]; then
+      echo "zip 内容："
+      ls -la
+      exit 2
+    fi
+
+    install -m 0755 "$bin" /usr/local/bin/xray
   )
+  local rc=$?
   rm -rf "$tmp"
+
+  if [[ $rc -ne 0 ]] || ! /usr/local/bin/xray version >/dev/null 2>&1; then
+    err "Xray 安装失败（rc=$rc），请检查 unzip/网络/磁盘权限"
+    return 1
+  fi
+
   ok "Xray 核心已就绪"
+  return 0
 }
+
 
 # --- 建议放在 install_xray_if_needed 函数之后 ---
 
@@ -1568,7 +1658,7 @@ add_node() {
     say "3) Hysteria2"
     say "4) CF Tunnel 隧道"
     say "0) 返回主菜单"
-    read -rp "输入协议编号: " proto
+    safe_read proto "输入协议编号: "
     proto=${proto:-1}
     [[ "$proto" == "0" ]] && return
     [[ "$proto" =~ ^[1-4]$ ]] && break
@@ -1602,7 +1692,7 @@ add_node() {
   if [[ "$proto" == "2" ]]; then
     local port uuid server_name key_pair private_key public_key short_id tag
     while true; do
-       read -rp "请输入端口号 (留空随机, 输入0返回): " port
+       safe_read port "请输入端口号 (留空随机, 输入0返回): "
        [[ "$port" == "0" ]] && return
        [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
        if ! check_nat_allow "$port" "tcp"; then
@@ -1884,7 +1974,7 @@ EOF
       say "2) 固定隧道 (Token)"
       say "3) 卸载/清理"
       say "0) 返回"
-      read -rp "选择: " ac
+      safe_read ac "选择: "
       case "$ac" in
           1) temp_tunnel_logic ;;
           2) add_argo_user ;;
@@ -2681,14 +2771,14 @@ status_menu() {
   while true; do
     # 已移除 clear，保留历史记录
     echo -e "\n${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
-    echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 ${C_GRAY}(依赖/权限/服务)${C_RESET}"
-    echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 ${C_GRAY}(Xray)${C_RESET}"
-    echo -e " ${C_GREEN}3.${C_RESET} 更新核心版本 ${C_GRAY}(Update)${C_RESET}"
-    echo -e " ${C_RED}4.${C_RESET} 彻底卸载脚本 ${C_GRAY}(Uninstall)${C_RESET}"
+    echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 "
+    echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 "
+    echo -e " ${C_GREEN}3.${C_RESET} 更新核心版本 "
+    echo -e " ${C_RED}4.${C_RESET} 彻底卸载脚本 "
     echo -e " ${C_GREEN}0.${C_RESET} 返回上级菜单"
     echo ""
 
-    read -rp " 请输入选项: " sc
+    safe_read sc " 请输入选项: "
     case "$sc" in
       1) 
           check_and_repair_menu
@@ -2826,16 +2916,18 @@ ip_version_menu() {
     say "2) 全局设置：优先使用 IPv6 ${C_GRAY}(检测到 $v6_count 个出口)${C_RESET}"
     say "3) 指定节点：单独设置 IP 版本与出口"
     say "0) 返回主菜单"
-    read -rp " 请选择操作: " ip_choice
+    safe_read ip_choice " 请选择操作: "
 
     case "$ip_choice" in
-      1|2)
+            1|2)
         local pref="v4"
         [[ "$ip_choice" == "2" ]] && pref="v6"
 
         mkdir -p /etc/xray >/dev/null 2>&1 || true
-        echo "$pref" > /etc/xray/ip_pref
-        ok "全局偏好已设置为：$pref"
+
+        # 记录旧值：用于判断是否需要“立刻生效”
+        local old_pref
+        old_pref="$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || true)"
 
         # === 新增：全局也选择具体出口 IP（可跳过）===
         local p_flag="4"
@@ -2844,9 +2936,19 @@ ip_version_menu() {
         echo -e "\n正在检测可用 IPv${p_flag} 出口及归属地..."
         mapfile -t avail_ips < <(get_all_ips_with_geo "$p_flag")
 
+        # ✅ 如果用户选 v6 但根本没 v6 出口：不切换、不重启（避免把策略切到 UseIPv6 造成没网）
+        if [[ "$pref" == "v6" && ${#avail_ips[@]} -eq 0 ]]; then
+          warn "未检测到可用的 IPv6 公网地址：已忽略本次 v6 偏好切换（不会重启）。"
+          continue
+        fi
+
+        # 先写偏好（但不强制重启；只有“真的改了全局出口IP”才重启）
+        echo "$pref" > /etc/xray/ip_pref
+        ok "全局偏好已设置为：$pref（将于下次重启生效；如需立刻生效请选择全局出口IP）"
+
+        # 没有可用公网出口：只保存偏好，不重启
         if [ ${#avail_ips[@]} -eq 0 ]; then
-          warn "未检测到可用的 IPv${p_flag} 公网地址，仅保存偏好（未设置全局出口 IP）"
-          restart_xray
+          warn "未检测到可用的 IPv${p_flag} 公网地址，仅保存偏好（不重启）"
           continue
         fi
 
@@ -2855,9 +2957,11 @@ ip_version_menu() {
           j=$((j+1))
           echo -e " ${C_GREEN}[$j]${C_RESET} ${C_CYAN}${line}${C_RESET}"
         done
-        echo -e " ${C_GREEN}[0]${C_RESET} 跳过（仅保存偏好）"
+        echo -e " ${C_GREEN}[0]${C_RESET} 跳过（仅保存偏好，不重启）"
 
         read -rp "请选择全局默认出口 IP 序号: " ip_idx
+
+        # ✅ 只有选了具体出口IP，才需要重启立刻生效
         if [[ -n "${ip_idx:-}" && "$ip_idx" != "0" ]]; then
           local chosen_raw="${avail_ips[$((ip_idx-1))]}"
           local chosen_ip
@@ -2870,13 +2974,13 @@ ip_version_menu() {
             echo "$chosen_ip" > /etc/xray/global_egress_ip_v4
             ok "全局默认 IPv4 出口已设置为: $chosen_raw"
           fi
-        else
-          ok "已跳过设置全局出口 IP（仅保存偏好）"
-        fi
 
-        # 立刻生效
-        restart_xray
+          restart_xray
+        else
+          ok "已跳过设置全局出口 IP（仅保存偏好，不重启）"
+        fi
         ;;
+
       3)
         # --- 节点选择层级 ---
         local tags_raw=""
@@ -3031,7 +3135,7 @@ outbound_menu() {
     say "8) 一键诊断并修复配置 (救急专用)"
     say "0) 返回主菜单"
     
-    read -rp " 请选择操作 [0-8]: " ob_choice
+    safe_read ob_choice " 请选择操作 [0-8]: "
     case "$ob_choice" in
       1|2) add_manual_proxy_outbound "$ob_choice" ;;
       3) add_manual_ss_outbound ;;
@@ -3468,17 +3572,20 @@ main_menu() {
   while true; do
     show_menu_banner
     echo -e ""
-    echo -e " ${C_GREEN}1.${C_RESET} 添加节点 ${C_GRAY}(SOCKS5 / VLESS / Hysteria2 / Argo)${C_RESET}"
-    echo -e " ${C_GREEN}2.${C_RESET} 查看节点 ${C_GRAY}(列表 / 链接)${C_RESET}"
-    echo -e " ${C_GREEN}3.${C_RESET} 删除节点"
-    echo -e " ${C_GREEN}4.${C_RESET} 状态维护 ${C_GRAY}(重启 / 修复 / 更新 / 卸载)${C_RESET}"
-    echo -e " ${C_GREEN}5.${C_RESET} 网络切换 ${C_GRAY}(IPv4 / IPv6 优先级管理)${C_RESET}"
-    echo -e " ${C_GREEN}6.${C_RESET} 落地出口 ${C_GRAY}(SOCKS5 / HTTP / 链接导入)${C_RESET}"
+    echo -e " ${C_GREEN}1.${C_RESET} 添加节点 "
+    echo -e " ${C_GREEN}2.${C_RESET} 查看节点 "
+    echo -e " ${C_GREEN}3.${C_RESET} 删除节点 "
+    echo -e " ${C_GREEN}4.${C_RESET} 状态维护 "
+    echo -e " ${C_GREEN}5.${C_RESET} 网络切换 "
+    echo -e " ${C_GREEN}6.${C_RESET} 落地出口 "
     echo -e " ${C_GREEN}0.${C_RESET} 退出脚本"
     echo -e ""
     echo -e "${C_BLUE}──────────────────────────────────────────────────────────────${C_RESET}"
     
-    read -rp " 请输入选项 [0-6]: " choice
+    if ! safe_read choice " 请输入选项 [0-6]: "; then
+  echo
+  exit 0
+fi
     case "$choice" in
       1) add_node ;;
       2) view_nodes_menu ;;

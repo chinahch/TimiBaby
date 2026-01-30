@@ -160,35 +160,41 @@ get_public_ipv6_ensure() {
 
 get_ip_country() {
     local ip="$1"
-    [[ -z "$ip" || "$ip" == "未知" ]] && echo "??" && return
-    
-    # 1. 检查内存缓存
-    if [[ -n "${GEO_CACHE[$ip]}" ]]; then
+    [[ -z "$ip" || "$ip" == "未知" || "$ip" == "null" ]] && echo "??" && return
+
+    # 1) 内存缓存
+    if [[ -n "${GEO_CACHE[$ip]:-}" ]]; then
         echo "${GEO_CACHE[$ip]}"
         return
     fi
 
-    # 2. 隧道 IP 特殊识别 (新增部分)
-    if [[ "$ip" == "10.0.0.1" || "$ip" == "fd00::1" ]]; then
-        echo "落地"
-        return
-    fi
-    
-    # 3. 快速过滤普通内网
-    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|fc00:|fd00:|fe80:) ]]; then
+    # 2) 内网/保留地址快速返回
+    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|169\.254\.|fc00:|fd00:|fe80:|::1) ]]; then
+        GEO_CACHE["$ip"]="LAN"
         echo "LAN"
         return
     fi
 
-    # 4. 极速查询 (缩短超时至 1.5s)
-    local code
-    code=$(curl -s --max-time 1.5 "http://ip-api.com/json/${ip}?fields=countryCode" | jq -r '.countryCode // "??"' 2>/dev/null)
-    
-    if [[ "$code" == "null" || -z "$code" ]]; then
-        code="??"
+    local code="??"
+
+    # A) ip-api（改用 HTTPS，避免 http 被挡/被劫持）
+    code=$(curl -s --max-time 1.5 "https://ip-api.com/json/${ip}?fields=countryCode" \
+        | jq -r '.countryCode // empty' 2>/dev/null)
+
+    # B) 兜底 1：api.country.is（非常快，返回 {"country":"US","ip":"x"}）
+    if [[ -z "$code" || "$code" == "null" ]]; then
+        code=$(curl -s --max-time 1.5 "https://api.country.is/${ip}" \
+            | jq -r '.country // empty' 2>/dev/null)
     fi
-    
-    # 5. 存入缓存并输出
+
+    # C) 兜底 2：ipwho.is（返回 country_code）
+    if [[ -z "$code" || "$code" == "null" ]]; then
+        code=$(curl -s --max-time 2 "https://ipwho.is/${ip}" \
+            | jq -r '.country_code // empty' 2>/dev/null)
+    fi
+
+    [[ -z "$code" || "$code" == "null" ]] && code="??"
+
     GEO_CACHE["$ip"]="$code"
     echo "$code"
 }
@@ -237,36 +243,107 @@ test_outbound_connection() {
 
 # 实时获取所有可用公网 IP 列表 (优化过滤版)
 get_all_ips_with_geo() {
-    local proto="$1" # "4" 或 "6"
-    local -a ip_list=()
-    
+    local proto="$1"   # "4" 或 "6"
+    local -a out_lines=()
+
+    # --- 小工具：判断 IP 是否形似 ---
+    _is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+    _is_ipv6() { [[ "$1" == *:* ]]; }
+
+    # --- 小工具：从接口探测真实公网 IP ---
+    _iface_pub_ip() {
+        local iface="$1" p="$2"
+        if [[ "$p" == "4" ]]; then
+            curl -s -4 --interface "$iface" --connect-timeout 1.5 --max-time 2 https://api.ipify.org 2>/dev/null | tr -d '\r\n'
+        else
+            curl -s -6 --interface "$iface" --connect-timeout 1.5 --max-time 2 https://api64.ipify.org 2>/dev/null | tr -d '\r\n'
+        fi
+    }
+
+    # --- A) 先列出本机“真实公网地址”(scope global) ---
     if [[ "$proto" == "4" ]]; then
-        # 1. 获取全局 v4 地址
-        # 2. 排除 172.x 和 192.x 网段
-        # 3. 排除 10.x 网段，但如果是 10.0.0.1 则保留
-        mapfile -t ip_list < <(ip -4 addr show scope global | awk '/inet / {print $2}' | cut -d/ -f1 | \
-            grep -vE '^(172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | \
-            awk '$1 !~ /^10\./ || $1 == "10.0.0.1"')
+        mapfile -t _pubs < <(
+            ip -4 addr show scope global 2>/dev/null \
+            | awk '/inet /{print $2}' | cut -d/ -f1 \
+            | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|169\.254\.)' \
+            | sort -u
+        )
+        for ip in "${_pubs[@]}"; do
+            local cc
+            cc="$(get_ip_country "$ip")"
+            out_lines+=("${ip} [${cc}]")
+        done
     else
-        # 1. 允许 2xxx/3xxx 开头的公网地址，以及 fd00 开头的私有地址
-        # 2. 排除临时地址，提取 IP
-        # 3. 排除其他的 fd00 网段，仅保留 fd00::1
-        mapfile -t ip_list < <(ip -6 addr show scope global | grep -v "temporary" | \
-            awk '/inet6 ([23]|fd00)/ {print $2}' | cut -d/ -f1 | \
-            awk '$1 !~ /^fd00/ || $1 == "fd00::1"')
+        mapfile -t _pubs < <(
+            ip -6 addr show scope global 2>/dev/null \
+            | grep -v "temporary" \
+            | awk '/inet6 [23]/{print $2}' | cut -d/ -f1 \
+            | sort -u
+        )
+        for ip in "${_pubs[@]}"; do
+            local cc
+            cc="$(get_ip_country "$ip")"
+            out_lines+=("${ip} [${cc}]")
+        done
     fi
 
-    # 如果过滤后没有任何 IP，给出友好提示
-    if [ ${#ip_list[@]} -eq 0 ]; then
+    # --- B) 再列出“落地出口”(10.x / fd00) 并探测真实公网IP+国家 ---
+    # 只抓常见“隧道/出口类接口”，避免把 docker/lo 之类乱入
+    local iface_re='^(wg|tun|tap|ppp|tailscale|warp|wgcf|utun)'
+
+    if [[ "$proto" == "4" ]]; then
+        mapfile -t _lands < <(
+            ip -4 -o addr show 2>/dev/null \
+            | awk -v re="$iface_re" '
+                $2 ~ re && $4 ~ /^10\./ {split($4,a,"/"); print a[1]"\t"$2}
+            ' | sort -u
+        )
+
+        for row in "${_lands[@]}"; do
+            local lip iface pub cc
+            lip="$(echo "$row" | awk '{print $1}')"
+            iface="$(echo "$row" | awk '{print $2}')"
+
+            pub="$(_iface_pub_ip "$iface" "4")"
+            if _is_ipv4 "$pub"; then
+                cc="$(get_ip_country "$pub")"
+                out_lines+=("${lip} [落地] -> ${pub} [${cc}] (${iface})")
+            else
+                out_lines+=("${lip} [落地] -> 探测失败 (${iface})")
+            fi
+        done
+
+    else
+        mapfile -t _lands < <(
+            ip -6 -o addr show 2>/dev/null \
+            | awk -v re="$iface_re" '
+                $2 ~ re && $4 ~ /^fd00/ {split($4,a,"/"); print a[1]"\t"$2}
+            ' | sort -u
+        )
+
+        for row in "${_lands[@]}"; do
+            local lip iface pub cc
+            lip="$(echo "$row" | awk '{print $1}')"
+            iface="$(echo "$row" | awk '{print $2}')"
+
+            pub="$(_iface_pub_ip "$iface" "6")"
+            if _is_ipv6 "$pub"; then
+                cc="$(get_ip_country "$pub")"
+                out_lines+=("${lip} [落地] -> ${pub} [${cc}] (${iface})")
+            else
+                out_lines+=("${lip} [落地] -> 探测失败 (${iface})")
+            fi
+        done
+    fi
+
+    # --- 去重输出 ---
+    if [ ${#out_lines[@]} -eq 0 ]; then
         return
     fi
 
-    # 循环输出：IP [国家]
-    for ip in "${ip_list[@]}"; do
-        local geo=$(get_ip_country "$ip")
-        echo "${ip} [${geo}]"
-    done
+    printf "%s\n" "${out_lines[@]}" | awk '!seen[$0]++'
 }
+
 
 # 系统状态 Dashboard
 get_sys_status() {
@@ -3412,7 +3489,7 @@ main_menu() {
 # --- 1. 定义快捷键函数 ---
 setup_shortcuts() {
   local SCRIPT_PATH
-  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo '/root/timibaby.sh')"
+  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo '/root/baby.sh')"
   if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
   if ! grep -q "alias my=" /root/.bashrc; then
       echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc

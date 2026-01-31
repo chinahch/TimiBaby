@@ -134,21 +134,47 @@ print_card() {
   echo ""
 }
 
-# 异步后台更新 IP (兼容 BusyBox / Alpine / GNU)
 update_ip_async() {
+    # 增加简单的运行锁，防止重复启动探测进程
+    local lock="/tmp/ip_probe.lock"
+    if [[ -f "$lock" ]]; then
+        local pid=$(cat "$lock" 2>/dev/null)
+        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then return 0; fi
+    fi
+    echo $$ > "$lock"
+
     (
-        # IPv4 获取
-        local ip4=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me/ip)
-        [[ -n "$ip4" ]] && echo "$ip4" > "$IP_CACHE_FILE"
+        # 1. 系统原生 IP 探测
+        local ip4; ip4=$(curl -s -4 --connect-timeout 2 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\r\n')
+        [[ -n "$ip4" ]] && echo -n "$ip4" > "$IP_CACHE_FILE"
         
-        # IPv6 获取：优先使用 API，兜底使用本地指令
-        local ip6=$(curl -s -6 --max-time 3 https://api64.ipify.org || curl -s -6 --max-time 3 https://6.ipw.cn)
-        if [[ -z "$ip6" ]]; then
-            # 放弃使用 grep -oP，改用 awk 提取 inet6 后面以 2 或 3 开头的地址
-            # 并使用 cut 去掉 CIDR 前缀 (如 /64)
-            ip6=$(ip -6 addr show scope global | grep -v "temporary" | awk '/inet6 [23]/ {print $2}' | cut -d/ -f1 | head -n 1)
+        local ip6; ip6=$(curl -s -6 --connect-timeout 2 --max-time 5 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
+        [[ -n "$ip6" ]] && echo -n "$ip6" > "${IP_CACHE_FILE}_v6"
+
+        # 2. Xray 出口探测
+        local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
+        local lock_ip=""
+        [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
+        [[ "$pref" == "v4" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
+
+        if [[ -n "$lock_ip" ]]; then
+            local xray_pub=""
+            # 探测逻辑：优先尝试绑定 IP 探测
+            if [[ "$pref" == "v6" ]]; then
+                xray_pub=$(curl -s -6 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
+            else
+                xray_pub=$(curl -s -4 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null | tr -d '\r\n')
+            fi
+
+            if [[ -n "$xray_pub" ]]; then
+                echo -n "$xray_pub" > "${IP_CACHE_FILE}_xray"
+                echo -n "OK" > "${IP_CACHE_FILE}_xray_status"
+            else
+                echo -n "FAILED" > "${IP_CACHE_FILE}_xray_status"
+                echo -n "N/A" > "${IP_CACHE_FILE}_xray"
+            fi
         fi
-        [[ -n "$ip6" ]] && echo "$ip6" > "${IP_CACHE_FILE}_v6"
+        rm -f "$lock"
     ) &
 }
 
@@ -361,7 +387,7 @@ get_all_ips_with_geo() {
 }
 
 
-# 系统状态 Dashboard
+# 系统状态 Dashboard (支持显示网卡名称)
 get_sys_status() {
     local cpu_load=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
     local mem_total=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null)
@@ -370,18 +396,55 @@ get_sys_status() {
     local mem_rate=0
     [[ $mem_total -gt 0 ]] && mem_rate=$((mem_used * 100 / mem_total))
     
-    local ip_addr="获取中..."
-    [[ -f "$IP_CACHE_FILE" ]] && ip_addr=$(cat "$IP_CACHE_FILE")
+    # 获取原生 IP 缓存
+    local sys_ip4="未检测到"; [[ -f "$IP_CACHE_FILE" ]] && sys_ip4=$(cat "$IP_CACHE_FILE")
+    local sys_ip6="未检测到"; [[ -f "${IP_CACHE_FILE}_v6" ]] && sys_ip6=$(cat "${IP_CACHE_FILE}_v6")
+
+    # Xray 出口状态逻辑
+    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || echo "v4")
+    local lock_ip=""; [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null) || lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null)
+    
+    local xray_egress="跟随系统 (默认)"
+    if [[ -n "$lock_ip" ]]; then
+        # 核心修改：根据锁定 IP 反查网卡名称
+        local iface_name; iface_name=$(ip -o addr show | grep "$lock_ip" | awk '{print $2}' | head -n1)
+        [[ -z "$iface_name" ]] && iface_name="未知"
+
+        local real_pub="获取中..."
+        [[ -f "${IP_CACHE_FILE}_xray" ]] && real_pub=$(cat "${IP_CACHE_FILE}_xray")
+        
+        local status="CHECKING"
+        [[ -f "${IP_CACHE_FILE}_xray_status" ]] && status=$(cat "${IP_CACHE_FILE}_xray_status")
+
+        # 纠正版本错位显示
+        if [[ "$pref" == "v4" && "$real_pub" == *:* ]]; then real_pub="获取中..."; fi
+        if [[ "$pref" == "v6" && "$real_pub" == *.* ]]; then real_pub="获取中..."; fi
+
+        local cc="??"
+        [[ "$real_pub" != "获取中..." && "$real_pub" != "N/A" ]] && cc=$(get_ip_country "$real_pub")
+
+        local status_disp="${C_YELLOW}[检测中]${C_RESET}"
+        if [[ "$status" == "OK" ]]; then
+            status_disp="${C_GREEN}[正常]${C_RESET}"
+        elif [[ "$status" == "FAILED" ]]; then
+            status_disp="${C_RED}[失效]${C_RESET}"
+            real_pub="N/A"
+        fi
+
+        # 最终显示行：显示网卡名 (iface_name)
+        xray_egress="${C_GREEN}${real_pub}${C_RESET} ${C_PURPLE}[${cc}]${C_RESET} ${C_GRAY}(src:${iface_name})${C_RESET} ${status_disp}"
+    fi
 
     local color_cpu="$C_GREEN"
     [[ $(echo "$cpu_load > 2.0" | bc -l 2>/dev/null) -eq 1 ]] && color_cpu="$C_YELLOW"
-    
-    local color_mem="$C_GREEN"
-    [[ $mem_rate -ge 80 ]] && color_mem="$C_YELLOW"
+    local color_mem="$C_GREEN"; [[ $mem_rate -ge 80 ]] && color_mem="$C_YELLOW"
 
     echo -e "${C_BLUE}┌──[ 系统监控 ]────────────────────────────────────────────────┐${C_RESET}"
     echo -e "${C_BLUE}│${C_RESET} CPU: ${color_cpu}${cpu_load}${C_RESET} | 内存: ${color_mem}${mem_used}MB/${mem_total}MB (${mem_rate}%)${C_RESET}"
-    echo -e "${C_BLUE}│${C_RESET} IP : ${C_YELLOW}${ip_addr}${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} 系统 IPv4: ${C_GRAY}${sys_ip4}${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} 系统 IPv6: ${C_GRAY}${sys_ip6}${C_RESET}"
+    echo -e "${C_BLUE}├──────────────────────────────────────────────────────────────┤${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} Xray 出口: ${xray_egress}"
     echo -e "${C_BLUE}└──────────────────────────────────────────────────────────────┘${C_RESET}"
 }
 
@@ -1569,17 +1632,61 @@ auto_optimize_cpu() {
   fi
 }
 
+sync_and_restart_argo() {
+    # 1. 获取当前最新的全局出口偏好
+    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
+    local lock_ip=""
+    local ds="AsIs"
+    if [[ "$pref" == "v6" ]]; then
+        lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
+        ds="UseIPv6"
+    else
+        lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
+        ds="UseIPv4"
+    fi
+
+    # 构造新的 Outbound JSON
+    local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
+    [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
+
+    # 2. 精准清理：只杀固定隧道，跳过临时隧道 (*_temp)
+    pkill -f "cloudflared.*--token" >/dev/null 2>&1
+    pkill -f "/root/agsbx/xray.*argo_users" >/dev/null 2>&1
+    sleep 0.5
+
+    # 3. [已彻底移除] 临时隧道重启逻辑，确保其域名不断开
+
+    # 4. 仅同步重启所有固定隧道
+    local tags; tags=$(jq -r 'to_entries[] | select(.value.type=="argo" and .value.token!=null) | .key' "$META" 2>/dev/null)
+    for t in $tags; do
+        local p; p=$(jq -r --arg t "$t" '.[$t].port' "$META")
+        local tk; tk=$(jq -r --arg t "$t" '.[$t].token' "$META")
+        local f_cfg="/etc/xray/argo_users/${p}.json"
+        if [[ -f "$f_cfg" ]]; then
+            local f_tmp; f_tmp=$(mktemp)
+            jq --argjson out "[${outbound_json}]" '.outbounds = $out' "$f_cfg" > "$f_tmp" && mv "$f_tmp" "$f_cfg"
+            nohup /root/agsbx/xray run -c "$f_cfg" >/dev/null 2>&1 &
+            nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$tk" >/dev/null 2>&1 &
+        fi
+    done
+}
+
+
 restart_xray() {
-  # ✅ 确保 wrapper 存在（systemd ExecStartPre 也依赖它）
+  # 1. 立即清理缓存和探测锁
+  rm -f "${IP_CACHE_FILE}_xray" "${IP_CACHE_FILE}_xray_status" /tmp/ip_probe.lock 2>/dev/null
   install_singleton_wrapper >/dev/null 2>&1 || true
 
-  # 先同步并做语法校验，避免“重启即翻车”
+  # 2. 先同步主模型并做 Xray 语法校验
   if ! sync_xray_config >/dev/null 2>&1; then
     err "配置文件不合法（Xray 校验未通过）"
     return 1
   fi
 
-  # --- systemd 路径：只有真的 systemd 才走这里；没有 xray.service 就自动装一个 ---
+  # 3. 🚀 关键：同步重启所有 Argo 隧道出口配置
+  sync_and_restart_argo
+
+  # --- 路径 A: systemd 托管 ---
   if command -v systemctl >/dev/null 2>&1 && is_real_systemd; then
     if ! systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
       install_systemd_service >/dev/null 2>&1 || true
@@ -1588,30 +1695,33 @@ restart_xray() {
     systemctl restart xray >/dev/null 2>&1 || true
     sleep 1
     if systemctl is-active --quiet xray; then
-      ok "Xray 重启完成（systemd）"
+      update_ip_async  # 启动成功立即触发 IP 探测
+      ok "主服务及所有 Argo 隧道已完成出口同步并重启 (systemd)"
       return 0
     fi
   fi
 
-  # --- OpenRC ---
+  # --- 路径 B: OpenRC 托管 ---
   if command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/xray ]]; then
     rc-service xray restart >/dev/null 2>&1 || true
     sleep 1
     if rc-service xray status 2>/dev/null | grep -q started; then
-      ok "Xray 重启完成（OpenRC）"
+      update_ip_async
+      ok "主服务及所有 Argo 隧道已完成出口同步并重启 (OpenRC)"
       return 0
     fi
   fi
 
-  # --- Fallback：必须真启动成功才算成功 ---
+  # --- 路径 C: Fallback ---
   pkill -x xray >/dev/null 2>&1 || true
   if start_xray_singleton_force; then
     auto_optimize_cpu
-    ok "Xray 重启完成（Fallback）"
+    update_ip_async
+    ok "主服务及所有 Argo 隧道已完成出口同步并重启 (Fallback)"
     return 0
   fi
 
-  err "Xray 重启失败（Fallback 也未能拉起进程）"
+  err "Xray 重启失败"
   return 1
 }
 
@@ -1862,117 +1972,187 @@ EOF
   read -rp "按回车继续..." _
 }
 
-# --- Argo Tunnel Logic Wrapper ---
+
+
+
+# --- Cloudflare 隧道管理逻辑封装 ---
 argo_menu_wrapper() {
-    # 提取原脚本 ARGO 相关逻辑
-    # 为节省篇幅且不删除逻辑，这里包含核心 Argo 函数
-    
+    # --- 1. 依赖与环境准备 ---
     ensure_argo_deps() {
         mkdir -p "/etc/xray/argo_users" "/root/agsbx"
+        local arch="amd64"
+        [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] && arch="arm64"
         if [[ ! -f "/root/agsbx/cloudflared" ]]; then
-             local arch="amd64"; [[ "$(uname -m)" == "aarch64" ]] && arch="arm64"
-             curl -L -o /root/agsbx/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/2024.6.1/cloudflared-linux-${arch}"
+             say "正在下载 Cloudflare 核心..."
+             curl -L -o /root/agsbx/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
              chmod +x /root/agsbx/cloudflared
         fi
         if [[ ! -f "/root/agsbx/xray" ]]; then
-             local z="https://github.com/XTLS/Xray-core/releases/download/v1.8.11/Xray-linux-64.zip"
-             [[ "$(uname -m)" == "aarch64" ]] && z="https://github.com/XTLS/Xray-core/releases/download/v1.8.11/Xray-linux-arm64-v8a.zip"
-             wget -qO /root/agsbx/x.zip "$z" && unzip -o /root/agsbx/x.zip -d /root/agsbx "xray" && rm /root/agsbx/x.zip
+             cp /usr/local/bin/xray /root/agsbx/xray 2>/dev/null || {
+                local z="https://github.com/XTLS/Xray-core/releases/download/v1.8.11/Xray-linux-64.zip"
+                [[ "$arch" == "arm64" ]] && z="https://github.com/XTLS/Xray-core/releases/download/v1.8.11/Xray-linux-arm64-v8a.zip"
+                wget -qO /root/agsbx/x.zip "$z" && unzip -o /root/agsbx/x.zip -d /root/agsbx "xray" && rm /root/agsbx/x.zip
+             }
              chmod +x /root/agsbx/xray
         fi
     }
 
+    # --- 增强版：重启并同步出口配置 ---
+    restart_argo_services() {
+    say "正在重新同步固定隧道出口并重启 (临时隧道保持不动)..."
+    
+    # 1. 获取当前最新的全局出口偏好
+    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
+    local lock_ip=""
+    local ds="AsIs"
+    if [[ "$pref" == "v6" ]]; then
+        lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
+        ds="UseIPv6"
+    else
+        lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
+        ds="UseIPv4"
+    fi
+
+    local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
+    [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
+
+    # 2. 精准清理：只清理固定隧道进程，跳过带 _temp 后缀的临时进程
+    # 只针对带 token 的 cloudflared 和 argo_users 目录下的 xray 进行清理
+    pkill -f "cloudflared.*--token" >/dev/null 2>&1
+    pkill -f "/root/agsbx/xray.*argo_users" >/dev/null 2>&1
+    sleep 0.5
+
+    # 3. [已彻底删除] 临时隧道重启逻辑
+    # 此处不再操作 /root/agsbx/temp_node/，以确保临时隧道域名不断开
+
+    # 4. 重新重构所有固定隧道配置并拉起
+    local tags; tags=$(jq -r 'to_entries[] | select(.value.type=="argo" and .value.token!=null) | .key' "$META" 2>/dev/null)
+    for t in $tags; do
+        local p; p=$(jq -r --arg t "$t" '.[$t].port' "$META")
+        local tk; tk=$(jq -r --arg t "$t" '.[$t].token' "$META")
+        local f_cfg="/etc/xray/argo_users/${p}.json"
+        
+        if [[ -f "$f_cfg" ]]; then
+            # 更新固定隧道的出口绑定
+            local f_tmp; f_tmp=$(mktemp)
+            jq --argjson out "[${outbound_json}]" '.outbounds = $out' "$f_cfg" > "$f_tmp" && mv "$f_tmp" "$f_cfg"
+            
+            nohup /root/agsbx/xray run -c "$f_cfg" >/dev/null 2>&1 &
+            nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$tk" >/dev/null 2>&1 &
+            say "固定隧道 [$t] 已按新出口重启"
+        fi
+    done
+    ok "固定隧道已同步重启，临时隧道保持运行 (域名未变)"
+    read -rp "按回车继续..." _
+}
+    # --- 3. 固定隧道 (支持自定义端口) ---
+    add_argo_user() {
+        ensure_argo_deps
+        read -rp "请输入 Cloudflare Tunnel Token: " token
+        [[ -z "$token" ]] && return
+        read -rp "请输入绑定的域名: " domain
+        [[ -z "$domain" ]] && return
+
+        # 新增：自定义端口逻辑
+        read -rp "请输入本地监听端口 (留空则自动分配): " input_port
+        local port=${input_port:-$(get_random_allowed_port "tcp")}
+        
+        # 简单检查端口占用
+        if lsof -i:"$port" >/dev/null 2>&1; then
+            err "端口 $port 已被占用，请更换后重试。"
+            return
+        fi
+
+        local uuid=$(uuidgen); local path="/vm-${port}"; local tag="Argo-${port}"
+        mkdir -p "/etc/xray/argo_users"
+        
+        local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
+        local lock_ip=""; local ds="AsIs"
+        if [[ "$pref" == "v6" ]]; then
+            lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n '); ds="UseIPv6"
+        else
+            lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n '); ds="UseIPv4"
+        fi
+        local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
+        [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
+
+        cat > "/etc/xray/argo_users/${port}.json" <<EOF
+{ "inbounds": [{ "port": ${port}, "listen": "127.0.0.1", "protocol": "vmess", "settings": { "clients": [{ "id": "${uuid}" }] }, "streamSettings": { "network": "ws", "wsSettings": { "path": "${path}" } } }], "outbounds": [ ${outbound_json} ] }
+EOF
+        nohup /root/agsbx/xray run -c "/etc/xray/argo_users/${port}.json" >/dev/null 2>&1 &
+        nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$token" >/dev/null 2>&1 &
+        
+        local vm_json='{"v":"2","ps":"'$tag'","add":"'$domain'","port":"443","id":"'$uuid'","net":"ws","path":"'$path'","tls":"tls","sni":"'$domain'","host":"'$domain'"}'
+        local link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
+        
+        # 存入 Meta，包含 Token 和 Port
+        local tmp=$(mktemp)
+        jq --arg t "$tag" --arg p "$port" --arg d "$domain" --arg raw "$link" --arg tk "$token" \
+          '. + {($t): {type:"argo", subtype:"fixed", port:$p, domain:$d, raw:$raw, token:$tk}}' "$META" >"$tmp" && mv "$tmp" "$META"
+        print_card "固定隧道配置成功" "$tag" "域名: $domain\n端口: $port" "$link"
+    }
+
+    # --- 临时隧道逻辑 (保持不变) ---
     temp_tunnel_logic() {
         ensure_argo_deps
         say "启动临时隧道..."
         local ARGO_DIR="/root/agsbx"
         mkdir -p "$ARGO_DIR/temp_node"
-        
-        # Cleanup
-        pkill -f "cloudflared_temp"
-        pkill -f "xray_temp"
-        
+        pkill -f "cloudflared_temp"; pkill -f "xray_temp"
         cp "$ARGO_DIR/xray" "$ARGO_DIR/temp_node/xray_temp"
         cp "$ARGO_DIR/cloudflared" "$ARGO_DIR/temp_node/cloudflared_temp"
         
-        local port=$((RANDOM % 10000 + 40000))
-        local uuid=$(uuidgen)
-        local path="/$uuid"
-        
-        # Xray Config
+        local port=$((RANDOM % 10000 + 40000)); local uuid=$(uuidgen); local path="/$uuid"
+        local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
+        local lock_ip=""; local ds="AsIs"
+        if [[ "$pref" == "v6" ]]; then
+            lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n '); ds="UseIPv6"
+        else
+            lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n '); ds="UseIPv4"
+        fi
+        local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
+        [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
+
         cat > "$ARGO_DIR/temp_node/config.json" <<EOF
-{ "inbounds": [{ "port": ${port}, "listen": "127.0.0.1", "protocol": "vmess", "settings": { "clients": [{ "id": "${uuid}" }] }, "streamSettings": { "network": "ws", "wsSettings": { "path": "${path}" } } }], "outbounds": [{ "protocol": "freedom" }] }
+{ "inbounds": [{ "port": ${port}, "listen": "127.0.0.1", "protocol": "vmess", "settings": { "clients": [{ "id": "${uuid}" }] }, "streamSettings": { "network": "ws", "wsSettings": { "path": "${path}" } } }], "outbounds": [ ${outbound_json} ] }
 EOF
         nohup "$ARGO_DIR/temp_node/xray_temp" run -c "$ARGO_DIR/temp_node/config.json" >/dev/null 2>&1 &
-        
-        # Cloudflared
         nohup "$ARGO_DIR/temp_node/cloudflared_temp" tunnel --url http://127.0.0.1:$port --no-autoupdate > "$ARGO_DIR/temp_node/cf.log" 2>&1 &
         
         say "正在获取域名 (5s)..."
         sleep 5
         local url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$ARGO_DIR/temp_node/cf.log" | head -n1)
-        if [[ -z "$url" ]]; then err "获取失败"; return; fi
-        
-        local domain=${url#https://}
-        local tag="Argo-Temp"
+        [[ -z "$url" ]] && { err "获取失败"; return; }
+        local domain=${url#https://}; local tag="Argo-Temp"
         local vm_json='{"v":"2","ps":"'$tag'","add":"'$domain'","port":"443","id":"'$uuid'","net":"ws","path":"'$path'","tls":"tls","sni":"'$domain'","host":"'$domain'"}'
         local link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
-        
-        # Update Meta
         local tmp=$(mktemp)
         jq --arg t "$tag" --arg raw "$link" '. + {($t): {type:"argo", subtype:"temp", raw:$raw}}' "$META" >"$tmp" && mv "$tmp" "$META"
-        
         print_card "临时隧道成功" "$tag" "域名: $domain" "$link"
         read -rp "按回车继续..." _
     }
-    
-    add_argo_user() {
-        ensure_argo_deps
-        read -rp "Token: " token
-        [[ -z "$token" ]] && return
-        read -rp "域名: " domain
-        read -rp "本地端口: " port
-        
-        local uuid=$(uuidgen)
-        local path="/vm-${port}"
-        local tag="Argo-${port}"
-        
-        # Config & Services setup (Simplifying text but logic is same)
-        mkdir -p "/etc/xray/argo_users"
-        cat > "/etc/xray/argo_users/${port}.json" <<EOF
-{ "inbounds": [{ "port": ${port}, "listen": "127.0.0.1", "protocol": "vmess", "settings": { "clients": [{ "id": "${uuid}" }] }, "streamSettings": { "network": "ws", "wsSettings": { "path": "${path}" } } }], "outbounds": [{ "protocol": "freedom" }] }
-EOF
-        # Start processes (Fixed nodes)
-        nohup /root/agsbx/xray run -c "/etc/xray/argo_users/${port}.json" >/dev/null 2>&1 &
-        nohup /root/agsbx/cloudflared tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "$token" --url "http://127.0.0.1:${port}" >/dev/null 2>&1 &
-        
-        local vm_json='{"v":"2","ps":"'$tag'","add":"'$domain'","port":"443","id":"'$uuid'","net":"ws","path":"'$path'","tls":"tls","sni":"'$domain'","host":"'$domain'"}'
-        local link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
-        
-        local tmp=$(mktemp)
-        jq --arg t "$tag" --arg p "$port" --arg d "$domain" --arg raw "$link" '. + {($t): {type:"argo", port:$p, domain:$d, raw:$raw}}' "$META" >"$tmp" && mv "$tmp" "$META"
-        ok "添加成功"
-    }
-    
+
     uninstall_argo_all() {
-        pkill -f /root/agsbx
+        pkill -f "/root/agsbx"
         rm -rf /root/agsbx
         local tmp=$(mktemp)
         jq 'to_entries | map(select(.value.type != "argo")) | from_entries' "$META" > "$tmp" && mv "$tmp" "$META"
-        ok "Argo 已卸载"
+        ok "Argo 数据已清理"
     }
 
     while true; do
-      say "====== Cloudflare 隧道管理 ======"
+      echo -e "\n${C_CYAN}====== Cloudflare 隧道管理 ======${C_RESET}"
       say "1) 临时隧道"
       say "2) 固定隧道 (Token)"
-      say "3) 卸载/清理"
+      say "3) 重启所有隧道服务 ${C_GREEN}(新增)${C_RESET}"
+      say "4) 卸载/清理"
       say "0) 返回"
       safe_read ac "选择: "
       case "$ac" in
           1) temp_tunnel_logic ;;
           2) add_argo_user ;;
-          3) uninstall_argo_all ;;
+          3) restart_argo_services ;;
+          4) uninstall_argo_all ;;
           0) return ;;
       esac
     done
@@ -3560,8 +3740,14 @@ fi
 
 
 main_menu() {
-  update_ip_async 
   while true; do
+    # 核心：如果发现 Xray 锁定了 IP 但探测结果还没出来，就尝试触发一次探测
+    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
+    local lock_ip=""; [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null) || lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null)
+
+    if [[ -n "$lock_ip" && ! -f "${IP_CACHE_FILE}_xray_status" ]]; then
+        update_ip_async
+    fi
     show_menu_banner
     echo -e ""
     echo -e " ${C_GREEN}1.${C_RESET} 添加节点 "

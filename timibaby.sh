@@ -3250,9 +3250,9 @@ get_iface_local_ip6() {
     echo "$ip"
   }
 
-  describe_outbound_tag() {
+  # 修复后的函数 1：统一使用管道符分隔输出
+describe_outbound_tag() {
   local tag="$1"
-  # 显式使用 jq 提取并以制表符分隔，防止空格干扰
   jq -r --arg t "$tag" '
     .outbounds[]? | select(.tag == $t)
     | [
@@ -3260,39 +3260,39 @@ get_iface_local_ip6() {
         (.server // .address // .host // .settings.servers[0].address // "未知"),
         ((.server_port // .port // .settings.servers[0].port // "0") | tostring)
       ]
-    | @tsv
+    | join("|")
   ' "$CONFIG" 2>/dev/null
 }
 
-  build_proxy_out_display() {
-    local tag="$1"
-    local info type host port
-    info="$(describe_outbound_tag "$tag")"
+# 修复后的函数 2：确保使用字符串判定
+build_proxy_out_display() {
+  local tag="$1"
+  local info type host port
+  info="$(describe_outbound_tag "$tag")"
 
-    # 使用 cut 确保提取正确，避免空格干扰
-    type="$(echo "$info" | cut -f1)"
-    host="$(echo "$info" | cut -f2)"
-    port="$(echo "$info" | cut -f3)"
+  # 现在 cut -d'|' 可以正确工作了
+  type="$(echo "$info" | cut -d'|' -f1)"
+  host="$(echo "$info" | cut -d'|' -f2)"
+  port="$(echo "$info" | cut -d'|' -f3)"
 
-    # 修复核心：严禁在此处使用 (( ))
-    if [[ -z "$host" || "$host" == "未知" ]]; then
-        echo "${tag}  (配置缺失)"
-        return
-    fi
+  # 判定 host 是否有效，严格使用 [[ ]]
+  if [[ -z "$host" || "$host" == "未知" ]]; then
+      echo "${tag}  (配置信息缺失)"
+      return
+  fi
 
-    local real_ip="" cc="??"
-    # 先尝试直接解析，如果 host 本身是 IP，resolve 函数应直接返回它
-    real_ip="$(resolve_host_ip_cached "$host")"
+  local real_ip="" cc="??"
+  # 解析 IP (resolve_host_ip_cached 内部也必须是 [[ ]] 判定)
+  real_ip="$(resolve_host_ip_cached "$host")"
 
-    if [[ -n "$real_ip" ]]; then
-        # 调用你已经修复了 -4 参数的 get_ip_country 函数
-        cc="$(get_ip_country "$real_ip")"
-        echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
-    else
-        # 如果解析不到 IP，尝试直接对 host 运行一次国家查询（兜底方案）
-        cc="$(get_ip_country "$host")"
-        echo "${tag}  ${host}:${port} -> ${host} [${cc}] (${type})"
-    fi
+  if [[ -n "$real_ip" ]]; then
+      cc="$(get_ip_country "$real_ip")"
+      echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
+  else
+      # 兜底：如果解析失败，尝试直接查 host
+      cc="$(get_ip_country "$host")"
+      echo "${tag}  ${host}:${port} -> ${host} [${cc}] (${type})"
+  fi
 }
 
   # 0) 基础结构初始化 (确保 route/outbounds 存在)

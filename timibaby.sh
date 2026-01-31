@@ -3265,32 +3265,34 @@ get_iface_local_ip6() {
 }
 
   build_proxy_out_display() {
-  local tag="$1"
-  local info type host port
-  info="$(describe_outbound_tag "$tag")"
+    local tag="$1"
+    local info type host port
+    info="$(describe_outbound_tag "$tag")"
 
-  # 使用制表符切分，避免 IP 包含特殊字符
-  type="$(echo "$info" | cut -f1)"
-  host="$(echo "$info" | cut -f2)"
-  port="$(echo "$info" | cut -f3)"
+    # 使用 cut 确保提取正确，避免空格干扰
+    type="$(echo "$info" | cut -f1)"
+    host="$(echo "$info" | cut -f2)"
+    port="$(echo "$info" | cut -f3)"
 
-  # 修复核心：使用 [[ ]] 字符串判断，严禁使用 (( )) 处理 host
-  if [[ -z "$host" || "$host" == "未知" ]]; then
-    echo "${tag}  (配置信息缺失)"
-    return
-  fi
+    # 修复核心：严禁在此处使用 (( ))
+    if [[ -z "$host" || "$host" == "未知" ]]; then
+        echo "${tag}  (配置缺失)"
+        return
+    fi
 
-  local real_ip="" cc="??"
-  # 解析域名或直接使用 IP
-  real_ip="$(resolve_host_ip_cached "$host")"
-  
-  if [[ -n "$real_ip" ]]; then
-    # 调用 API 获取国家
-    cc="$(get_ip_country "$real_ip")"
-    echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
-  else
-    echo "${tag}  ${host}:${port} -> 无法解析 [??] (${type})"
-  fi
+    local real_ip="" cc="??"
+    # 先尝试直接解析，如果 host 本身是 IP，resolve 函数应直接返回它
+    real_ip="$(resolve_host_ip_cached "$host")"
+
+    if [[ -n "$real_ip" ]]; then
+        # 调用你已经修复了 -4 参数的 get_ip_country 函数
+        cc="$(get_ip_country "$real_ip")"
+        echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
+    else
+        # 如果解析不到 IP，尝试直接对 host 运行一次国家查询（兜底方案）
+        cc="$(get_ip_country "$host")"
+        echo "${tag}  ${host}:${port} -> ${host} [${cc}] (${type})"
+    fi
 }
 
   # 0) 基础结构初始化 (确保 route/outbounds 存在)

@@ -13,8 +13,9 @@ if ! [[ -t 0 ]]; then
 fi
 
 export LC_ALL=C  # 优化 grep/sed/awk 处理速度
-
-# GEO 缓存（Bash 4+ 才支持关联数组；旧环境自动降级不报错）
+# 必须显式声明，否则 IP 地址索引会触发算术运算报错
+declare -A _HOST2IP 2>/dev/null || true
+declare -A _seen6 2>/dev/null || true
 declare -A GEO_CACHE 2>/dev/null || true
 
 # ============= 0. 全局配置与 UI 变量 =============
@@ -3350,23 +3351,33 @@ while read -r iface _ip; do
 done < <(ip -4 -o addr show | awk '/inet 10\./{split($4,a,"/"); print $2, a[1]}')
 
 
-# v6：候选接口（fd00/2xxx）
-# 原代码：按接口名去重
+# 1. 必须在函数开头或循环前声明关联数组（Bash 5.2 环境下必须）
+declare -A _seen6 2>/dev/null || true
+
 while read -r iface _ip; do
   [[ -n "$iface" ]] || continue
-  [[ -n "${_seen6[$_ip]:-}" ]] && continue _seen6[$_ip]=1
+  
+  # 2. 关键修复：使用实际分配的 IP ($_ip) 去重，而不是网卡名
+  [[ -n "${_seen6[$_ip]:-}" ]] && continue 
+  _seen6[$_ip]=1
 
   local lip pub cc line
-  lip="$(get_iface_local_ip6 "$iface")"
-  [[ -z "$lip" ]] && { _fail6+=("$iface"); continue; }
+  # 3. 直接使用扫到的 IP 作为本地 IP
+  lip="$_ip" 
 
-  pub="$(get_iface_public_ip "$iface" 6)"
-  [[ -z "$pub" ]] && { _fail6+=("$iface"); continue; }
+  # 4. 探测该具体 IP 的公网出口（增加 --interface 绑定）
+  pub=$(curl -s -6 --interface "$_ip" --connect-timeout 2 --max-time 3 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
+  
+  # 如果绑定 IP 探测失败，尝试网卡探测兜底
+  [[ -z "$pub" ]] && pub=$(curl -s -6 --interface "$iface" --max-time 2 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
+  [[ -z "$pub" ]] && continue
 
   cc="$(get_ip_country "$pub")"
   line="${pub} [${cc}] (${iface})|${lip}"
   LOCAL_V6+=("$line")
-done < <(ip -6 -o addr show | awk '/inet6 (fd00|2)/{split($4,a,"/"); print $2, a[1]}')
+
+# 5. 优化 awk：只抓取 global 状态且非临时（temporary）的地址
+done < <(ip -6 addr show scope global | grep -v "temporary" | awk '/inet6 [23]/ {split($2,a,"/"); print $NF, a[1]}')
 
 [ ${#_fail4[@]} -gt 0 ] && echo -e "${C_GRAY}⚠ IPv4 以下接口未探测到公网/本地源IP，已跳过: ${_fail4[*]}${C_RESET}"
 [ ${#_fail6[@]} -gt 0 ] && echo -e "${C_GRAY}⚠ IPv6 以下接口未探测到公网/本地源IP，已跳过: ${_fail6[*]}${C_RESET}"

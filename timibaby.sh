@@ -3258,59 +3258,47 @@ get_iface_local_ip6() {
   }
 
   describe_outbound_tag() {
-    local tag="$1"
-    # 输出格式：type|host|port
-    jq -r --arg t "$tag" '
-      .outbounds[] | select(.tag == $t)
-      | [
-          (.type // "unknown"),
-          (
-            .server
-            // .address
-            // .host
-            // .settings.servers[0].address
-            // .settings.servers[0].server
-            // .settings.vnext[0].address
-            // .vnext[0].address
-            // ""
-          ),
-          (
-            (.server_port // .port // .settings.servers[0].port // .settings.vnext[0].port // .vnext[0].port // "")
-            | tostring
-          )
-        ]
-      | @tsv
-    ' "$CONFIG" 2>/dev/null
-  }
+  local tag="$1"
+  # 显式使用 jq 提取并以制表符分隔，防止空格干扰
+  jq -r --arg t "$tag" '
+    .outbounds[]? | select(.tag == $t)
+    | [
+        (.type // "unknown"),
+        (.server // .address // .host // .settings.servers[0].address // "未知"),
+        ((.server_port // .port // .settings.servers[0].port // "0") | tostring)
+      ]
+    | @tsv
+  ' "$CONFIG" 2>/dev/null
+}
 
   build_proxy_out_display() {
-    local tag="$1"
-    local info type host port
-    info="$(describe_outbound_tag "$tag")"
+  local tag="$1"
+  local info type host port
+  info="$(describe_outbound_tag "$tag")"
 
-    type="$(echo "$info" | awk '{print $1}')"
-    host="$(echo "$info" | awk '{print $2}')"
-    port="$(echo "$info" | awk '{print $3}')"
+  # 使用制表符切分，避免 IP 包含特殊字符
+  type="$(echo "$info" | cut -f1)"
+  host="$(echo "$info" | cut -f2)"
+  port="$(echo "$info" | cut -f3)"
 
-    [[ -z "$host" ]] && host="未知"
-    [[ -z "$port" || "$port" == "null" ]] && port="??"
-    [[ -z "$type" ]] && type="unknown"
+  # 修复核心：使用 [[ ]] 字符串判断，严禁使用 (( )) 处理 host
+  if [[ -z "$host" || "$host" == "未知" ]]; then
+    echo "${tag}  (配置信息缺失)"
+    return
+  fi
 
-    local real_ip="" cc="??"
-    if [[ "$host" != "未知" ]]; then
-      real_ip="$(resolve_host_ip_cached "$host")"
-      if [[ -n "$real_ip" ]]; then
-        cc="$(get_ip_country "$real_ip")"
-      fi
-    fi
-
-    # 展示：tag  host:port -> real_ip [CC] (type)
-    if [[ -n "$real_ip" ]]; then
-      echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
-    else
-      echo "${tag}  ${host}:${port} -> ?? [??] (${type})"
-    fi
-  }
+  local real_ip="" cc="??"
+  # 解析域名或直接使用 IP
+  real_ip="$(resolve_host_ip_cached "$host")"
+  
+  if [[ -n "$real_ip" ]]; then
+    # 调用 API 获取国家
+    cc="$(get_ip_country "$real_ip")"
+    echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
+  else
+    echo "${tag}  ${host}:${port} -> 无法解析 [??] (${type})"
+  fi
+}
 
   # 0) 基础结构初始化 (确保 route/outbounds 存在)
   safe_json_edit "$CONFIG" '(.route //= {}) | (.route.rules //= []) | (.outbounds //= []) | (.inbounds //= [])' >/dev/null 2>&1 || true

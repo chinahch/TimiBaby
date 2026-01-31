@@ -311,7 +311,7 @@ get_all_ips_with_geo() {
         mapfile -t _lands < <(
             ip -4 -o addr show 2>/dev/null \
             | awk -v re="$iface_re" '
-                $2 ~ re && $4 ~ /^10\./ {split($4,a,"/"); print a[1]"\t"$2}
+                $2 ~ re && $4 ~ /^(10\.|172\.|192\.168\.)/ {split($4,a,"/"); print a[1]"\t"$2}
             ' | sort -u
         )
 
@@ -3348,8 +3348,7 @@ while read -r iface _ip; do
   cc="$(get_ip_country "$pub")"
   line="${pub} [${cc}] (${iface})|${lip}"
   LOCAL_V4+=("$line")
-done < <(ip -4 -o addr show | awk '/inet 10\./{split($4,a,"/"); print $2, a[1]}')
-
+done < <(ip -4 -o addr show | awk '/inet (10\.|172\.|192\.168\.)/{split($4,a,"/"); print $2, a[1]}')
 
 # 1. 必须在函数开头或循环前声明关联数组（Bash 5.2 环境下必须）
 declare -A _seen6 2>/dev/null || true

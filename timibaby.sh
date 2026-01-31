@@ -199,20 +199,13 @@ get_ip_country() {
 
     local code="??"
 
-    # A) ip-api（改用 HTTPS，避免 http 被挡/被劫持）
-    code=$(curl -s --max-time 1.5 "https://ip-api.com/json/${ip}?fields=countryCode" \
+    # 修复核心：增加 -4 参数强制使用 IPv4 访问地理位置接口
+    code=$(curl -s -4 --max-time 2 "https://ip-api.com/json/${ip}?fields=countryCode" \
         | jq -r '.countryCode // empty' 2>/dev/null)
-
-    # B) 兜底 1：api.country.is（非常快，返回 {"country":"US","ip":"x"}）
+        
+    # 如果还是失败，切换到备用接口
     if [[ -z "$code" || "$code" == "null" ]]; then
-        code=$(curl -s --max-time 1.5 "https://api.country.is/${ip}" \
-            | jq -r '.country // empty' 2>/dev/null)
-    fi
-
-    # C) 兜底 2：ipwho.is（返回 country_code）
-    if [[ -z "$code" || "$code" == "null" ]]; then
-        code=$(curl -s --max-time 2 "https://ipwho.is/${ip}" \
-            | jq -r '.country_code // empty' 2>/dev/null)
+        code=$(curl -s -4 --max-time 2 "https://api.country.is/${ip}" | jq -r '.country // empty' 2>/dev/null)
     fi
 
     [[ -z "$code" || "$code" == "null" ]] && code="??"

@@ -3369,10 +3369,11 @@ done < <(ip -4 -o addr show | awk '/inet 10\./{split($4,a,"/"); print $2, a[1]}'
 
 
 # v6：候选接口（fd00/2xxx）
+# 原代码：按接口名去重
 while read -r iface _ip; do
   [[ -n "$iface" ]] || continue
-  [[ -n "${_seen6[$_ip]:-}" ]] && continue
-  _seen6[$_ip]=1
+  [[ -n "${_seen6[$iface]:-}" ]] && continue  # 这里导致了重复网卡被跳过
+  _seen6[$iface]=1
 
   local lip pub cc line
   lip="$(get_iface_local_ip6 "$iface")"

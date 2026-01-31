@@ -3253,6 +3253,7 @@ get_iface_local_ip6() {
   # 修复后的函数 1：统一使用管道符分隔输出
 describe_outbound_tag() {
   local tag="$1"
+  # 统一使用 join("|") 代替 @tsv，确保切割逻辑一致
   jq -r --arg t "$tag" '
     .outbounds[]? | select(.tag == $t)
     | [
@@ -3270,31 +3271,29 @@ build_proxy_out_display() {
   local info type host port
   info="$(describe_outbound_tag "$tag")"
 
-  # 现在 cut -d'|' 可以正确工作了
+  # 使用管道符 | 切割变量
   type="$(echo "$info" | cut -d'|' -f1)"
   host="$(echo "$info" | cut -d'|' -f2)"
-  port="$(echo "$info" | cut -d'|' -f3)"
+  port="$(echo "$info" | cut -f3)"
 
-  # 判定 host 是否有效，严格使用 [[ ]]
+  # 严格使用 [[ ]] 字符串判断，避免触发 Bash 算术运算
   if [[ -z "$host" || "$host" == "未知" ]]; then
-      echo "${tag}  (配置信息缺失)"
+      echo "${tag}  (配置缺失)"
       return
   fi
 
   local real_ip="" cc="??"
-  # 解析 IP (resolve_host_ip_cached 内部也必须是 [[ ]] 判定)
+  # 解析 IP (resolve_host_ip_cached 内部建议同步检查)
   real_ip="$(resolve_host_ip_cached "$host")"
 
   if [[ -n "$real_ip" ]]; then
       cc="$(get_ip_country "$real_ip")"
       echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
   else
-      # 兜底：如果解析失败，尝试直接查 host
       cc="$(get_ip_country "$host")"
       echo "${tag}  ${host}:${port} -> ${host} [${cc}] (${type})"
   fi
 }
-
   # 0) 基础结构初始化 (确保 route/outbounds 存在)
   safe_json_edit "$CONFIG" '(.route //= {}) | (.route.rules //= []) | (.outbounds //= []) | (.inbounds //= [])' >/dev/null 2>&1 || true
 
@@ -3355,8 +3354,7 @@ done < <(ip -4 -o addr show | awk '/inet 10\./{split($4,a,"/"); print $2, a[1]}'
 # 原代码：按接口名去重
 while read -r iface _ip; do
   [[ -n "$iface" ]] || continue
-  [[ -n "${_seen6[$iface]:-}" ]] && continue  # 这里导致了重复网卡被跳过
-  _seen6[$iface]=1
+  [[ -n "${_seen6[$_ip]:-}" ]] && continue _seen6[$_ip]=1
 
   local lip pub cc line
   lip="$(get_iface_local_ip6 "$iface")"

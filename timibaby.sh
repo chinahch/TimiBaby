@@ -3593,18 +3593,24 @@ fi
 }
 # ============= 6. 极速启动逻辑 (脚本执行入口) =============
 
-# ============= 6. 极速启动逻辑 (脚本执行入口) =============
-
-# --- 1. 定义快捷键函数 ---
 setup_shortcuts() {
   local SCRIPT_PATH
-  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo '/usr/local/bin/timibaby')"
+  # 1. 获取脚本的绝对路径
+  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null)"
+  
+  # 2. 如果获取失败（极少数情况），则使用当前执行命令时的路径
+  [[ -z "$SCRIPT_PATH" ]] && SCRIPT_PATH="$PWD/$(basename "$0")"
+
   if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
-  if ! grep -q "alias my=" /root/.bashrc; then
-      echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
-      echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
-      ok "快捷指令 'my' 已设置，下次登录生效"
-  fi
+
+  # 3. 改进逻辑：先删除旧的（无论对错），再写入最新的
+  # 这样无论你脚本叫什么、放哪里，每次运行都会自动校准别名
+  sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
+  echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
+  echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
+  
+  # 只有在第一次设置或路径变动时才提示，避免每次运行都刷屏
+  # ok "快捷指令 'my' 已同步至最新路径: $SCRIPT_PATH"
 }
 
 # --- 2. 启动执行流程 ---

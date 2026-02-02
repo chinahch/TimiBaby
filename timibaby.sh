@@ -2158,7 +2158,6 @@ EOF
     done
 }
 
-# --- View / Delete Nodes (Original Logic) ---
 view_nodes_menu() {
   # 1. 基础环境与显示优化准备
   local V4_ADDR=$(get_public_ipv4_ensure)
@@ -2169,46 +2168,58 @@ view_nodes_menu() {
   [[ -f "$META" ]] && meta_json=$(cat "$META")
 
   # 存储用于详情跳转的索引数据
-  local -a NODE_TAGS=()
-  local -a NODE_TYPES=()
-  local -a NODE_PORTS=()
-  local -a NODE_IPS=()
-  local -a NODE_V_DISP=()
+  NODE_TAGS=()
+  NODE_TYPES=()
+  NODE_PORTS=()
+  NODE_IPS=()
+  NODE_V_DISP=()
   local idx=1
 
   # 汇总并去重所有标签 (从运行配置和元数据文件中聚合)
   local all_tags
   all_tags=$( (jq -r '.inbounds[].tag // empty' "$CONFIG" 2>/dev/null; jq -r 'keys[]' "$META" 2>/dev/null) | sort -u)
 
-  echo -e "\n${C_CYAN}=== 节点列表预览 (选择序号查看详情) ===${C_RESET}"
+  echo -e "\n${C_CYAN}=== 节点列表预览 (严格单行对齐) ===${C_RESET}"
   echo -e "➜ ${C_GRAY}正在聚合节点出口状态...${C_RESET}"
 
-  # 使用缓冲区实现“一次性全显”，消除跳跃感
-  local menu_buffer=""
+  # 打印表头，确保视觉对齐
+  echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+  printf " ${C_YELLOW}%-4s | %-20s | %-15s | %-8s | %-15s${C_RESET}\n" "序号" "节点标签" "协议/状态" "端口" "出口地址"
+  echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
 
   while read -r tag; do
       [[ -z "$tag" || "$tag" == "null" ]] && continue
       
-      # 2. 获取节点基础信息 (优先从运行配置读取，Meta 兜底)
+      # 2. 获取节点基础信息 (修复端口显示 0 问题)
       local type=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .type // empty' "$CONFIG" 2>/dev/null)
       [[ -z "$type" ]] && type=$(jq -r --arg t "$tag" '.[$t].type // "UNKNOWN"' "$META" 2>/dev/null)
       
-      local port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen_port // empty' "$CONFIG" 2>/dev/null)
+      local port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | (.port // .listen_port // empty)' "$CONFIG" 2>/dev/null)
       [[ -z "$port" || "$port" == "null" ]] && port=$(jq -r --arg t "$tag" '.[$t].port // "0"' "$META" 2>/dev/null)
 
       # 3. 判定 IP 版本与出口显示
-      local fixed_ip=$(jq -r --arg t "$tag" '.[$t].fixed_ip // empty' "$META" 2>/dev/null)
-      local node_v=$(jq -r --arg t "$tag" '.[$t].ip_version // empty' "$META" 2>/dev/null)
+      local fixed_ip=$(echo "$meta_json" | jq -r --arg t "$tag" '.[$t].fixed_ip // empty')
+      local node_v=$(echo "$meta_json" | jq -r --arg t "$tag" '.[$t].ip_version // empty')
       local use_v=${node_v:-$global_pref} 
       
       local CURRENT_IP="$V4_ADDR"
       [[ "$use_v" == "v6" && -n "$V6_ADDR" ]] && CURRENT_IP="$V6_ADDR"
-      [[ -n "$fixed_ip" && "$fixed_ip" != "null" ]] && CURRENT_IP="$fixed_ip"
+      [[ -n "$fixed_ip" && "$fixed_ip" != "null" && "$fixed_ip" != "" ]] && CURRENT_IP="$fixed_ip"
 
-      # 4. 规范化协议名称显示
+      # 4. 规范化协议名称与 Argo 状态识别
+      local check_type="${type,,}" # 转为小写判断
       local display_type="${type^^}"
-      [[ "$type" == "vless" ]] && display_type="VLESS-REALITY"
-      [[ "$type" == "argo" ]] && display_type="ARGO-TUNNEL"
+      
+      if [[ "$check_type" == "vless" ]]; then
+          display_type="VLESS-REALITY"
+      elif [[ "$check_type" == "argo" ]]; then
+          # 核心修复点：通过 fixed_ip 判定 Argo 类型
+          if [[ -n "$fixed_ip" && "$fixed_ip" != "null" && "$fixed_ip" != "" ]]; then
+              display_type="ARGO-FIXED"
+          else
+              display_type="ARGO-TEMP"
+          fi
+      fi
 
       # 存储数据
       NODE_TAGS+=("$tag")
@@ -2219,22 +2230,22 @@ view_nodes_menu() {
 
       local geo=$(get_ip_country "$CURRENT_IP")
       
-      # 5. 构建缓冲行：格式为 [序号] 标签 (协议 | 端口:xxx | 出口:v4 [国家])
+      # 5. 严格垂直对齐打印
       local line_color="$C_YELLOW"
-      [[ "$type" != "vless" && "$type" != "socks" ]] && line_color="$C_PURPLE"
+      [[ "$check_type" != "vless" && "$check_type" != "socks" ]] && line_color="$C_PURPLE"
       
-      local formatted_line=$(printf " ${C_GREEN}[%d]${C_RESET} ${line_color}%-20s${C_RESET} ${C_GRAY}(%s | 端口:%s | 出口:%s [%s])${C_RESET}\n" \
-              "$idx" "$tag" "$display_type" "$port" "$use_v" "$geo")
-      menu_buffer+="$formatted_line"
+      # 限制标签显示长度并执行单行打印
+      local short_tag="${tag:0:20}"
+      printf " ${C_GREEN}[%2d]${C_RESET} | ${line_color}%-20s${C_RESET} | %-15s | %-8s | %-15s\n" \
+              "$idx" "$short_tag" "$display_type" "$port" "$use_v [$geo]"
       
       ((idx++))
   done <<< "$all_tags"
 
-  # 一次性打印列表
-  echo -e "$menu_buffer"
+  echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
   echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单"
 
-  # 6. 二级详情查看逻辑
+  # 6. 二级详情查看逻辑 (完整版)
   read -rp " 请选择要查看详情的节点序号: " v_choice
   [[ -z "$v_choice" || "$v_choice" == "0" ]] && return
 
@@ -2244,33 +2255,36 @@ view_nodes_menu() {
   local t_ip="${NODE_IPS[$sel_idx]}"
   local t_port="${NODE_PORTS[$sel_idx]}"
   
-  [[ -z "$target_tag" ]] && { err "无效序号"; sleep 1; return; }
+  [[ -z "$target_tag" ]] && { echo -e "${C_RED}错误：无效序号${C_RESET}"; sleep 1; return; }
 
   # 展示详情卡片
   local final_link=""
-  if [[ "$t_type" == "socks" ]]; then
+  if [[ "${t_type,,}" == "socks" ]]; then
       local user=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].username // "user"' "$CONFIG" 2>/dev/null)
       local pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].password // "pass"' "$CONFIG" 2>/dev/null)
       final_link="socks://$(printf "%s:%s" "$user" "$pass" | base64 -w0)@${t_ip}:${t_port}#${target_tag}"
       print_card "SOCKS5 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n用户: ${user}\n密码: ${pass}" "$final_link"
-  elif [[ "$t_type" == "vless" ]]; then
+
+  elif [[ "${t_type,,}" == "vless" ]]; then
       local uuid=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG" 2>/dev/null)
       local pbk=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')
       local sid=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')
       local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')
       final_link="vless://${uuid}@${t_ip}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
       print_card "VLESS-REALITY 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\nSNI: ${sni}\nPublic Key: ${pbk}\nShort ID: ${sid}" "$final_link"
-  elif [[ "$t_type" == "hysteria2" ]]; then
+
+  elif [[ "${t_type,,}" == "hysteria2" ]]; then
       local auth=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth')
       local obfs=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].obfs')
       local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni')
       final_link="hysteria2://${auth}@${t_ip}:${t_port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${target_tag}"
       print_card "Hysteria2 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n认证: ${auth}\n混淆: ${obfs}\nSNI: ${sni}" "$final_link"
-  elif [[ "$t_type" == "argo" ]]; then
+
+  elif [[ "${t_type,,}" == "argo" ]]; then
       final_link=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].raw')
       print_card "Argo Tunnel 详情" "$target_tag" "出口类型: Cloudflare 隧道" "$final_link"
-  elif [[ "$t_type" == "vmess" ]]; then
-      # 如果有导入过 VMess 落地出口，这里也可以查看
+
+  elif [[ "${t_type,,}" == "vmess" ]]; then
       local uuid=$(jq -r --arg t "$target_tag" '.outbounds[] | select(.tag==$t) | .settings.vnext[0].users[0].id' "$CONFIG" 2>/dev/null)
       print_card "VMess 落地详情" "$target_tag" "此为落地出口节点，UUID: ${uuid}" "需配合分流规则使用"
   fi
@@ -2553,8 +2567,93 @@ repair_config_structure() {
 }
 
 
-# 查看并删除落地出口 (显示 IP:端口 + 国家版)
-# 查看并删除落地出口 (显示 IP:端口 + 国家版) — 修复：过滤掉裸 direct / 空tag
+# 查看并删除落地出口 (显示更准：支持域名解析/显示直连绑定出口)
+# -----------------------------
+# Outbound 显示增强：为菜单展示 tag -> server:port (type) [国家]
+# -----------------------------
+
+resolve_host_ip_cached() {
+  local host="$1"
+  [[ -z "$host" ]] && { echo ""; return 0; }
+
+  # 已经是 IP
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$host" == *:* ]]; then
+    echo "$host"
+    return 0
+  fi
+
+  # cache
+  if [[ -n "${_HOST2IP[$host]:-}" ]]; then
+    echo "${_HOST2IP[$host]}"
+    return 0
+  fi
+
+  local ip=""
+  if command -v getent >/dev/null 2>&1; then
+    ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    [[ -z "$ip" ]] && ip="$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+  fi
+  if [[ -z "$ip" ]] && command -v dig >/dev/null 2>&1; then
+    ip="$(dig +short A "$host" 2>/dev/null | head -n1)"
+    [[ -z "$ip" ]] && ip="$(dig +short AAAA "$host" 2>/dev/null | head -n1)"
+  fi
+
+  _HOST2IP["$host"]="$ip"
+  echo "$ip"
+}
+
+format_outbound_label() {
+  local tag="$1"
+  [[ -z "$tag" || "$tag" == "null" ]] && { echo ""; return 0; }
+
+  # 内置直连
+  if [[ "$tag" == "direct" ]]; then
+    echo "直连 (direct)"
+    return 0
+  fi
+
+  # 读取 model config 里的 outbound（sing-box 风格）
+  local ob
+  ob="$(jq -c --arg t "$tag" '.outbounds[]? | select(.tag==$t)' "$CONFIG" 2>/dev/null)"
+  if [[ -z "$ob" || "$ob" == "null" ]]; then
+    echo ""
+    return 0
+  fi
+
+  local type server port sendThrough
+  type="$(echo "$ob" | jq -r '.type // "unknown"' 2>/dev/null)"
+  server="$(echo "$ob" | jq -r '.server // .address // .host // empty' 2>/dev/null)"
+  port="$(echo "$ob" | jq -r '.server_port // .port // empty' 2>/dev/null)"
+  sendThrough="$(echo "$ob" | jq -r '.sendThrough // .send_through // empty' 2>/dev/null)"
+
+  # direct + sendThrough（旧残留）：显示绑定 IP + 国家
+  if [[ "$type" == "direct" ]]; then
+    if [[ -n "$sendThrough" ]]; then
+      local cc="??"
+      cc="$(get_ip_country "$sendThrough" 2>/dev/null || echo "??")"
+      echo "${sendThrough} (direct) [${cc}]"
+    else
+      echo "直连 (direct)"
+    fi
+    return 0
+  fi
+
+  [[ -z "$server" ]] && server="未知"
+  [[ -z "$port" || "$port" == "null" ]] && port="??"
+
+  local ip="" cc="??"
+  if [[ "$server" != "未知" ]]; then
+    ip="$(resolve_host_ip_cached "$server")"
+    [[ -n "$ip" ]] && cc="$(get_ip_country "$ip" 2>/dev/null || echo "??")"
+  fi
+
+  if [[ -n "$ip" ]]; then
+    echo "${server}:${port} (${type}) -> ${ip} [${cc}]"
+  else
+    echo "${server}:${port} (${type}) [${cc}]"
+  fi
+}
+
 list_and_del_outbounds() {
     local menu_buffer=""
     menu_buffer+="\n${C_CYAN}=== 当前落地出口列表 (管理自定义落地) ===${C_RESET}\n"
@@ -2564,81 +2663,62 @@ list_and_del_outbounds() {
     # 仅展示“可管理的自定义落地”：
     # - tag 必须存在且非空
     # - 排除 tag=direct
+    # - 排除 LOCAL-OUT-*（自动生成的 direct 出站）
     # - 排除“裸 direct”（type=direct 且没有 sendThrough/send_through）
-    #   （如果你未来确实用 direct+sendThrough 当作“绑定出口IP”，它会被显示出来）
     mapfile -t TAG_LIST < <(
       jq -r '
         .outbounds[]?
         | select(.tag != null and (.tag|tostring|length) > 0)
         | select(.tag != "direct")
+        | select((.tag|test("^LOCAL-OUT-")) | not)
         | select(.type != "direct" or ((.sendThrough // .send_through // "")|tostring|length) > 0)
         | .tag
       ' "$CONFIG" 2>/dev/null
     )
 
-    if [ ${#TAG_LIST[@]} -eq 0 ]; then
-        warn "当前没有可删除的自定义落地。"
-        return
+    if [[ ${#TAG_LIST[@]} -eq 0 ]]; then
+      warn "当前没有可管理的自定义落地。"
+      return
     fi
 
-    local i=0
-    for tag in "${TAG_LIST[@]}"; do
-        i=$((i+1))
-
-        # 尽量兼容多种 outbound：优先 server/server_port；否则尝试 address/port；再否则显示占位
-        local ob_info
-        ob_info=$(jq -r --arg t "$tag" '
-          .outbounds[] | select(.tag == $t)
-          | "\(.type // "unknown")|\(.server // .address // .host // "")|\(.server_port // .port // "")"
-        ' "$CONFIG" 2>/dev/null)
-
-        local type_info server_addr server_port
-        type_info=$(echo "$ob_info" | cut -d'|' -f1)
-        server_addr=$(echo "$ob_info" | cut -d'|' -f2)
-        server_port=$(echo "$ob_info" | cut -d'|' -f3)
-
-        # 兜底显示
-        [[ -z "$server_addr" ]] && server_addr="未知"
-        [[ -z "$server_port" ]] && server_port="??"
-
-        # 只有像正常地址时才查国家，避免 "未知" 触发无意义查询
-        local geo="??"
-        if [[ "$server_addr" != "未知" && "$server_addr" != "N/A" && -n "$server_addr" ]]; then
-            geo=$(get_ip_country "$server_addr")
-        fi
-
-        menu_buffer+=" ${C_GREEN}[$i]${C_RESET} ${C_YELLOW}${server_addr}:${server_port}${C_RESET} ${C_GRAY}(${type_info})${C_RESET} ${C_PURPLE}[${geo}]${C_RESET}\n"
+    # 构建菜单：tag + 解析信息(含国家)
+    local idx=0
+    for t in "${TAG_LIST[@]}"; do
+      idx=$((idx+1))
+      menu_buffer+=" ${C_GREEN}[$idx]${C_RESET} ${C_YELLOW}${t}${C_RESET}  $(format_outbound_label "$t")\n"
     done
-    menu_buffer+=" ${C_GREEN}[0]${C_RESET} 取消并返回"
+    menu_buffer+=" ${C_GREEN}[0]${C_RESET} 取消并返回\n"
 
     echo -e "$menu_buffer"
     read -rp "请输入要删除的序号: " del_idx
-    [[ "$del_idx" == "0" || -z "$del_idx" ]] && return
+    [[ -z "${del_idx:-}" || "$del_idx" == "0" ]] && return
+    [[ ! "$del_idx" =~ ^[0-9]+$ ]] && { warn "无效输入"; return; }
 
-    # 校验输入
-    if [[ ! "$del_idx" =~ ^[0-9]+$ ]] || [ "$del_idx" -gt "$i" ] || [ "$del_idx" -lt 1 ]; then
-        err "无效序号，请输入 1 到 $i 之间的数字"
-        return
-    fi
+    local del_tag="${TAG_LIST[$((del_idx-1))]}"
+    [[ -z "${del_tag:-}" ]] && { warn "无效序号"; return; }
 
-    # 还原对应的标签名
-    local target_tag="${TAG_LIST[$((del_idx-1))]}"
+    warn "即将删除落地：${C_YELLOW}${del_tag}${C_RESET}  $(format_outbound_label "$del_tag")"
+    read -rp "确认删除？(y/N): " yn
+    [[ "$yn" != "y" && "$yn" != "Y" ]] && { say "已取消"; return; }
 
-    say "正在执行级联移除: ${target_tag} ..."
+    safe_json_edit "$CONFIG" 'del(.outbounds[] | select(.tag==$tag))' --arg tag "$del_tag" >/dev/null 2>&1 || {
+      err "删除失败：JSON 写入异常"
+      return 1
+    }
 
-    # 1) 从 outbounds 数组中删除
-    safe_json_edit "$CONFIG" "del(.outbounds[] | select(.tag == \$t))" --arg t "$target_tag"
+    # 同步清理引用该 outbound 的规则，防止残留
+    safe_json_edit "$CONFIG" 'del(.route.rules[]? | select(.outbound==$tag))' --arg tag "$del_tag" >/dev/null 2>&1 || true
 
-    # 2) 自动清理引用了该落地的路由规则 (关键：防止 Xray 启动失败)
-    safe_json_edit "$CONFIG" 'del(.route.rules[] | select(.outbound == $t))' --arg t "$target_tag"
-
-    ok "落地出口及其关联规则已移除。"
+    ok "已删除落地：$del_tag"
     restart_xray
 }
 
-list_and_del_routing_rules() {
-    echo -e "\n${C_CYAN}=== 查看/解除 关联规则 (route.rules) ===${C_RESET}"
 
+
+list_and_del_routing_rules() {
+    echo -e "\n${C_CYAN}=== 查看/解除 关联规则 (分流列表) ===${C_RESET}"
+
+    # 确保基础结构存在
     safe_json_edit "$CONFIG" '(.route //= {}) | (.route.rules //= []) | (.outbounds //= [])' >/dev/null 2>&1 || true
 
     local total
@@ -2650,174 +2730,12 @@ list_and_del_routing_rules() {
     fi
 
     echo -e "➜ ${C_GRAY}当前规则总数: ${total}${C_RESET}"
-    echo -e "${C_BLUE}提示：输入序号删除单条；in:<tag> 删除该入站全部规则；ms:<tag> 仅删该入站 media-split 规则；all 清空全部规则；0 返回${C_RESET}\n"
+    echo -e "${C_BLUE}操作指引：${C_RESET}"
+    # 已移除 in:标签 的提示
+    echo -e " ${C_YELLOW}数字${C_RESET} - 删除对应行 | ${C_YELLOW}all${C_RESET} - 清空全部 | ${C_YELLOW}0${C_RESET} - 返回"
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
 
-    # ---------- helpers：把 outbound tag 渲染成 “公网IP/国家” ----------
-    is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-    is_ipv6() { [[ "$1" == *:* ]]; }
-
-    is_private_ip() {
-      local ip="$1"
-      # IPv4 私网/保留
-      if is_ipv4 "$ip"; then
-        [[ "$ip" =~ ^10\. ]] && return 0
-        [[ "$ip" =~ ^192\.168\. ]] && return 0
-        [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
-        [[ "$ip" =~ ^127\. ]] && return 0
-        [[ "$ip" =~ ^169\.254\. ]] && return 0
-      fi
-      # IPv6 ULA/loopback/link-local
-      if is_ipv6 "$ip"; then
-        [[ "$ip" =~ ^fd ]] && return 0
-        [[ "$ip" == "::1" ]] && return 0
-        [[ "$ip" =~ ^fe80: ]] && return 0
-      fi
-      return 1
-    }
-
-    get_iface_public_ip() {
-      local iface="$1"
-      local proto="${2:-4}"
-      local url="https://api.ipify.org"
-      local curl_flag="-4"
-      if [[ "$proto" == "6" ]]; then
-        url="https://api64.ipify.org"
-        curl_flag="-6"
-      fi
-      curl -s ${curl_flag} --interface "$iface" --connect-timeout 1.5 --max-time 2 "$url" 2>/dev/null | tr -d '\r\n'
-    }
-
-    # 用本地源IP反查接口名（wg0/wg1...）
-    iface_by_local_ip() {
-      local lip="$1"
-      ip -o addr show 2>/dev/null | awk -v ip="$lip" '$0 ~ ip {print $2; exit}'
-    }
-
-    # 解析域名 -> IP（缓存）
-    declare -A _HOST2IP
-    resolve_host_ip_cached() {
-      local host="$1"
-      if [[ -n "${_HOST2IP[$host]:-}" ]]; then
-        echo "${_HOST2IP[$host]}"; return 0
-      fi
-      if is_ipv4 "$host" || is_ipv6 "$host"; then
-        _HOST2IP["$host"]="$host"; echo "$host"; return 0
-      fi
-      local ipaddr=""
-      ipaddr="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
-      [[ -z "$ipaddr" ]] && ipaddr="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
-      _HOST2IP["$host"]="$ipaddr"
-      echo "$ipaddr"
-    }
-
-    # 提取一个 outbound 的关键字段：type|host|port|sendThrough
-    outbound_info_by_tag() {
-      local tag="$1"
-      jq -r --arg t "$tag" '
-        .outbounds[]? | select(.tag == $t)
-        | [
-            (.type // "unknown"),
-            (
-              .server
-              // .address
-              // .host
-              // .settings.servers[0].address
-              // .settings.servers[0].server
-              // .settings.vnext[0].address
-              // .vnext[0].address
-              // ""
-            ),
-            (
-              (.server_port // .port // .settings.servers[0].port // .settings.vnext[0].port // .vnext[0].port // "")
-              | tostring
-            ),
-            ((.sendThrough // .send_through // "") | tostring)
-          ]
-        | @tsv
-      ' "$CONFIG" 2>/dev/null
-    }
-
-    # 如果 tag 不是 outbound.tag，但刚好是 sendThrough 的本地IP，也把它当作“本地绑定出口”
-    find_sendthrough_by_tag_or_ip() {
-      local tag="$1"
-      # 1) tag 对应 outbound 的 sendThrough
-      local st
-      st="$(jq -r --arg t "$tag" '.outbounds[]? | select(.tag==$t) | (.sendThrough // .send_through // "")' "$CONFIG" 2>/dev/null | head -n1)"
-      [[ -n "$st" && "$st" != "null" ]] && { echo "$st"; return 0; }
-
-      # 2) 如果 tag 本身是私网IP，直接用它
-      if (is_ipv4 "$tag" || is_ipv6 "$tag") && is_private_ip "$tag"; then
-        echo "$tag"; return 0
-      fi
-
-      # 3) 否则查找 “sendThrough == tag”
-      st="$(jq -r --arg ip "$tag" '
-        .outbounds[]? | select((.sendThrough // .send_through // "") == $ip) | (.sendThrough // .send_through // "")
-      ' "$CONFIG" 2>/dev/null | head -n1)"
-      [[ -n "$st" && "$st" != "null" ]] && { echo "$st"; return 0; }
-
-      echo ""
-      return 1
-    }
-
-    format_outbound_label() {
-      local tag="$1"
-      [[ -z "$tag" || "$tag" == "null" ]] && { echo "-"; return; }
-      [[ "$tag" == "direct" ]] && { echo "direct"; return; }
-
-      # 1) 优先判定：这是不是“本地绑定出口”（direct + sendThrough，或 tag 本身就是私网IP）
-      local st
-      st="$(find_sendthrough_by_tag_or_ip "$tag")"
-      if [[ -n "$st" ]]; then
-        local iface pub cc proto
-        iface="$(iface_by_local_ip "$st")"
-        proto="4"; is_ipv6 "$st" && proto="6"
-        if [[ -n "$iface" ]]; then
-          pub="$(get_iface_public_ip "$iface" "$proto")"
-          if [[ -n "$pub" ]]; then
-            cc="$(get_ip_country "$pub")"
-            echo "${pub} [${cc}] (${iface}) src=${st}"
-            return
-          fi
-          echo "(${iface}) src=${st}"
-          return
-        fi
-        echo "src=${st}"
-        return
-      fi
-
-      # 2) 普通代理落地：显示 host:port -> real_ip [CC] (type)
-      local info type host port sendThrough
-      info="$(outbound_info_by_tag "$tag")"
-      type="$(echo "$info" | awk '{print $1}')"
-      host="$(echo "$info" | awk '{print $2}')"
-      port="$(echo "$info" | awk '{print $3}')"
-      sendThrough="$(echo "$info" | awk '{print $4}')"
-
-      [[ -z "$type" ]] && type="unknown"
-      [[ -z "$host" ]] && host="未知"
-      [[ -z "$port" || "$port" == "null" ]] && port="??"
-
-      # direct 且没有 sendThrough 的，直接显示 tag（避免 host:??）
-      if [[ "$type" == "direct" ]]; then
-        echo "${tag} (direct)"
-        return
-      fi
-
-      local real_ip="" cc="??"
-      if [[ "$host" != "未知" ]]; then
-        real_ip="$(resolve_host_ip_cached "$host")"
-        [[ -n "$real_ip" ]] && cc="$(get_ip_country "$real_ip")"
-      fi
-
-      if [[ -n "$real_ip" ]]; then
-        echo "${host}:${port} -> ${real_ip} [${cc}] (${type})"
-      else
-        echo "${host}:${port} -> ?? [??] (${type})"
-      fi
-    }
-
-    # ---------- 展示规则 ----------
+    # 展示规则，并将 label 和类型名称汉化
     jq -r '
       (.route.rules // [])
       | to_entries[]
@@ -2826,22 +2744,31 @@ list_and_del_routing_rules() {
       | [
           ($i+1),
           (if ($r.inbound|type)=="array" then ($r.inbound|join(",")) else ($r.inbound//"-") end),
-          ($r.kind // "-"),
-          ($r.outbound // "-"),
+          ($r.kind // "通用"),
+          ($r.outbound // "direct"),
           (if ($r.domain|type)=="array" then (($r.domain|length)|tostring) else "0" end)
         ]
       | @tsv
     ' "$CONFIG" 2>/dev/null | while IFS=$'\t' read -r idx inbound kind outbound_tag dcnt; do
-        local ob_label
-        ob_label="$(format_outbound_label "$outbound_tag")"
-        echo -e " ${C_GREEN}[$idx]${C_RESET} inbound=${C_YELLOW}${inbound}${C_RESET}  kind=${C_CYAN}${kind}${C_RESET}  outbound=${C_PURPLE}${ob_label}${C_RESET}  domains=${dcnt}"
+        # 汉化类型名称
+        local display_kind="$kind"
+        display_kind="${display_kind//media-split-GLOBAL/【全局代理】}"
+        display_kind="${display_kind//media-split-GPT/ChatGPT分流}"
+        display_kind="${display_kind//media-split-GEMINI/Gemini分流}"
+        display_kind="${display_kind//media-split-CUSTOM/自定义分流}"
+        display_kind="${display_kind//media-split-/}" # 去掉其他分类的前缀
+
+        local ob_label; ob_label="$(format_outbound_label "$outbound_tag")"
+        
+        printf " ${C_GREEN}[%s]${C_RESET} 入站:${C_YELLOW}%-15s${C_RESET} 类型:${C_CYAN}%-12s${C_RESET} 落地:${C_PURPLE}%-25s${C_RESET} 域名数:%s\n" \
+               "$idx" "$inbound" "$display_kind" "$ob_label" "$dcnt"
     done
 
-    echo
-    read -rp "请输入操作: " action
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+    read -rp "请输入操作指令: " action
     [[ -z "${action:-}" || "$action" == "0" ]] && return
 
-    # 1) 删除单条：纯数字
+    # 1) 删除单条：输入纯数字
     if [[ "$action" =~ ^[0-9]+$ ]]; then
         local del_idx=$((action-1))
         if (( del_idx < 0 || del_idx >= total )); then
@@ -2865,42 +2792,14 @@ list_and_del_routing_rules() {
     # 2) all：清空全部规则
     if [[ "$action" == "all" ]]; then
         safe_json_edit "$CONFIG" '.route.rules = []' >/dev/null 2>&1 || true
-        ok "已清空全部规则（恢复全局直连行为）。"
+        ok "已清空所有分流规则（恢复直连）。"
         restart_xray
         return
     fi
 
-    # 3) in:<tag> 删除该入站全部规则
-    if [[ "$action" =~ ^in:(.+)$ ]]; then
-        local in_tag="${BASH_REMATCH[1]}"
-        safe_json_edit "$CONFIG" '
-          .route.rules |= map(select(
-            (if (.inbound|type)=="array" then (.inbound|index($in)!=null) else (.inbound==$in) end) | not
-          ))
-        ' --arg in "$in_tag" >/dev/null 2>&1 || true
-        ok "已删除 inbound=${in_tag} 的全部规则。"
-        restart_xray
-        return
-    fi
+    # 注意：此处已删除了 in:标签 和 ms:标签 的后台逻辑判断
 
-    # 4) ms:<tag> 仅删除该入站的 media-split-* 规则
-    if [[ "$action" =~ ^ms:(.+)$ ]]; then
-        local in_tag="${BASH_REMATCH[1]}"
-        safe_json_edit "$CONFIG" '
-          .route.rules |= map(select(
-            (
-              (if (.inbound|type)=="array" then (.inbound|index($in)!=null) else (.inbound==$in) end)
-              and ((.kind // "") | test("^media-split-"))
-            ) | not
-          ))
-        ' --arg in "$in_tag" >/dev/null 2>&1 || true
-        ok "已删除 inbound=${in_tag} 的 media-split 分流规则。"
-        restart_xray
-        return
-    fi
-
-    warn "未识别的输入：$action"
-    warn "可用：序号 / in:<tag> / ms:<tag> / all / 0"
+    warn "未识别的输入：$action (请输入数字序号或 all)"
 }
 
 
@@ -3268,28 +3167,37 @@ add_manual_proxy_outbound() {
     read -rp "用户名 (可选): " user
     read -rp "密码 (可选): " pass
 
-    # 重启前测试
+    # 1) 检查标签是否已存在
+    local tag="MAN-${proto^^}-${port}"
+    if jq -e --arg t "$tag" '.outbounds[]? | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1; then
+        err "添加失败：标签 [${tag}] 已存在，请先在‘查看/删除现有落地’中清理，或更换端口。"
+        return 1
+    fi
+
+    # 2) 测试连接
     test_outbound_connection "$proto" "$server" "$port" "$user" "$pass"
     [[ $? -ne 0 ]] && { warn "落地测试未通过，已取消添加。"; return 1; }
 
-    local tag="MAN-${proto^^}-${port}"
+    # 3) 构建 JSON
     local new_node
     if [[ -n "$user" && -n "$pass" ]]; then
-        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg u "$user" --arg pw "$pass" --arg pr "$proto" '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber), username: $u, password: $pw}')
+        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg pr "$proto" \
+            '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber), username: $u, password: $pw}')
     else
-        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg pr "$proto" '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber)}')
+        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg pr "$proto" \
+            '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber)}')
     fi
 
     local sandbox="/tmp/sb_proxy_check.json"
     cp "$CONFIG" "$sandbox"
     jq --argjson node "$new_node" '(.outbounds //= []) | .outbounds += [$node]' "$sandbox" > "${sandbox}.tmp" && mv "${sandbox}.tmp" "$sandbox"
 
-    if _check_model_config "$sandbox" >/dev/null 2>&1; then
+    # 4) 关键修改：移除 >/dev/null 2>&1，让真实的报错显现出来
+    if _check_model_config "$sandbox"; then
         mv "$sandbox" "$CONFIG"
-        ok "落地已保存。(请在关联节点后查看效果)"
-        # 移除 restart_xray
+        ok "落地 [${tag}] 已成功保存！"
     else
-        err "✖ 校验失败：内部逻辑冲突。"
+        err "✖ 落地添加失败：内核配置校验未通过（见上方提示）。"
         rm -f "$sandbox"
         return 1
     fi
@@ -3357,129 +3265,13 @@ add_manual_ss_outbound() {
 
 # 设置节点与落地的关联规则 (支持自定义域名增量追加版)
 set_node_routing() {
-  echo -e "\n${C_CYAN}=== 分流模式：增量配置 (自定义域名支持追加) ===${C_RESET}"
+  echo -e "\n${C_CYAN}=== 分流模式：增量配置 (支持全局流量) ===${C_RESET}"
 
-  # --- helper：按接口探测真实公网出口 IP（v4/v6） ---
-  get_iface_public_ip() {
-    local iface="$1"
-    local proto="${2:-4}"  # 4 或 6
-
-    local url="https://api.ipify.org"
-    local curl_flag="-4"
-    if [[ "$proto" == "6" ]]; then
-      url="https://api64.ipify.org"
-      curl_flag="-6"
-    fi
-
-    curl -s ${curl_flag} --interface "$iface" \
-      --connect-timeout 1.5 --max-time 2 \
-      "$url" 2>/dev/null | tr -d '\r\n'
-  }
-  get_iface_local_ip4() {
-  local iface="$1"
-  ip -4 -o addr show dev "$iface" 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]; exit}'
-}
-get_iface_local_ip6() {
-  local iface="$1"
-  # 取一个全局/ULA v6（你环境是 fd00/2xxx），按需可改过滤
-  ip -6 -o addr show dev "$iface" 2>/dev/null | awk '
-    /inet6 (fd00|2)/{split($4,a,"/"); print a[1]; exit}
-  '
-}
-
-
-  build_iface_egress_line() {
-    local iface="$1"
-    local proto="${2:-4}"
-    local pub
-    pub="$(get_iface_public_ip "$iface" "$proto")"
-    [[ -z "$pub" ]] && return 1
-
-    local cc="??"
-    cc="$(get_ip_country "$pub")"
-    echo "${pub} [${cc}] (${iface})"
-  }
-
-  # --- helper：自定义代理落地展示：解析真实IP + 国家 ---
-  is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-  is_ipv6() { [[ "$1" == *:* ]]; }
-
-  resolve_host_ip_cached() {
-    local host="$1"
-    local ip=""
-
-    # 缓存命中
-    if [[ -n "${_HOST2IP[$host]:-}" ]]; then
-      echo "${_HOST2IP[$host]}"
-      return 0
-    fi
-
-    # 已经是IP就直接返回
-    if is_ipv4 "$host" || is_ipv6 "$host"; then
-      _HOST2IP["$host"]="$host"
-      echo "$host"
-      return 0
-    fi
-
-    # 优先 v4，再 v6（用 getent，尽量避免额外依赖）
-    ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
-    if [[ -z "$ip" ]]; then
-      ip="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1; exit}')"
-    fi
-
-    _HOST2IP["$host"]="$ip"
-    echo "$ip"
-  }
-
-  # 修复后的函数 1：统一使用管道符分隔输出
-describe_outbound_tag() {
-  local tag="$1"
-  # 统一使用 join("|") 代替 @tsv，确保切割逻辑一致
-  jq -r --arg t "$tag" '
-    .outbounds[]? | select(.tag == $t)
-    | [
-        (.type // "unknown"),
-        (.server // .address // .host // .settings.servers[0].address // "未知"),
-        ((.server_port // .port // .settings.servers[0].port // "0") | tostring)
-      ]
-    | join("|")
-  ' "$CONFIG" 2>/dev/null
-}
-
-# 修复后的函数 2：确保使用字符串判定
-build_proxy_out_display() {
-  local tag="$1"
-  local info type host port
-  info="$(describe_outbound_tag "$tag")"
-
-  # 使用管道符 | 切割变量
-  type="$(echo "$info" | cut -d'|' -f1)"
-  host="$(echo "$info" | cut -d'|' -f2)"
-  port="$(echo "$info" | cut -f3)"
-
-  # 严格使用 [[ ]] 字符串判断，避免触发 Bash 算术运算
-  if [[ -z "$host" || "$host" == "未知" ]]; then
-      echo "${tag}  (配置缺失)"
-      return
-  fi
-
-  local real_ip="" cc="??"
-  # 解析 IP (resolve_host_ip_cached 内部建议同步检查)
-  real_ip="$(resolve_host_ip_cached "$host")"
-
-  if [[ -n "$real_ip" ]]; then
-      cc="$(get_ip_country "$real_ip")"
-      echo "${tag}  ${host}:${port} -> ${real_ip} [${cc}] (${type})"
-  else
-      cc="$(get_ip_country "$host")"
-      echo "${tag}  ${host}:${port} -> ${host} [${cc}] (${type})"
-  fi
-}
-  # 0) 基础结构初始化 (确保 route/outbounds 存在)
+  # --- 1) 确保结构存在 ---
   safe_json_edit "$CONFIG" '(.route //= {}) | (.route.rules //= []) | (.outbounds //= []) | (.inbounds //= [])' >/dev/null 2>&1 || true
 
-  # 1) 选择入站 (Inbound)
-  mapfile -t IN_TAGS < <(jq -r '.inbounds[] | select(.tag != null) | .tag' "$CONFIG" 2>/dev/null)
+  # --- 2) 选择入站 ---
+  mapfile -t IN_TAGS < <(jq -r '.inbounds[]? | select(.tag != null) | .tag' "$CONFIG" 2>/dev/null)
   if [ ${#IN_TAGS[@]} -eq 0 ]; then
     echo -e "${C_RED}✖ 当前没有任何入站节点，请先添加一个节点。${C_RESET}"
     return
@@ -3495,142 +3287,40 @@ build_proxy_out_display() {
   [[ -z "${in_idx:-}" || "$in_idx" == "0" ]] && return
   local selected_inbound="${IN_TAGS[$((in_idx-1))]}"
 
-  # 2) 聚合所有可能的落地出口
-  echo -e "➜ ${C_GRAY}正在扫描可用出口...${C_RESET}"
+  # --- 3) 选择代理出口（不再提供 IP:*，避免生成 LOCAL-OUT-SRC-*）---
+  echo -e "\n${C_CYAN}=== 第二步：选择落地出口（代理出口）===${C_RESET}"
 
-  # 自定义代理落地（配置里已有的非 direct 且非 LOCAL-OUT-）
+  # 可选出口：所有“可管理落地”（排除裸 direct；允许 direct 作为一个显式选项）
   mapfile -t PROXY_OUTS < <(
-    jq -r '.outbounds[]
-      | select(.tag != null and .tag != "direct" and (.tag | startswith("LOCAL-OUT-") | not))
-      | .tag' "$CONFIG" 2>/dev/null | sort -u
+    jq -r '
+      .outbounds[]?
+      | select(.tag != null and (.tag|tostring|length)>0)
+      | select(.tag != "direct")
+      | select(.type != "direct" or ((.sendThrough // .send_through // "")|tostring|length) > 0)
+      | .tag
+    ' "$CONFIG" 2>/dev/null
   )
 
-  # 本地出口：探测真实公网 IP + 国家 + 接口名（wg0/wg1/...）
-  LOCAL_V4=()   # 存 "展示文本|本地源IP"
-LOCAL_V6=()
-
-declare -A _seen4 _seen6
-local -a _fail4 _fail6
-
-# v4：候选接口（仍按 10.* 选 wg）
-while read -r iface _ip; do
-  [[ -n "$iface" ]] || continue
-  [[ -n "${_seen4[$iface]:-}" ]] && continue
-  _seen4[$iface]=1
-
-  local lip pub cc line
-  lip="$(get_iface_local_ip4 "$iface")"
-  [[ -z "$lip" ]] && { _fail4+=("$iface"); continue; }
-
-  pub="$(get_iface_public_ip "$iface" 4)"
-  [[ -z "$pub" ]] && { _fail4+=("$iface"); continue; }
-
-  cc="$(get_ip_country "$pub")"
-  line="${pub} [${cc}] (${iface})|${lip}"
-  LOCAL_V4+=("$line")
-done < <(ip -4 -o addr show | awk '/inet (10\.|172\.|192\.168\.)/{split($4,a,"/"); print $2, a[1]}')
-
-# 1. 必须在函数开头或循环前声明关联数组（Bash 5.2 环境下必须）
-declare -A _seen6 2>/dev/null || true
-
-while read -r iface _ip; do
-  [[ -n "$iface" ]] || continue
-  
-  # 2. 关键修复：使用实际分配的 IP ($_ip) 去重，而不是网卡名
-  [[ -n "${_seen6[$_ip]:-}" ]] && continue 
-  _seen6[$_ip]=1
-
-  local lip pub cc line
-  # 3. 直接使用扫到的 IP 作为本地 IP
-  lip="$_ip" 
-
-  # 4. 探测该具体 IP 的公网出口（增加 --interface 绑定）
-  pub=$(curl -s -6 --interface "$_ip" --connect-timeout 2 --max-time 3 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
-  
-  # 如果绑定 IP 探测失败，尝试网卡探测兜底
-  [[ -z "$pub" ]] && pub=$(curl -s -6 --interface "$iface" --max-time 2 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
-  [[ -z "$pub" ]] && continue
-
-  cc="$(get_ip_country "$pub")"
-  line="${pub} [${cc}] (${iface})|${lip}"
-  LOCAL_V6+=("$line")
-
-# 5. 优化 awk：只抓取 global 状态且非临时（temporary）的地址
-done < <(ip -6 addr show scope global | grep -v "temporary" | awk '/inet6 [23]/ {split($2,a,"/"); print $NF, a[1]}')
-
-[ ${#_fail4[@]} -gt 0 ] && echo -e "${C_GRAY}⚠ IPv4 以下接口未探测到公网/本地源IP，已跳过: ${_fail4[*]}${C_RESET}"
-[ ${#_fail6[@]} -gt 0 ] && echo -e "${C_GRAY}⚠ IPv6 以下接口未探测到公网/本地源IP，已跳过: ${_fail6[*]}${C_RESET}"
-
-
-  # 提示哪些接口没探测到公网 IP（不会加入可选列表，避免选到错误 sendThrough）
-  if [ ${#_fail4[@]} -gt 0 ]; then
-    echo -e "${C_GRAY}⚠ IPv4 以下接口未探测到公网出口，已跳过: ${_fail4[*]}${C_RESET}"
-  fi
-  if [ ${#_fail6[@]} -gt 0 ]; then
-    echo -e "${C_GRAY}⚠ IPv6 以下接口未探测到公网出口，已跳过: ${_fail6[*]}${C_RESET}"
-  fi
-
-  echo -e "\n${C_CYAN}=== 第二步：选择落地出口 (Outbound) ===${C_RESET}"
-  local j=0
-  declare -a TEMP_OUT_LIST
-
-  if [ ${#PROXY_OUTS[@]} -gt 0 ]; then
-      echo -e "${C_BLUE}--- 自定义代理落地（真实IP/国家） ---${C_RESET}"
-      for tag in "${PROXY_OUTS[@]}"; do
-          j=$((j+1))
-          local pretty
-          pretty="$(build_proxy_out_display "$tag")"
-          echo -e " ${C_GREEN}[$j]${C_RESET} ${C_YELLOW}${pretty}${C_RESET}"
-          TEMP_OUT_LIST[$j]="$tag"
-      done
-  fi
-
-  if [ ${#LOCAL_V4[@]} -gt 0 ]; then
-  echo -e "${C_BLUE}--- 本地 IPv4 出口（显示公网IP，实际绑定本地源IP） ---${C_RESET}"
-  for line in "${LOCAL_V4[@]}"; do
-    j=$((j+1))
-    local show="${line%%|*}"
-    local srcip="${line#*|}"
-    echo -e " ${C_GREEN}[$j]${C_RESET} ${C_CYAN}${show}${C_RESET}"
-    TEMP_OUT_LIST[$j]="IP:${srcip}"
+  # 展示列表（带国家显示）
+  local -a TEMP_OUT_LIST=()
+  local idx=0
+  for tag in "${PROXY_OUTS[@]}"; do
+    idx=$((idx+1))
+    TEMP_OUT_LIST[$idx]="$tag"
+    echo -e " ${C_GREEN}[$idx]${C_RESET} ${C_YELLOW}${tag}${C_RESET}  $(format_outbound_label "$tag")"
   done
-fi
 
-if [ ${#LOCAL_V6[@]} -gt 0 ]; then
-  echo -e "${C_BLUE}--- 本地 IPv6 出口（显示公网IP，实际绑定本地源IP） ---${C_RESET}"
-  for line in "${LOCAL_V6[@]}"; do
-    j=$((j+1))
-    local show="${line%%|*}"
-    local srcip="${line#*|}"
-    echo -e " ${C_GREEN}[$j]${C_RESET} ${C_PURPLE}${show}${C_RESET}"
-    TEMP_OUT_LIST[$j]="IP:${srcip}"
-  done
-fi
-
-
-  if [ "$j" -eq 0 ]; then
-    err "没有可用的落地出口（自定义落地为空，且本地接口也未探测到公网出口）。"
-    return
-  fi
+  # 额外提供 direct（真正直连，不绑定 sendThrough）
+  idx=$((idx+1))
+  TEMP_OUT_LIST[$idx]="direct"
+  echo -e " ${C_GREEN}[$idx]${C_RESET} ${C_YELLOW}direct${C_RESET}  直连 (不走代理/不绑定本机IP)"
 
   read -rp "请选择落地序号 (0 取消): " out_idx
   [[ -z "${out_idx:-}" || "$out_idx" == "0" ]] && return
-  local raw_choice="${TEMP_OUT_LIST[$out_idx]}"
-  local selected_outbound_tag=""
+  local selected_outbound_tag="${TEMP_OUT_LIST[$out_idx]}"
+  [[ -z "${selected_outbound_tag:-}" ]] && { warn "无效选择"; return; }
 
-  if [[ "$raw_choice" == IP:* ]]; then
-  local target_ip="${raw_choice#IP:}"     # 这里现在会是 10.* 或 fd00::*
-  local safe_ip_tag="${target_ip//./-}"; safe_ip_tag="${safe_ip_tag//:/-}"
-  selected_outbound_tag="LOCAL-OUT-SRC-${safe_ip_tag}"
-  safe_json_edit "$CONFIG" \
-    '.outbounds |= (map(select(.tag != $tag)) + [{"type":"direct","tag":$tag,"sendThrough":$ip}])' \
-    --arg tag "$selected_outbound_tag" --arg ip "$target_ip"
-else
-  selected_outbound_tag="$raw_choice"
-fi
-
-
-  # 3) 分流分类定义
+  # --- 4) 分类定义（含全局 g）---
   declare -A CAT_DOMAINS
   CAT_DOMAINS["GEMINI"]="domain:gemini.google.com domain:aistudio.google.com domain:makersuite.google.com domain:deepmind.com"
   CAT_DOMAINS["GPT"]="domain:openai.com domain:chatgpt.com domain:oaistatic.com domain:oaiusercontent.com domain:stripe.com domain:chat.openai.com"
@@ -3655,86 +3345,102 @@ fi
     k=$((k+1))
     echo -e " ${C_GREEN}[$k]${C_RESET} ${C_YELLOW}${name}${C_RESET}"
   done
+  echo -e " ${C_GREEN}[g]${C_RESET} ${C_PURPLE}全局流量 (该入站所有流量都走该落地)${C_RESET}"
   echo -e " ${C_GREEN}[a]${C_RESET} 全选"
-  read -rp "请选择 (逗号分隔): " sel_raw
+  read -rp "请选择 (支持 g/a/数字, 逗号分隔): " sel_raw
   [[ -z "${sel_raw:-}" || "$sel_raw" == "0" ]] && return
 
-  local -a selected_keys=()
-  if [[ "$sel_raw" =~ ^[aA]$ ]]; then
-    selected_keys=("${CAT_KEYS[@]}")
+  # --- 5) 写规则：先清理该 inbound 旧的 media-split 规则，再写入新规则 ---
+  # 说明：全局规则只要匹配 inbound 即可（无 domain 字段），而且要放最前面，确保优先生效。
+  local new_rules_jq='
+    .route.rules as $r
+    | .route.rules = (
+        # 先删掉这个 inbound 之前的 media-split-* 规则
+        ($r | map(select(.inbound? != null)) | . ) as $tmp
+        | ($r | map(
+            if ((.inbound|type)=="array" and (.inbound|index($inb))!=null and (.kind?//"")|startswith("media-split-"))
+            then empty
+            else .
+            end
+          )) as $clean
+        | $clean
+      )
+  '
+  safe_json_edit "$CONFIG" "$new_rules_jq" --arg inb "$selected_inbound" >/dev/null 2>&1 || true
+
+  # 解析选择
+  local want_global=0
+  if echo "$sel_raw" | grep -qiE '(^|,)\s*g\s*(,|$)'; then
+    want_global=1
+  fi
+
+  if [[ "$want_global" == "1" ]]; then
+    echo -e "➜ 全局代理：${C_YELLOW}${selected_inbound}${C_RESET} -> ${C_GREEN}${selected_outbound_tag}${C_RESET}"
+
+    # 构建全局规则，并放到 rules 最前面
+    local global_rule
+    global_rule=$(jq -n --arg inb "$selected_inbound" --arg out "$selected_outbound_tag" \
+      '{inbound: [$inb], outbound: $out, kind: "media-split-GLOBAL"}')
+
+    safe_json_edit "$CONFIG" '
+      .route.rules = ([ $rule ] + (.route.rules // []))
+    ' --argjson rule "$global_rule" >/dev/null 2>&1 || true
+
+    ok "规则已写入：${selected_inbound} -> ${selected_outbound_tag}"
+    restart_xray
+    return
+  fi
+
+  # 分类模式
+  local -a selected_nums=()
+  if echo "$sel_raw" | grep -qiE '(^|,)\s*a\s*(,|$)'; then
+    # 全选 -> 1..N
+    local n="${#CAT_KEYS[@]}"
+    for ((x=1; x<=n; x++)); do selected_nums+=("$x"); done
   else
-    for n in $(echo "$sel_raw" | tr ',' ' '); do
-      [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -le "${#CAT_KEYS[@]}" ] && selected_keys+=("${CAT_KEYS[$((n-1))]}")
+    IFS=',' read -ra parts <<<"$sel_raw"
+    for p in "${parts[@]}"; do
+      p="$(echo "$p" | tr -d '[:space:]')"
+      [[ "$p" =~ ^[0-9]+$ ]] && selected_nums+=("$p")
     done
   fi
 
-  # 4) 增量更新逻辑
-  for key in "${selected_keys[@]}"; do
-    local kind_tag="media-split-$key"
-    local domains_str=""
+  # 逐个写入分类规则（插入到最前面：比其他泛规则更优先）
+  for num in "${selected_nums[@]}"; do
+    local idx0=$((num-1))
+    [[ $idx0 -lt 0 || $idx0 -ge ${#CAT_KEYS[@]} ]] && continue
+
+    local key="${CAT_KEYS[$idx0]}"
+    local name="${CAT_NAMES[$idx0]}"
 
     if [[ "$key" == "CUSTOM" ]]; then
-        local existing_doms
-        existing_doms=$(jq -r --arg in_tag "$selected_inbound" --arg kind "$kind_tag" '
-          .route.rules[] | select((.kind == $kind) and (if (.inbound|type)=="array" then (.inbound | index($in_tag) != null) else (.inbound == $in_tag) end)) | .domain[]
-        ' "$CONFIG" 2>/dev/null | tr '\n' ' ')
-
-        echo -e "\n${C_CYAN}➜ 正在配置自定义分流${C_RESET}"
-        if [ -n "$existing_doms" ]; then
-            echo -e "${C_GRAY}当前已有内容: ${C_RESET}${C_YELLOW}${existing_doms}${C_RESET}"
-            echo -e "${C_GRAY}新输入的内容将追加到上述列表之后。${C_RESET}"
-        fi
-
-        read -rp "请输入要分流的域名或 IP (空格分隔): " custom_input
-        [[ -z "$custom_input" && -z "$existing_doms" ]] && continue
-
-        local new_doms
-        new_doms=$(echo "$custom_input" | tr ',' ' ' | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+$/) print $i; else print "domain:"$i}')
-        domains_str="$existing_doms $new_doms"
-    else
-        domains_str="${CAT_DOMAINS[$key]}"
+      read -rp "请输入自定义域名/IP (空格分隔，支持 domain:xxx / ip:1.2.3.4 / geosite:xxx): " custom
+      [[ -z "$custom" ]] && continue
+      CAT_DOMAINS["CUSTOM"]="$custom"
     fi
 
+    local domains="${CAT_DOMAINS[$key]}"
+    [[ -z "$domains" ]] && continue
+
+    # domains 字符串拆成数组（按空格）
     local dom_json
-    dom_json=$(echo "$domains_str" | tr ' ' '\n' | grep -v '^$' | sort -u | jq -R . | jq -s .)
+    dom_json=$(printf "%s\n" $domains | jq -R -s 'split("\n") | map(select(length>0))')
 
-    echo -e "➜ 正在更新分类 [${C_YELLOW}$key${C_RESET}] 出口 -> [${C_CYAN}$selected_outbound_tag${C_RESET}]"
+    local rule
+    rule=$(jq -n --arg inb "$selected_inbound" --arg out "$selected_outbound_tag" --arg kind "media-split-$key" --argjson dom "$dom_json" \
+      '{inbound: [$inb], outbound: $out, domain: $dom, kind: $kind}')
 
-    # A. 清理该分类旧规则
+    echo -e "➜ 分类分流：${C_YELLOW}${selected_inbound}${C_RESET}  ${C_GRAY}(${name})${C_RESET} -> ${C_GREEN}${selected_outbound_tag}${C_RESET}"
+
     safe_json_edit "$CONFIG" '
-      .route.rules |= map(select(
-        ((if (.inbound|type)=="array" then (.inbound | index($in_tag) != null) else (.inbound == $in_tag) end) and
-        (.kind == $kind)) | not
-      ))
-    ' --arg in_tag "$selected_inbound" --arg kind "$kind_tag"
-
-    # B. 插入合并后的新规则
-    safe_json_edit "$CONFIG" '
-      .route.rules = [
-        {
-          "inbound": [$in_tag],
-          "outbound": $out_tag,
-          "domain": $domains,
-          "kind": $kind
-        }
-      ] + .route.rules
-    ' --arg in_tag "$selected_inbound" --arg out_tag "$selected_outbound_tag" --arg kind "$kind_tag" --argjson domains "$dom_json"
+      .route.rules = ([ $rule ] + (.route.rules // []))
+    ' --argjson rule "$rule" >/dev/null 2>&1 || true
   done
 
-  # 5) Fallback 兜底
-  safe_json_edit "$CONFIG" '
-    if (.route.rules | map(select(.kind == "media-split-fallback" and (if (.inbound|type)=="array" then (.inbound | index($in_tag) != null) else (.inbound == $in_tag) end))) | length == 0) then
-      .route.rules += [{
-        "inbound": [$in_tag],
-        "outbound": "direct",
-        "kind": "media-split-fallback"
-      }]
-    else . end
-  ' --arg in_tag "$selected_inbound"
-
-  ok "关联成功！自定义域名已实现增量更新。"
+  ok "分类规则写入完成：${selected_inbound} -> ${selected_outbound_tag}"
   restart_xray
 }
+
 
 
 

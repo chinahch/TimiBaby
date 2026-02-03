@@ -43,6 +43,33 @@ C_PURPLE='\033[38;5;129m'
 C_CYAN='\033[38;5;51m'
 C_GRAY='\033[90m'
 
+# ============= IP 策略状态翻译工具 (修复版) =============
+
+# 1. 核心翻译逻辑 (兼容两种函数名)
+_mode_label() { _ip_mode_desc "$1"; }
+
+_ip_mode_desc() {
+  case "${1:-}" in
+    v4pref) echo "优选IPv4(回退IPv6)" ;;
+    v6pref) echo "优选IPv6(回退IPv4+失败域名走v4)" ;;
+    v4only) echo "IPv4 only(完全不用IPv6)" ;;
+    v6only) echo "IPv6 only(完全不用IPv4)" ;;
+    off)    echo "已停止(不干预IP版本)" ;;
+    follow_global|follow|"(未设置)"|"") echo "跟随全局" ;;
+    *)      echo "$1" ;;
+  esac
+}
+
+# 2. 读取全局配置文件
+_get_global_mode() {
+  local pref
+  # 读取 /etc/xray/ip_pref 文件的内容
+  pref="$(head -n 1 /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || true)"
+  [[ -z "$pref" || "$pref" == "(未设置)" ]] && pref="follow_global"
+  echo "$pref"
+}
+
+
 # ============= 1. 核心工具函数 (UI优化) =============
 
 say()  { echo -e "${C_GREEN}➜ ${C_RESET}$*"; }
@@ -52,6 +79,48 @@ warn() { echo -e "${C_YELLOW}⚡ $*${C_RESET}" >&2; }
 log_msg() {
   local level="$1" msg="$2"
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
+}
+
+
+# 节点侧：如果是 SOCKS 入站，做一次最小可用性探测（避免“切到 only 后连节点都不通”）
+_probe_socks_inbound() {
+  local tag="$1" mode="$2"
+  local cfg="${XRAY_CONFIG:-/etc/xray/xray_config.json}"
+
+  # 仅在配置存在时探测
+  [[ -s "$cfg" ]] || return 0
+
+  local port auth user pass
+  port="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .port // empty' "$cfg" 2>/dev/null | head -n1)"
+  auth="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .settings.auth // "noauth"' "$cfg" 2>/dev/null | head -n1)"
+  user="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .settings.accounts[0].user // empty' "$cfg" 2>/dev/null | head -n1)"
+  pass="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .settings.accounts[0].pass // empty' "$cfg" 2>/dev/null | head -n1)"
+
+  [[ -n "${port:-}" ]] || return 0
+
+  # 先确认端口在监听（tcp4/tcp6 任一都算）
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:\.]${port}\b" || return 2
+  fi
+
+  # only 模式最容易翻车：做一次真正代理请求
+  local url="https://api.ipify.org"
+  case "$mode" in
+    v6* ) url="https://api64.ipify.org" ;;
+  esac
+
+  local px=""
+  if [[ "$auth" == "password" && -n "${user:-}" && -n "${pass:-}" ]]; then
+    px="socks5h://${user}:${pass}@127.0.0.1:${port}"
+  else
+    px="socks5h://127.0.0.1:${port}"
+  fi
+
+  # 只要能拿到一个像样的 IP（4 或 6），就算通过
+  local out
+  out="$(curl -sS --connect-timeout 3 --max-time 6 -x "$px" "$url" 2>/dev/null | tr -d '\r\n')"
+  [[ -n "$out" ]] || return 3
+  return 0
 }
 
 # 升级版：支持 --arg 传参，彻底告别引号转义和占位符报错
@@ -207,38 +276,61 @@ get_public_ipv6_ensure() {
     fi
 }
 
+# 获取 IP 地理位置与类型 (中文增强版)
 get_ip_country() {
     local ip="$1"
-    [[ -z "$ip" || "$ip" == "未知" || "$ip" == "null" ]] && echo "??" && return
+    # 处理空值或非法输入
+    [[ -z "$ip" || "$ip" == "未知" || "$ip" == "null" || "$ip" == "??" ]] && echo "未知" && return
 
-    # 1) 内存缓存
+    # 1) 内存缓存：避免对同一 IP 多次请求
     if [[ -n "${GEO_CACHE[$ip]:-}" ]]; then
         echo "${GEO_CACHE[$ip]}"
         return
     fi
 
-    # 2) 内网/保留地址快速返回
+    # 2) 内网地址识别
     if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|169\.254\.|fc00:|fd00:|fe80:|::1) ]]; then
-        GEO_CACHE["$ip"]="LAN"
-        echo "LAN"
-        return
+        echo "内网" && return
     fi
 
-    local code="??"
+    # 3) 获取中文国家名称 (ip-api.com)
+    local country
+    country=$(curl -s -4 --connect-timeout 2 --max-time 3 "http://ip-api.com/json/${ip}?fields=country&lang=zh-CN" \
+        | jq -r '.country // empty' 2>/dev/null)
+    [[ -z "$country" || "$country" == "null" ]] && country="未知国家"
 
-    # 修复核心：增加 -4 参数强制使用 IPv4 访问地理位置接口
-    code=$(curl -s -4 --max-time 2 "https://ip-api.com/json/${ip}?fields=countryCode" \
-        | jq -r '.countryCode // empty' 2>/dev/null)
-        
-    # 如果还是失败，切换到备用接口
-    if [[ -z "$code" || "$code" == "null" ]]; then
-        code=$(curl -s -4 --max-time 2 "https://api.country.is/${ip}" | jq -r '.country // empty' 2>/dev/null)
+    # 4) 获取 IP 详细类型 (ipapi.is)
+    local type_label="通用"
+    local ip_data
+    ip_data=$(curl -s -4 --connect-timeout 2 --max-time 3 "https://api.ipapi.is/?ip=${ip}" 2>/dev/null)
+    
+    if [[ -n "$ip_data" && "$ip_data" != "null" ]]; then
+        local is_hosting=$(echo "$ip_data" | jq -r '.is_hosting // false' 2>/dev/null)
+        local is_mobile=$(echo "$ip_data" | jq -r '.is_mobile // false' 2>/dev/null)
+        local is_business=$(echo "$ip_data" | jq -r '.is_business // false' 2>/dev/null)
+        local asn_type=$(echo "$ip_data" | jq -r '.asn.type // "unknown"' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+
+        # --- 增强版判断逻辑：优先级排列 ---
+        if [[ "$is_hosting" == "true" || "$asn_type" == "hosting" || "$asn_type" == "data center" ]]; then
+            # 只要 API 标记为托管或 ASN 类型为 hosting，即判定为机房
+            type_label="机房"
+        elif [[ "$is_mobile" == "true" ]]; then
+            type_label="移动网"
+        elif [[ "$is_business" == "true" || "$asn_type" == "business" || "$asn_type" == "education" ]]; then
+            # 商宽或教育网合并显示
+            type_label="商宽"
+        elif [[ "$asn_type" == "isp" || "$asn_type" == "residential" ]]; then
+            # 只有明确标记为 ISP 或 Residential 时才显示家宽
+            type_label="家宽"
+        else
+            # 无法确定时，保持“通用”或“未知类型”，不盲目判定为家宽
+            type_label="通用"
+        fi
     fi
 
-    [[ -z "$code" || "$code" == "null" ]] && code="??"
-
-    GEO_CACHE["$ip"]="$code"
-    echo "$code"
+    local result="${country} [${type_label}]"
+    GEO_CACHE["$ip"]="$result"
+    echo "$result"
 }
 
 # 按接口探测真实公网出口 IP（v4/v6）
@@ -283,108 +375,95 @@ test_outbound_connection() {
 }
 
 
-# 实时获取所有可用公网 IP 列表 (优化过滤版)
+# 获取所有可用 IP 列表 (多出口增强修复版)
 get_all_ips_with_geo() {
     local proto="$1"   # "4" 或 "6"
     local -a out_lines=()
+    local -A seen_pub_ips     # 公网出口IP去重（仅用于公网口）
+    local -A seen_land_keys   # 落地口去重（iface+本地IP）
+    local api_url="https://api.ipify.org"
+    [[ "$proto" == "6" ]] && api_url="https://api64.ipify.org"
 
-    # --- 小工具：判断 IP 是否形似 ---
-    _is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-    _is_ipv6() { [[ "$1" == *:* ]]; }
+    # --- Step 1. 探测系统当前真正的默认公网出口 ---
+    local system_default_pub=""
+    if [[ "$proto" == "4" ]]; then
+        system_default_pub=$(curl -s -4 --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null | tr -d '\r\n')
+    else
+        system_default_pub=$(curl -s -6 --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null | tr -d '\r\n')
+    fi
 
-    # --- 小工具：从接口探测真实公网 IP ---
-    _iface_pub_ip() {
-        local iface="$1" p="$2"
-        if [[ "$p" == "4" ]]; then
-            curl -s -4 --interface "$iface" --connect-timeout 1.5 --max-time 2 https://api.ipify.org 2>/dev/null | tr -d '\r\n'
+    # --- Step 2. 收集所有 UP 状态网卡的 IP ---
+    local -a all_addr_info=()
+    if [[ "$proto" == "4" ]]; then
+        mapfile -t all_addr_info < <(ip -4 -o addr show | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
+    else
+        mapfile -t all_addr_info < <(ip -6 -o addr show scope global| grep -v "temporary" | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
+    fi
+
+    for line in "${all_addr_info[@]}"; do
+        local iface=$(echo "$line" | awk '{print $1}')
+        local lip=$(echo "$line" | awk '{print $2}')
+        [[ -z "$lip" ]] && continue
+
+        local is_private=0
+        if [[ "$proto" == "4" ]]; then
+            [[ "$lip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|100\.) ]] && is_private=1
         else
-            curl -s -6 --interface "$iface" --connect-timeout 1.5 --max-time 2 https://api64.ipify.org 2>/dev/null | tr -d '\r\n'
+            [[ "$lip" =~ ^(fd|fc|fe80:|::1) ]] && is_private=1
         fi
-    }
 
-    # --- A) 先列出本机“真实公网地址”(scope global) ---
-    if [[ "$proto" == "4" ]]; then
-        mapfile -t _pubs < <(
-            ip -4 addr show scope global 2>/dev/null \
-            | awk '/inet /{print $2}' | cut -d/ -f1 \
-            | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|169\.254\.)' \
-            | sort -u
-        )
-        for ip in "${_pubs[@]}"; do
-            local cc
-            cc="$(get_ip_country "$ip")"
-            out_lines+=("${ip} [${cc}]")
-        done
-    else
-        mapfile -t _pubs < <(
-            ip -6 addr show scope global 2>/dev/null \
-            | grep -v "temporary" \
-            | awk '/inet6 [23]/{print $2}' | cut -d/ -f1 \
-            | sort -u
-        )
-        for ip in "${_pubs[@]}"; do
-            local cc
-            cc="$(get_ip_country "$ip")"
-            out_lines+=("${ip} [${cc}]")
-        done
-    fi
+        local pub_ip=""
+        if [[ "$is_private" -eq 0 ]]; then
+            # 情况 A: 直接是公网 IP
+            pub_ip="$lip"
+        else
+            # 情况 B: 私有 IP (如 tun10)，强制探测出口
+            pub_ip=$(curl -s -"$proto" --interface "$lip"  --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null || \
+                     curl -s -"$proto" --interface "$iface" --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null)
+            pub_ip=$(echo "$pub_ip" | tr -d '\r\n')
+            [[ -n "$pub_ip" && ("$pub_ip" == *"HTML"* || "$pub_ip" == "FAILED") ]] && pub_ip=""
+        fi
 
-    # --- B) 再列出“落地出口”(10.x / fd00) 并探测真实公网IP+国家 ---
-    # 只抓常见“隧道/出口类接口”，避免把 docker/lo 之类乱入
-    local iface_re='^(wg|tun|tap|ppp|tailscale|warp|wgcf|utun)'
+        # --- Step 3. 汇总逻辑 ---
+        if [[ "$is_private" -eq 1 ]]; then
+            # ✅ 落地口：按 iface+本地IP 去重，且探测失败也要显示（不漏）
+            local land_key="${iface}|${lip}"
+            [[ -n "${seen_land_keys[$land_key]}" ]] && continue
+            seen_land_keys["$land_key"]=1
 
-    if [[ "$proto" == "4" ]]; then
-        mapfile -t _lands < <(
-            ip -4 -o addr show 2>/dev/null \
-            | awk -v re="$iface_re" '
-                $2 ~ re && $4 ~ /^(10\.|172\.|192\.168\.)/ {split($4,a,"/"); print a[1]"\t"$2}
-            ' | sort -u
-        )
-
-        for row in "${_lands[@]}"; do
-            local lip iface pub cc
-            lip="$(echo "$row" | awk '{print $1}')"
-            iface="$(echo "$row" | awk '{print $2}')"
-
-            pub="$(_iface_pub_ip "$iface" "4")"
-            if _is_ipv4 "$pub"; then
-                cc="$(get_ip_country "$pub")"
-                out_lines+=("${lip} [落地] -> ${pub} [${cc}] (${iface})")
+            if [[ -n "$pub_ip" ]]; then
+                local detail; detail=$(get_ip_country "$pub_ip")
+                local tag=""
+                [[ "$pub_ip" == "$system_default_pub" ]] && tag=" ${C_GREEN}[系统默认]${C_RESET}"
+                out_lines+=("${lip} [落地] -> ${pub_ip} ${detail} (${iface})${tag}")
             else
-                out_lines+=("${lip} [落地] -> 探测失败 (${iface})")
+                out_lines+=("${lip} [落地] -> (探测失败) 未知 (${iface})")
             fi
-        done
-
-    else
-        mapfile -t _lands < <(
-            ip -6 -o addr show 2>/dev/null \
-            | awk -v re="$iface_re" '
-                $2 ~ re && $4 ~ /^fd00/ {split($4,a,"/"); print a[1]"\t"$2}
-            ' | sort -u
-        )
-
-        for row in "${_lands[@]}"; do
-            local lip iface pub cc
-            lip="$(echo "$row" | awk '{print $1}')"
-            iface="$(echo "$row" | awk '{print $2}')"
-
-            pub="$(_iface_pub_ip "$iface" "6")"
-            if _is_ipv6 "$pub"; then
-                cc="$(get_ip_country "$pub")"
-                out_lines+=("${lip} [落地] -> ${pub} [${cc}] (${iface})")
-            else
-                out_lines+=("${lip} [落地] -> 探测失败 (${iface})")
+        else
+            # 公网口：仍按公网出口IP去重
+            if [[ -n "$pub_ip" && -z "${seen_pub_ips[$pub_ip]}" ]]; then
+                local detail; detail=$(get_ip_country "$pub_ip")
+                local tag=""
+                [[ "$pub_ip" == "$system_default_pub" ]] && tag=" ${C_GREEN}[系统默认]${C_RESET}"
+                out_lines+=("${pub_ip} ${detail}${tag}")
+                seen_pub_ips["$pub_ip"]=1
             fi
-        done
+        fi
+    done
+
+    # --- Step 4. 保底逻辑：确保默认出口一定出现 ---
+    if [[ -n "$system_default_pub" && -z "${seen_pub_ips[$system_default_pub]}" ]]; then
+        local detail; detail=$(get_ip_country "$system_default_pub")
+        out_lines+=("${system_default_pub} ${detail} ${C_GREEN}[系统默认]${C_RESET}")
+        seen_pub_ips["$system_default_pub"]=1
     fi
 
-    # --- 去重输出 ---
-    if [ ${#out_lines[@]} -eq 0 ]; then
-        return
-    fi
-
+    # --- Step 5. 最终输出 ---
+    [[ ${#out_lines[@]} -eq 0 ]] && return 0
     printf "%s\n" "${out_lines[@]}" | awk '!seen[$0]++'
 }
+
+
 
 
 # 系统状态 Dashboard (支持显示网卡名称)
@@ -436,7 +515,7 @@ get_sys_status() {
     fi
 
     local color_cpu="$C_GREEN"
-    [[ $(echo "$cpu_load > 2.0" | bc -l 2>/dev/null) -eq 1 ]] && color_cpu="$C_YELLOW"
+    if awk -v l="$cpu_load" 'BEGIN{exit (l>2.0)?0:1}' >/dev/null 2>&1; then color_cpu="$C_YELLOW"; fi
     local color_mem="$C_GREEN"; [[ $mem_rate -ge 80 ]] && color_mem="$C_YELLOW"
 
     echo -e "${C_BLUE}┌──[ 系统监控 ]────────────────────────────────────────────────┐${C_RESET}"
@@ -482,7 +561,6 @@ _xray_test_config() {
   "$bin" -test -c "$cfg" && return 0
   return 1
 }
-
 _translate_model_to_xray() {
   local model_cfg="$1"
   local out_cfg="$2"
@@ -490,16 +568,63 @@ _translate_model_to_xray() {
 
   mkdir -p "$(dirname "$out_cfg")" "$(dirname "$log_path")" >/dev/null 2>&1 || true
 
-  # === 全局 IP 偏好 -> domainStrategy ===
+  # === 全局 IP 偏好 -> freedom.domainStrategy ===
   local pref ds
-  pref="$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || true)"
+  pref="$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '
+ ' || true)"
   case "$pref" in
-    v4) ds="UseIPv4" ;;
-    v6) ds="UseIPv6" ;;
-    *)  ds="AsIs" ;;
+    off)       ds="AsIs"      ;;  # 停止全局策略：不干预（让节点策略/默认行为决定）
+    v6pref|v6) ds="UseIPv6v4" ;;  # IPv6优选 + 可回退IPv4（不断网）
+    v4pref|v4) ds="UseIPv4v6" ;;  # IPv4优选 + 可回退IPv6
+    v6only)    ds="UseIPv6" ;;  # 真全局 IPv6 only
+    v4only)    ds="UseIPv4" ;;  # 真全局 IPv4 only
+    *)         ds="AsIs"      ;;  # 未设置：不强行改策略
   esac
 
-  jq --arg log "$log_path" --arg ds "$ds" '
+  # === META（用于单节点 ip_mode）===
+  local meta_json="{}"
+  if [[ -s "$META" ]]; then
+    meta_json="$(cat "$META" 2>/dev/null || echo '{}')"
+  fi
+
+  # === v6pref：强制 IPv4 域名名单（全局 v6pref 或 任意节点 v6pref 时启用）===
+  local fvd_json="[]"
+  local need_fvd=0
+  if [[ "$pref" == "v6pref" || "$pref" == "v6" ]]; then
+    need_fvd=1
+  else
+    if [[ -s "$META" ]] && jq -e 'to_entries | any(.value.ip_mode=="v6pref")' "$META" >/dev/null 2>&1; then
+      need_fvd=1
+    fi
+  fi
+
+  if [[ "$need_fvd" == "1" ]]; then
+    mkdir -p /etc/xray >/dev/null 2>&1 || true
+    if [[ ! -s /etc/xray/force_v4_domains.txt ]]; then
+      cat >/etc/xray/force_v4_domains.txt <<'EOF'
+discord.com
+x.com
+openai.com
+EOF
+    fi
+
+    # 生成 ["domain:discord.com","domain:x.com", ...]
+    fvd_json="$(
+      awk '
+        {gsub("
+","");}
+        NF && $0 !~ /^[[:space:]]*#/ {print "domain:"$0}
+      ' /etc/xray/force_v4_domains.txt \
+      | jq -Rsc 'split("
+") | map(select(length>0))'
+    )"
+  fi
+
+  jq --arg log "$log_path" \
+     --arg ds "$ds" \
+     --arg pref "$pref" \
+     --argjson fvd "$fvd_json" \
+     --argjson meta "$meta_json" '
     def _listen: (.listen // "::");
     def _port: ((.listen_port // .port // 0) | tonumber);
 
@@ -516,11 +641,7 @@ _translate_model_to_xray() {
             accounts: ((.users // []) | map({user: .username, pass: .password})),
             udp: true
           },
-          # ✅ 新增：开启 sniffing，才能按域名分流
-          sniffing: {
-            enabled: true,
-            destOverride: ["http", "tls"]
-          }
+          sniffing: { enabled: true, destOverride: ["http", "tls"] }
         }
       elif .type == "vless" then
         {
@@ -546,11 +667,7 @@ _translate_model_to_xray() {
               shortIds: (.tls.reality.short_id // [])
             }
           },
-          # ✅ 新增：开启 sniffing，才能按域名分流
-          sniffing: {
-            enabled: true,
-            destOverride: ["http", "tls"]
-          }
+          sniffing: { enabled: true, destOverride: ["http", "tls"] }
         }
       else
         empty
@@ -661,61 +778,127 @@ _translate_model_to_xray() {
         { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
       end;
 
+    # --- 单节点 ip_mode：把「规则里 outboundTag=direct」按 inboundTag 映射到不同 direct-* ---
+    def _mode_for(t): ($meta[t].ip_mode // empty);
+    def _direct_tag(m):
+      if m=="v6pref" then "direct-v6pref"
+      elif m=="v4pref" then "direct-v4pref"
+      elif m=="v6only" then "direct-v6only"
+      elif m=="v4only" then "direct-v4only"
+      else "direct" end;
+    def _map_outbound(ob; inb):
+      if ob!="direct" then ob
+      elif (inb|length)==1 then _direct_tag(_mode_for(inb[0]))
+      else ob end;
+
     # ---------------- Routing rules (支持 domain 分流) ----------------
     def mk_rule:
       (
-        {
-          type: "field",
-          outboundTag: (.outbound // "direct"),
-          inboundTag: (if (.inbound | type) == "array" then .inbound else [(.inbound // empty)] end)
-        }
-        +
-        (if (.domain? != null)
-          then { domain: (if (.domain|type)=="array" then .domain else [(.domain|tostring)] end) }
-          else {}
-         end)
-        +
-        (if (.ip? != null)
-          then { ip: (if (.ip|type)=="array" then .ip else [(.ip|tostring)] end) }
-          else {}
-         end)
-        +
-        (if (.port? != null)
-          then { port: (if (.port|type)=="array" then .port else [(.port|tostring)] end) }
-          else {}
-         end)
-        +
-        (if (.protocol? != null)
-          then { protocol: (if (.protocol|type)=="array" then .protocol else [(.protocol|tostring)] end) }
-          else {}
-         end)
+        (if (.inbound | type) == "array" then .inbound else [(.inbound // empty)] end) as $inb
+        | (
+          {
+            type: "field",
+            outboundTag: _map_outbound((.outbound // "direct"); $inb),
+            inboundTag: $inb
+          }
+          +
+          (if (.domain? != null)
+            then { domain: (if (.domain|type)=="array" then .domain else [(.domain|tostring)] end) }
+            else {}
+           end)
+          +
+          (if (.ip? != null)
+            then { ip: (if (.ip|type)=="array" then .ip else [(.ip|tostring)] end) }
+            else {}
+           end)
+          +
+          (if (.port? != null)
+            then { port: (if (.port|type)=="array" then .port else [(.port|tostring)] end) }
+            else {}
+           end)
+          +
+          (if (.protocol? != null)
+            then { protocol: (if (.protocol|type)=="array" then .protocol else [(.protocol|tostring)] end) }
+            else {}
+           end)
+        )
       );
 
     . as $root
-    | {
-        log: { loglevel: "warning", access: $log, error: $log },
-        inbounds: ((($root.inbounds // []) | map(mk_inbound)) // []),
-        outbounds:
-          (
-            (($root.outbounds // []) | map(mk_outbound))
-            | (if (map(select(.tag=="direct")) | length) == 0
-               then . + [{protocol:"freedom", tag:"direct", settings:{domainStrategy:$ds}}]
-               else .
-              end)
-          ),
-        routing: {
-          domainStrategy: $ds,
-          rules: (
-            ($root.route.rules // [])
-            | map(mk_rule)
-          )
+    | (
+        {
+          log: { loglevel: "warning", access: $log, error: $log },
+          inbounds: ((($root.inbounds // []) | map(mk_inbound)) // []),
+          outbounds:
+            (
+              (($root.outbounds // []) | map(mk_outbound))
+              | (if (map(select(.tag=="direct")) | length) == 0
+                 then . + [{protocol:"freedom", tag:"direct", settings:{domainStrategy:$ds}}]
+                 else .
+                end)
+              | (if (map(select(.tag=="block")) | length) == 0 then . + [{protocol:"blackhole", tag:"block", settings:{}}] else . end)
+              | (if (map(select(.tag=="direct-v6pref")) | length) == 0
+                 then . + [{protocol:"freedom", tag:"direct-v6pref", settings:{domainStrategy:"UseIPv6v4"}}]
+                 else .
+                end)
+              | (if (map(select(.tag=="direct-v4pref")) | length) == 0
+                 then . + [{protocol:"freedom", tag:"direct-v4pref", settings:{domainStrategy:"UseIPv4v6"}}]
+                 else .
+                end)
+              | (if (map(select(.tag=="direct-v6only")) | length) == 0
+                 then . + [{protocol:"freedom", tag:"direct-v6only", settings:{domainStrategy:"UseIPv6"}}]
+                 else .
+                end)
+              | (if (map(select(.tag=="direct-v4only")) | length) == 0
+                 then . + [{protocol:"freedom", tag:"direct-v4only", settings:{domainStrategy:"UseIPv4"}}]
+                 else .
+                end)
+              | (if (map(select(.tag=="direct-v4")) | length) == 0
+                 then . + [{protocol:"freedom", tag:"direct-v4", settings:{domainStrategy:"UseIPv4"}}]
+                 else .
+                end)
+            ),
+          routing: {
+            domainStrategy: $ds,
+            rules: (
+              (($root.route.rules // []) | map(mk_rule))
+              + (
+                  ($root.inbounds // [])
+                  | map(.tag // empty) | map(select(length>0)) | unique
+                  | map((.) as $t | (_mode_for($t)) as $m
+                        | if $m=="v6only" then {type:"field", inboundTag:[$t], ip:["0.0.0.0/0"], outboundTag:"block"}
+                          elif $m=="v4only" then {type:"field", inboundTag:[$t], ip:["::/0"], outboundTag:"block"}
+                          else empty end)
+                  | map(select(. != null))
+                )
+              + (
+                  ($root.inbounds // [])
+                  | map(.tag // empty) | map(select(length>0)) | unique
+                  | map({type:"field", inboundTag:[.], outboundTag:_direct_tag(_mode_for(.))})
+                )
+            )
+          }
         }
-      }
+        # --- v6pref：强制v4域名规则（全局 v6pref 或 单节点 v6pref 生效）---
+        | if (($fvd|type=="array") and (($fvd|length) > 0)) then
+            .routing.rules = (
+              (if ($pref=="v6pref" or $pref=="v6")
+                then [ {type:"field", domain:$fvd, outboundTag:"direct-v4"} ]
+                else []
+               end)
+              + (
+                ($meta | to_entries
+                  | map(select(.value.ip_mode=="v6pref"))
+                  | map({type:"field", inboundTag:[.key], domain:$fvd, outboundTag:"direct-v4"})
+                )
+              )
+              + (.routing.rules // [])
+            )
+          else .
+          end
+      )
   ' "$model_cfg" > "$out_cfg"
 }
-
-
-
 _check_model_config() {
   local model_cfg="$1"
   local tmp_out
@@ -896,6 +1079,14 @@ ensure_runtime_deps() {
   ensure_cmd lsof     lsof         lsof        lsof       lsof
   ensure_cmd unzip    unzip        unzip       unzip      unzip
 
+  # 如果 Debian/Ubuntu 上因为「apt 缺 update」导致安装失败，这里统一补一次 update 并重试缺包
+  if [[ "${OS_ID:-}" =~ ^(debian|ubuntu)$ ]] && ((${#_APT_RETRY_PKGS[@]} > 0)); then
+    warn "检测到 apt 安装可能因未 update 失败：补一次 apt-get update 后重试安装：${_APT_RETRY_PKGS[*]}"
+    apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${_APT_RETRY_PKGS[@]}" >/dev/null 2>&1 || true
+    _APT_RETRY_PKGS=()
+  fi
+
   # 最终严格校验：缺哪个就报哪个（不再假成功）
   local missing=()
   for c in "${need[@]}"; do
@@ -922,8 +1113,14 @@ enable_bbr() {
     fi
 
     # 检查内核版本，BBR 需要内核 4.9+
-    local kernel_version=$(uname -r | cut -d- -f1)
-    if [[ $(echo "$kernel_version < 4.9" | bc -l 2>/dev/null) -eq 1 ]]; then
+    local kernel_version
+    kernel_version="$(uname -r | cut -d- -f1)"
+    local kv_major kv_minor rest
+    kv_major="${kernel_version%%.*}"
+    rest="${kernel_version#*.}"
+    kv_minor="${rest%%.*}"
+    kv_major="${kv_major:-0}"; kv_minor="${kv_minor:-0}"
+    if (( kv_major < 4 || (kv_major == 4 && kv_minor < 9) )); then
         warn "内核版本过低 ($kernel_version)，无法开启 BBR。"
         return 1
     fi
@@ -1270,262 +1467,119 @@ install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
   # ========================================================
-  # 1. 生成 xray-sync (增强版：支持 IP 绑定 + 全局 v4/v6 偏好 + 全局默认出口IP + VLESS落地 + 域名分流)
+  # 1. 生成 xray-sync (修复版：支持单节点 IP 模式 + IP 绑定)
   # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 022
 
-XRAY_BASE_DIR="${XRAY_BASE_DIR:-/etc/xray}"
+XRAY_BASE_DIR="/etc/xray"
 MODEL_CFG="${XRAY_BASE_DIR}/config.json"
 META_CFG="${XRAY_BASE_DIR}/nodes_meta.json"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
-LOG_PATH="${LOG_FILE:-/var/log/xray.log}"
+LOG_PATH="/var/log/xray.log"
 
 mkdir -p "$(dirname "$OUT_CFG")" "$(dirname "$LOG_PATH")" >/dev/null 2>&1 || true
 [[ -f "$META_CFG" ]] || echo "{}" > "$META_CFG"
 
-# === 读取全局 IP 偏好：ip_pref -> domainStrategy ===
+# --- 全局 IP 偏好设置 ---
 PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
 case "$PREF" in
-  v4) DS="UseIPv4" ;;
-  v6) DS="UseIPv6" ;;
-  *)  DS="AsIs" ;;
+  v6pref|v6) DS="UseIPv6v4" ;;
+  v4pref|v4) DS="UseIPv4v6" ;;
+  v6only)    DS="ForceIPv6" ;;
+  v4only)    DS="ForceIPv4" ;;
+  *)         DS="UseIPv6v4" ;;
 esac
 
-# === 读取“全局默认出口 IP”（可为空）===
+# --- 全局默认出口 IP ---
 GLOBAL_IP=""
-if [[ "$PREF" == "v6" ]]; then
-  GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v6" 2>/dev/null | tr -d '\r\n ' || true)"
-elif [[ "$PREF" == "v4" ]]; then
-  GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v4" 2>/dev/null | tr -d '\r\n ' || true)"
-fi
+[[ "$PREF" == "v6only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v6" 2>/dev/null | tr -d '\r\n ' || true)"
+[[ "$PREF" == "v4only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v4" 2>/dev/null | tr -d '\r\n ' || true)"
 
 jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "::");
   def _port: ((.listen_port // .port // 0) | tonumber);
 
-  # ================= Inbound 翻译（加 sniffing 才能域名分流） =================
+  # --- 映射模式到 Outbound Tag ---
+  def _mode_tag(m):
+    if m == "v6pref" then "direct-v6pref"
+    elif m == "v4pref" then "direct-v4pref"
+    elif m == "v6only" then "direct-v6only"
+    elif m == "v4only" then "direct-v4only"
+    else "direct" end;
+
+  # --- Inbound 翻译 ---
   def mk_inbound:
     if .type == "socks" then
-      {
-        tag: (.tag // "socks-in"),
-        listen: _listen,
-        port: _port,
-        protocol: "socks",
-        settings: {
-          auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
-          accounts: ((.users // []) | map({user: .username, pass: .password})),
-          udp: true
-        },
-        sniffing: { enabled: true, destOverride: ["http","tls"] }
-      }
+      { tag: (.tag // "socks-in"), listen: _listen, port: _port, protocol: "socks",
+        settings: { auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
+        accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true },
+        sniffing: { enabled: true, destOverride: ["http","tls"] } }
     elif .type == "vless" then
-      {
-        tag: (.tag // "vless-in"),
-        listen: _listen,
-        port: _port,
-        protocol: "vless",
-        settings: {
-          clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})),
-          decryption: "none"
-        },
-        streamSettings: {
-          network: "tcp",
-          security: "reality",
-          realitySettings: {
-            show: false,
-            dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring)
-                  + ":" + (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)),
-            xver: 0,
-            serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
-            privateKey: (.tls.reality.private_key // ""),
-            shortIds: (.tls.reality.short_id // [])
-          }
-        },
-        sniffing: { enabled: true, destOverride: ["http","tls"] }
-      }
+      { tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
+        settings: { clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})), decryption: "none" },
+        streamSettings: { network: "tcp", security: "reality",
+        realitySettings: { show: false, dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring) + ":" + (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)),
+        xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
+        privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // []) } },
+        sniffing: { enabled: true, destOverride: ["http","tls"] } }
     else empty end;
 
-  # ================= Outbound 翻译 =================
+  # --- Outbound 翻译 ---
   def mk_outbound:
     if .type == "direct" then
-      (
-        { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
-        + (if ((.sendThrough // .send_through // "") | length) > 0
-           then { sendThrough: (.sendThrough // .send_through) }
-           else {}
-          end)
-      )
+      { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
+      + (if ((.sendThrough // .send_through // "") | length) > 0 then { sendThrough: (.sendThrough // .send_through) } else {} end)
     elif .type == "socks" then
-      {
-        protocol: "socks", tag: (.tag // "socks-out"),
-        settings: { servers: [{
-          address: (.server // ""),
-          port: ((.server_port // 0) | tonumber),
-          users: (if ((.username // "") != "" and (.password // "") != "")
-                 then [{user: .username, pass: .password}] else [] end)
-        }] }
-      }
+      { protocol: "socks", tag: (.tag // "socks-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber),
+        users: (if ((.username // "") != "" and (.password // "") != "") then [{user: .username, pass: .password}] else [] end) }] } }
     elif .type == "shadowsocks" then
-      {
-        protocol: "shadowsocks", tag: (.tag // "ss-out"),
-        settings: { servers: [{
-          address: (.server // ""),
-          port: ((.server_port // 0) | tonumber),
-          method: (.method // "aes-256-gcm"),
-          password: (.password // "")
-        }] }
-      }
-    elif .type == "vmess" then
-      {
-        protocol: "vmess", tag: (.tag // "vmess-out"),
-        settings: { vnext: [{
-          address: (.server // ""),
-          port: ((.server_port // 0) | tonumber),
-          users: [{ id: (.uuid // .id // ""), security: "auto" }]
-        }] },
-        streamSettings: {
-          network: (.transport.type // .network // "tcp"),
-          security: (if (.tls.enabled == true or .tls != null) then "tls" else "none" end),
-          tlsSettings: (if (.tls.enabled == true or .tls != null)
-                        then { serverName: (.tls.server_name // .sni // ""), allowInsecure: true }
-                        else empty end),
-          wsSettings: (if (.transport.type == "ws" or .network == "ws")
-                       then { path: (.transport.ws_settings.path // .path // ""),
-                              headers: { Host: (.transport.ws_settings.headers.Host // .host // "") } }
-                       else empty end)
-        }
-      }
+      { protocol: "shadowsocks", tag: (.tag // "ss-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), method: (.method // "aes-256-gcm"), password: (.password // "") }] } }
     elif .type == "vless" then
-      {
-        protocol: "vless",
-        tag: (.tag // "vless-out"),
-        settings: {
-          vnext: [{
-            address: (.server // ""),
-            port: ((.server_port // 0) | tonumber),
-            users: [{
-              id: (.uuid // .id // ""),
-              encryption: "none",
-              flow: (.flow // empty)
-            }]
-          }]
-        },
-        streamSettings: {
-          network: (.transport.type // .network // "tcp"),
-          security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
-          realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then {
-            show: false,
-            fingerprint: (.tls.utls.fingerprint // .fp // "chrome"),
-            serverName: (.tls.server_name // .sni // "www.microsoft.com"),
-            publicKey: (.tls.reality.public_key // .pbk // ""),
-            shortId: (if ((.tls.reality.short_id // []) | length) > 0
-                      then (.tls.reality.short_id[0] | tostring)
-                      else (.sid // "")
-                     end),
-            spiderX: "/"
-          } else empty end),
-          tcpSettings: (if ((.transport.type // .network // "tcp") == "tcp")
-                        then { header: { type: (.transport.header_type // .headerType // "none") } }
-                        else empty end)
-        }
-      }
+      { protocol: "vless", tag: (.tag // "vless-out"), settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), encryption: "none", flow: (.flow // empty) }] }] },
+        streamSettings: { network: (.transport.type // .network // "tcp"), security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
+        realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then { show: false, fingerprint: (.tls.utls.fingerprint // .fp // "chrome"), serverName: (.tls.server_name // .sni // "www.microsoft.com"), publicKey: (.tls.reality.public_key // .pbk // ""), shortId: (if ((.tls.reality.short_id // []) | length) > 0 then (.tls.reality.short_id[0] | tostring) else (.sid // "") end), spiderX: "/" } else empty end) } }
     else empty end;
 
-  # ================= 模型规则翻译：把 domain/ip/port/protocol 带入 Xray =================
-  def mk_rule:
-    (
-      {
-        type: "field",
-        outboundTag: (.outbound | tostring),
-        inboundTag: (
-          if .inbound
-          then (if (.inbound|type)=="array" then .inbound else [(.inbound|tostring)] end)
-          else null
-          end
-        )
-      }
-      + (if (.domain? != null)
-         then { domain: (if (.domain|type)=="array" then .domain else [(.domain|tostring)] end) }
-         else {} end)
-      + (if (.ip? != null)
-         then { ip: (if (.ip|type)=="array" then .ip else [(.ip|tostring)] end) }
-         else {} end)
-      + (if (.port? != null)
-         then { port: (if (.port|type)=="array" then .port else [(.port|tostring)] end) }
-         else {} end)
-      + (if (.protocol? != null)
-         then { protocol: (if (.protocol|type)=="array" then .protocol else [(.protocol|tostring)] end) }
-         else {} end)
-    ) | with_entries(select(.value != null));
+  . as $root |
+  ($meta[0]) as $m_data |
 
-  # ================= 节点 fixed_ip 绑定：生成 direct-<tag> 出站 + 优先路由 =================
-  ($meta[0] | to_entries | map(select(.value.fixed_ip != null)) | from_entries) as $bindings |
+  # 1. 基础出站
+  (($root.outbounds // []) | map(mk_outbound) | map(select(. != null))) as $base_outbounds |
 
-  ($bindings | to_entries | map(
-    . as $e
-    | (if (($e.value.ip_version // "") == "v6") or (($e.value.fixed_ip | tostring) | contains(":"))
-       then "UseIPv6"
-       elif (($e.value.ip_version // "") == "v4")
-       then "UseIPv4"
-       else $ds
-       end) as $bind_ds
-    | {
-        protocol: "freedom",
-        tag: ("direct-" + $e.key),
-        settings: { domainStrategy: $bind_ds },
-        sendThrough: $e.value.fixed_ip
-      }
-  )) as $bound_outbounds |
+  # 2. 注入特定 IP 策略的出站
+  ([
+    { tag: "direct-v6pref", ds: "UseIPv6v4" },
+    { tag: "direct-v4pref", ds: "UseIPv4v6" },
+    { tag: "direct-v6only", ds: "ForceIPv6" },
+    { tag: "direct-v4only", ds: "ForceIPv4" },
+    { tag: "direct-v4",     ds: "ForceIPv4" }
+  ] | map({ protocol: "freedom", tag: .tag, settings: { domainStrategy: .ds } })) as $spec_outbounds |
 
-  . as $root
-  | (
-      (($root.outbounds // []) | map(mk_outbound) | map(select(. != null))) as $base_outbounds
+  # 3. 注入 fixed_ip 出站
+  ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map(
+    . as $e | { protocol: "freedom", tag: ("bind-" + $e.key), settings: { domainStrategy: $ds }, sendThrough: $e.value.fixed_ip }
+  )) as $bind_outbounds |
 
-      | (
-          if ($base_outbounds | map(select(.tag=="direct")) | length) == 0
-          then ($base_outbounds + [{protocol:"freedom", tag:"direct", settings:{domainStrategy:$ds}}])
-          else $base_outbounds
-          end
-        ) as $outbounds_ready0
-
-      # 给 direct 注入全局默认出口 IP（若设置了）
-      | (
-          if ($gip | length) > 0 then
-            $outbounds_ready0
-            | map(
-                if .tag=="direct" and ((.sendThrough // "") | length) == 0
-                then . + {sendThrough:$gip}
-                else .
-                end
-              )
-          else
-            $outbounds_ready0
-          end
-        ) as $outbounds_ready
-
-      | {
-          log: { loglevel: "warning", access: $log, error: $log },
-          inbounds: ((($root.inbounds // []) | map(mk_inbound)) | map(select(. != null))),
-          outbounds: ($outbounds_ready + $bound_outbounds),
-          routing: {
-            domainStrategy: $ds,
-            rules: (
-              # 1) fixed_ip 绑定规则优先
-              ($bindings | to_entries | map({
-                type: "field",
-                inboundTag: [.key],
-                outboundTag: ("direct-" + .key)
-              }))
-              +
-              # 2) 模型 route.rules（带 domain）
-              ((($root.route.rules // []) | map(select(.outbound != null)) | map(mk_rule)))
-            )
-          }
-        }
-    )
+  {
+    log: { loglevel: "warning", access: $log, error: $log },
+    inbounds: ((($root.inbounds // []) | map(mk_inbound)) | map(select(. != null))),
+    outbounds: ($base_outbounds + $spec_outbounds + $bind_outbounds) | 
+               map(if .tag == "direct" and ($gip|length > 0) and (.sendThrough == null) then . + {sendThrough: $gip} else . end),
+    routing: {
+      domainStrategy: $ds,
+      rules: (
+        # 优先权 1: fixed_ip 绑定
+        ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({ type: "field", inboundTag: [.key], outboundTag: ("bind-" + .key) })) +
+        # 优先权 2: 单节点 ip_mode (v6only/v4only 等)
+        ($m_data | to_entries | map(select(.value.ip_mode != null)) | map({ type: "field", inboundTag: [.key], outboundTag: _mode_tag(.value.ip_mode) })) +
+        # 优先权 3: 自定义路由规则
+        (($root.route.rules // []) | map(select(.outbound != null) | { type: "field", outboundTag: .outbound, inboundTag: (if .inbound then (if (.inbound|type)=="array" then .inbound else [.inbound] end) else null end), domain: .domain, ip: .ip } | with_entries(select(.value != null))))
+      )
+    }
+  }
 ' "$MODEL_CFG" > "$OUT_CFG"
 SYNC
   chmod +x /usr/local/bin/xray-sync
@@ -1536,8 +1590,6 @@ SYNC
   cat > /usr/local/bin/xray-singleton <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
-
 XRAY_BASE_DIR="/etc/xray"
 PIDFILE="/run/xray.pid"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
@@ -1547,14 +1599,12 @@ LOG="/var/log/xray.log"
 /usr/local/bin/xray-sync >/dev/null 2>&1 || true
 
 if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then
-  echo "[$(date)] [xray-singleton] 配置文件语法错误" >> "$LOG"
+  echo "[$(date)] [xray-singleton] Config Error" >> "$LOG"
   exit 1
 fi
 
 if [[ "${1:-}" != "--force" ]]; then
-  if [[ -f "$PIDFILE" ]] && ps -p "$(cat "$PIDFILE")" -o comm= | grep -q 'xray'; then
-    exit 0
-  fi
+  if [[ -f "$PIDFILE" ]] && ps -p "$(cat "$PIDFILE")" -o comm= | grep -q 'xray'; then exit 0; fi
 fi
 
 pkill -x xray >/dev/null 2>&1 || true
@@ -2152,8 +2202,7 @@ EOF
           1) temp_tunnel_logic ;;
           2) add_argo_user ;;
           3) restart_argo_services ;;
-          4) uninstall_argo_all ;;
-          0) return ;;
+          4) uninstall_argo_all ;;      0) return ;;
       esac
     done
 }
@@ -2910,8 +2959,7 @@ status_menu() {
               say "已取消卸载。"
               sleep 1
           fi
-          ;;
-      0) return ;;
+          ;;      0) return ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
   done
@@ -2965,194 +3013,416 @@ clear_node_egress_lock_from_model() {
   ' --arg in "$tag" --arg ob "$ob_tag"
 }
 
+ensure_force_v4_domain_list() {
+  mkdir -p /etc/xray >/dev/null 2>&1 || true
 
+  # 第一次运行自动生成默认名单（你贴的失败站点）
+  if [[ ! -s /etc/xray/force_v4_domains.txt ]]; then
+    cat >/etc/xray/force_v4_domains.txt <<'EOF'
+discord.com
+x.com
+openai.com
+EOF
+  fi
+}
 
+# 生成一条 xray routing rule：命中名单域名 -> outboundTag=direct-v4
+# 输出：写到 stdout（一段 JSON 规则）
+_build_force_v4_rule_json() {
+  ensure_force_v4_domain_list
 
-ip_version_menu() {
+  # 读名单，转成 ["domain:xxx","domain:yyy"...]
+  local domains_json
+  domains_json=$(
+    awk '
+      {gsub("\r","");}
+      NF && $0 !~ /^[[:space:]]*#/ {print "domain:"$0}
+    ' /etc/xray/force_v4_domains.txt \
+    | jq -Rsc 'split("\n") | map(select(length>0))'
+  )
+
+  # 如果名单为空，输出空
+  if [[ -z "$domains_json" || "$domains_json" == "[]" ]]; then
+    echo ""
+    return 0
+  fi
+
+  # 输出一条标准 field 规则（优先级最高，后面会插到 rules 最前）
+  jq -cn --argjson d "$domains_json" '
+    {
+      "type":"field",
+      "domain": $d,
+      "outboundTag":"direct-v4"
+    }'
+}
+# === 服务器全局网络版本切换 (完整版：支持多 IP 选择 + 域名名单管理) ===
+_global_ip_version_menu() {
+  local __egress_probed=0
+  local -a V4_LIST=() V6_LIST=()
+  local v4_count=0 v6_count=0
+  _probe_egress_once() {
+    (( __egress_probed == 1 )) && return 0
+    mapfile -t V4_LIST < <(get_all_ips_with_geo 4)
+    mapfile -t V6_LIST < <(get_all_ips_with_geo 6)
+    v4_count="${#V4_LIST[@]}"
+    v6_count="${#V6_LIST[@]}"
+    __egress_probed=1
+  }
+
+  _probe_egress_once
+
   while true; do
-    echo -e "\n${C_CYAN}=== 网络版本切换 (IPv4 / IPv6) ===${C_RESET}"
+    echo -e "\n${C_CYAN}=== 服务器全局：网络版本切换 (IPv4 / IPv6) ===${C_RESET}"
 
-    # --- 使用与列表相同的过滤逻辑进行计数 ---
-    local v4_count
-    v4_count=$(ip -4 addr show scope global \
-      | awk '/inet / {print $2}' | cut -d/ -f1 \
-      | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' \
-      | wc -l)
+    # 1. 探测当前所有可用 IP
+    local -a V4_LIST=() V6_LIST=()
+    mapfile -t V4_LIST < <(get_all_ips_with_geo 4)
+    mapfile -t V6_LIST < <(get_all_ips_with_geo 6)
+    local v4_count="${#V4_LIST[@]}"
+    local v6_count="${#V6_LIST[@]}"
 
-    local v6_count
-    v6_count=$(ip -6 addr show scope global \
-      | grep -v "temporary" \
-      | awk '/inet6 [23]/ {print $2}' | cut -d/ -f1 \
-      | wc -l)
+    # 2. 获取当前模式显示
+    local cur_pref cur_label
+    cur_pref="$(_get_global_mode)"
+    cur_label="$(_ip_mode_desc "$cur_pref")"
+    
+    # 颜色排版：节点黄色，括号紫色，值白色
+    printf " ${C_RESET}当前全局模式：${C_YELLOW}%s${C_RESET} ${C_PURPLE}(${C_RESET}%s${C_PURPLE})${C_RESET}\n\n" "$cur_pref" "$cur_label"
 
-    say "1) 全局设置：优先使用 IPv4 ${C_GRAY}(检测到 $v4_count 个出口)${C_RESET}"
-    say "2) 全局设置：优先使用 IPv6 ${C_GRAY}(检测到 $v6_count 个出口)${C_RESET}"
-    say "3) 指定节点：单独设置 IP 版本与出口"
-    say "0) 返回主菜单"
-    safe_read ip_choice " 请选择操作: "
+    say "1) 全局：优选 IPv4（可回退 IPv6） ${C_GRAY}(检测到 $v4_count 个出口)${C_RESET}"
+    say "2) 全局：优选 IPv6（可回退 IPv4 + v6不通域名走v4） ${C_GRAY}(检测到 $v6_count 个出口)${C_RESET}"
+    say "3) 全局：真全局 IPv4 only（完全不用 IPv6） ${C_GRAY}(检测到 $v4_count 个出口)${C_RESET}"
+    say "4) 全局：真全局 IPv6 only（完全不用 IPv4） ${C_GRAY}(检测到 $v6_count 个出口)${C_RESET}"
+    say "5) 管理『v6不通强制走v4』域名名单（仅对 优选IPv6 生效）"
+    say "6) 停止全局策略（不干预IP版本，让节点策略优先生效）"
+    say "0) 返回上级"
+    
+    local ip_choice
+    safe_read ip_choice " 请选择操作 [0-6]: "
 
     case "$ip_choice" in
-            1|2)
-        local pref="v4"
-        [[ "$ip_choice" == "2" ]] && pref="v6"
-
+      1|2|3|4)
         mkdir -p /etc/xray >/dev/null 2>&1 || true
+        # 预防性解锁关键文件，防止由于之前的 chattr +i 导致写入失败
+        chattr -i /etc/xray/ip_pref /etc/xray/global_egress_ip_v6 /etc/xray/global_egress_ip_v4 2>/dev/null || true
 
-        # 记录旧值：用于判断是否需要“立刻生效”
-        local old_pref
-        old_pref="$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || true)"
+        local pref="" mode_name=""
+        case "$ip_choice" in
+          1) pref="v4pref"; mode_name="优选 IPv4" ;;
+          2) pref="v6pref"; mode_name="优选 IPv6" ;;
+          3) pref="v4only"; mode_name="真全局 IPv4 only" ;;
+          4) pref="v6only"; mode_name="真全局 IPv6 only" ;;
+        esac
 
-        # === 新增：全局也选择具体出口 IP（可跳过）===
-        local p_flag="4"
-        [[ "$pref" == "v6" ]] && p_flag="6"
-
-        echo -e "\n正在检测可用 IPv${p_flag} 出口及归属地..."
-        mapfile -t avail_ips < <(get_all_ips_with_geo "$p_flag")
-
-        # ✅ 如果用户选 v6 但根本没 v6 出口：不切换、不重启（避免把策略切到 UseIPv6 造成没网）
-        if [[ "$pref" == "v6" && ${#avail_ips[@]} -eq 0 ]]; then
-          warn "未检测到可用的 IPv6 公网地址：已忽略本次 v6 偏好切换（不会重启）。"
+        # 针对 v6only 的断网保护
+        if [[ "$pref" == "v6only" && $v6_count -eq 0 ]]; then
+          warn "错误：未检测到可用的 IPv6 出口，无法切换至 v6only 模式。"
           continue
         fi
 
-        # 先写偏好（但不强制重启；只有“真的改了全局出口IP”才重启）
+        # --- 多 IPv6 选择逻辑 ---
+        if [[ "$pref" == "v6pref" || "$pref" == "v6only" ]]; then
+            if [[ $v6_count -gt 1 ]]; then
+                echo -e "\n${C_CYAN}检测到多个 IPv6 出口，请选择要锁定的 IP：${C_RESET}"
+                local n=0
+                for line in "${V6_LIST[@]}"; do
+                    n=$((n+1))
+                    echo -e " ${C_GREEN}[$n]${C_RESET} $line"
+                done
+                echo -e " ${C_GREEN}[0]${C_RESET} 返回上级"
+                echo -e " ${C_GRAY}(回车=不锁定，交给系统动态路由)${C_RESET}"
+                read -rp " 请输入序号（回车=不锁定）: " ip_sel
+                
+                if [[ "${ip_sel:-}" == "0" ]]; then
+                    say "已返回上级（未改动锁定设置）"
+                    continue
+                fi
+
+                if [[ "$ip_sel" =~ ^[1-9]$ ]] && [[ "$ip_sel" -le $n ]]; then
+                    local selected_ip=$(echo "${V6_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+                    echo "$selected_ip" > /etc/xray/global_egress_ip_v6
+                    ok "已锁定出口 IP: $selected_ip"
+                else
+                    rm -f /etc/xray/global_egress_ip_v6
+                    say "已设置为系统动态分配"
+                fi
+            else
+                rm -f /etc/xray/global_egress_ip_v6
+            fi
+        fi
+
+        # 优选模式通常不强制锁定 v4 IP
+        [[ "$pref" == "v4pref" ]] && rm -f /etc/xray/global_egress_ip_v4
+
+        # 写入配置并重启
         echo "$pref" > /etc/xray/ip_pref
-        ok "全局偏好已设置为：$pref（将于下次重启生效；如需立刻生效请选择全局出口IP）"
-
-        # 没有可用公网出口：只保存偏好，不重启
-        if [ ${#avail_ips[@]} -eq 0 ]; then
-          warn "未检测到可用的 IPv${p_flag} 公网地址，仅保存偏好（不重启）"
-          continue
+        ok "✔ 全局模式已成功切换为：$mode_name"
+        
+        # 针对 v6pref 模式自动补全默认黑名单
+        if [[ "$pref" == "v6pref" && ! -s /etc/xray/force_v4_domains.txt ]]; then
+          echo -e "discord.com\nx.com\nopenai.com" > /etc/xray/force_v4_domains.txt
         fi
 
-        local j=0
-        for line in "${avail_ips[@]}"; do
-          j=$((j+1))
-          echo -e " ${C_GREEN}[$j]${C_RESET} ${C_CYAN}${line}${C_RESET}"
+        restart_xray
+        ;;
+
+      5)
+        # 域名名单管理 (完整逻辑，不省略)
+        while true; do
+            mkdir -p /etc/xray >/dev/null 2>&1 || true
+            [[ ! -s /etc/xray/force_v4_domains.txt ]] && echo -e "discord.com\nx.com\nopenai.com" > /etc/xray/force_v4_domains.txt
+
+            echo -e "\n${C_CYAN}=== v6不通强制走v4：域名名单 (v6pref 生效) ===${C_RESET}"
+            nl -ba /etc/xray/force_v4_domains.txt 2>/dev/null || echo "名单为空"
+            echo
+            say "1) 添加域名"
+            say "2) 删除域名"
+            say "3) 清理空行/注释/去重"
+            say "0) 返回上级"
+            local act
+            safe_read act " 请选择操作: "
+            
+            case "$act" in
+              1)
+                local d
+                safe_read d " 输入要添加的域名 (如 google.com): "
+                [[ -n "${d:-}" ]] && echo "$d" >> /etc/xray/force_v4_domains.txt && ok "已添加: $d"
+                ;;
+              2)
+                local d
+                safe_read d " 输入要删除的域名 (需完全匹配): "
+                if [[ -n "${d:-}" ]]; then
+                  grep -vFx "$d" /etc/xray/force_v4_domains.txt > /etc/xray/force_v4_domains.txt.tmp \
+                    && mv /etc/xray/force_v4_domains.txt.tmp /etc/xray/force_v4_domains.txt
+                  ok "已尝试删除: $d"
+                fi
+                ;;
+              3)
+                # 清理并去重
+                awk '{gsub("\r","");} NF && $0 !~ /^[[:space:]]*#/ {print}' /etc/xray/force_v4_domains.txt \
+                  | sort -u > /etc/xray/force_v4_domains.txt.tmp \
+                  && mv /etc/xray/force_v4_domains.txt.tmp /etc/xray/force_v4_domains.txt
+                ok "清理与去重完成。"
+                ;;
+              0) break ;;
+            esac
         done
-        echo -e " ${C_GREEN}[0]${C_RESET} 跳过（仅保存偏好，不重启）"
+        warn "提示：域名名单修改后需重启一次 Xray 服务方可对现有连接生效。"
+        ;;
 
-        read -rp "请选择全局默认出口 IP 序号: " ip_idx
+      6)
+        # 停止策略：解除文件锁定并写入 off
+        chattr -i /etc/xray/ip_pref /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 2>/dev/null || true
+        echo "off" > /etc/xray/ip_pref
+        rm -f /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 >/dev/null 2>&1 || true
+        ok "✔ 已停止全局策略（模式已设为 off），节点独立策略现在优先生效。"
+        restart_xray
+        ;;
 
-        # ✅ 只有选了具体出口IP，才需要重启立刻生效
-        if [[ -n "${ip_idx:-}" && "$ip_idx" != "0" ]]; then
-          local chosen_raw="${avail_ips[$((ip_idx-1))]}"
-          local chosen_ip
-          chosen_ip=$(echo "$chosen_raw" | awk '{print $1}')
+      0) return ;;
+      *) warn "无效输入。" ;;
+    esac
+  done
+}
 
-          if [[ "$pref" == "v6" ]]; then
-            echo "$chosen_ip" > /etc/xray/global_egress_ip_v6
-            ok "全局默认 IPv6 出口已设置为: $chosen_raw"
-          else
-            echo "$chosen_ip" > /etc/xray/global_egress_ip_v4
-            ok "全局默认 IPv4 出口已设置为: $chosen_raw"
-          fi
+# === 完美对齐+精准调色版：网络切换主菜单 ===
+ip_version_menu() {
+  while true; do
+    # 1. 获取全局状态
+    local g_pref g_label
+    g_pref="$(_get_global_mode)"
+    g_label="$(_ip_mode_desc "$g_pref")"
 
-          restart_xray
+    echo -e "\n${C_CYAN}=== 网络切换：选择节点/全局 ===${C_RESET}"
+    echo -e "${C_GRAY}说明：单节点独立设置会覆盖全局策略${C_RESET}\n"
+
+    # 2. 聚合所有节点标签
+    local tags_raw=""
+    [[ -f "$CONFIG" ]] && tags_raw+=$(jq -r '.inbounds[].tag // empty' "$CONFIG" 2>/dev/null || true)
+    [[ -f "$META"   ]] && tags_raw+=$'\n'$(jq -r 'keys[]' "$META" 2>/dev/null || true)
+    mapfile -t ALL_TAGS < <(echo "$tags_raw" | grep -v '^$' | sort -u)
+
+    # 3. 循环显示节点状态
+    local i=0
+    for tag in "${ALL_TAGS[@]}"; do
+      i=$((i+1))
+      # 从元数据 nodes_meta.json 读取模式
+      local node_mode
+      node_mode=$(jq -r --arg t "$tag" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
+      
+      local status_text=""
+      if [[ "$node_mode" == "follow_global" || "$node_mode" == "follow" || "$node_mode" == "null" || -z "$node_mode" ]]; then
+        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
+        status_text="${C_PURPLE}(当前：跟随全局 → ${C_RESET}${g_label}${C_PURPLE})${C_RESET}"
+      else
+        local n_label
+        n_label="$(_ip_mode_desc "$node_mode")"
+        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
+        status_text="${C_PURPLE}(独立设置：${C_RESET}${n_label}${C_PURPLE})${C_RESET}"
+      fi
+
+      # 核心修复：\033[40G 会强制将光标移至第 40 列，无论前面的节点名是中文还是英文，后面的括号都会在同一列对齐
+      printf " ${C_GREEN}[%d]${C_RESET} ${C_YELLOW}%s\033[40G%b\n" "$i" "$tag" "$status_text"
+    done
+
+    # 4. 服务器全局策略行同样使用 \033[40G 强制对齐
+    local g_idx=$((i+1))
+    printf " ${C_GREEN}[%d]${C_RESET} ${C_CYAN}服务器全局策略\033[40G${C_PURPLE}(当前全局：${C_RESET}%s${C_PURPLE})${C_RESET}\n" "$g_idx" "$g_label"
+    
+    echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单\n"
+
+    local pick
+    safe_read pick "请选择序号: "
+    [[ -z "${pick:-}" || "$pick" == "0" ]] && return
+    
+    if ! [[ "$pick" =~ ^[0-9]+$ ]]; then
+      warn "输入无效：请输入数字序号。"
+      continue
+    fi
+
+    if (( pick == g_idx )); then
+      _global_ip_version_menu
+      continue
+    fi
+
+    if (( pick < 1 || pick > ${#ALL_TAGS[@]} )); then
+      warn "输入无效：序号超出范围。"
+      continue
+    fi
+
+    _node_ip_mode_menu "${ALL_TAGS[$((pick-1))]}"
+  done
+}
+
+# === 单节点网络模式：支持变化检测与 IP 锁定 ===
+_node_ip_mode_menu() {
+  local target_tag="$1"
+  local __egress_probed=0
+  local -a V4_LIST=() V6_LIST=()
+  local v4_count=0 v6_count=0
+  _probe_egress_once() {
+    (( __egress_probed == 1 )) && return 0
+    mapfile -t V4_LIST < <(get_all_ips_with_geo 4)
+    mapfile -t V6_LIST < <(get_all_ips_with_geo 6)
+    v4_count="${#V4_LIST[@]}"
+    v6_count="${#V6_LIST[@]}"
+    __egress_probed=1
+  }
+
+  # 进入该节点菜单时立刻探测一次（只做一次）
+  _probe_egress_once
+
+  mkdir -p /etc/xray >/dev/null 2>&1 || true
+
+  while true; do
+    echo -e "\n${C_CYAN}=== 单节点网络模式：${C_YELLOW}${target_tag}${C_RESET}${C_CYAN} ===${C_RESET}"
+
+    # 1. 探测出口（仅首次进入本菜单时执行，避免重复浪费时间）
+    _probe_egress_once
+
+    # 2. 读取当前节点的【旧配置】用于对比
+    local old_mode old_fixed_ip
+    old_mode=$(jq -r --arg t "$target_tag" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
+    old_fixed_ip=$(jq -r --arg t "$target_tag" '.[$t].fixed_ip // empty' "$META" 2>/dev/null)
+    local cur_label="$(_ip_mode_desc "$old_mode")"
+
+    printf " ${C_RESET}当前节点模式：${C_YELLOW}%s${C_RESET} ${C_PURPLE}(${C_RESET}%s${C_PURPLE})${C_RESET}\n\n" "$old_mode" "$cur_label"
+
+    say "1) 单节点全局：优选 IPv4（可回退 IPv6） ${C_GRAY}(检测到 $v4_count 个出口)${C_RESET}"
+    say "2) 单节点全局：优选 IPv6（可回退 IPv4 + v6不通域名走v4） ${C_GRAY}(检测到 $v6_count 个出口)${C_RESET}"
+    say "3) 单节点全局：真全局 IPv4 only（完全不用 IPv6） ${C_GRAY}(检测到 $v4_count 个出口)${C_RESET}"
+    say "4) 单节点全局：真全局 IPv6 only（完全不用 IPv4） ${C_GRAY}(检测到 $v6_count 个出口)${C_RESET}"
+    say "5) 管理『v6不通强制走v4』域名名单"
+    say "6) 恢复：跟随服务器全局"
+    say "0) 返回上级"
+
+    local c
+    safe_read c " 请选择操作 [0-6]: "
+
+    case "$c" in
+      1|2|3|4)
+        chattr -i "$META" 2>/dev/null || true
+        local pref="" target_v=""
+        case "$c" in
+          1) pref="v4pref"; target_v="v4" ;;
+          2) pref="v6pref"; target_v="v6" ;;
+          3) pref="v4only"; target_v="v4" ;;
+          4) pref="v6only"; target_v="v6" ;;
+        esac
+
+        # --- IP 选择逻辑 ---
+        local selected_fixed_ip=""
+        local -a TARGET_IP_LIST=()
+        local target_count=0
+        [[ "$target_v" == "v6" ]] && { TARGET_IP_LIST=("${V6_LIST[@]}"); target_count=$v6_count; } \
+                                  || { TARGET_IP_LIST=("${V4_LIST[@]}"); target_count=$v4_count; }
+
+        if [[ $target_count -gt 1 ]]; then
+            echo -e "\n${C_CYAN}检测到该节点有多个 ${target_v^^} 出口，请选择要锁定的 IP：${C_RESET}"
+            local n=0
+            for line in "${TARGET_IP_LIST[@]}"; do
+                n=$((n+1))
+                echo -e " ${C_GREEN}[$n]${C_RESET} $line"
+            done
+            echo -e " ${C_GREEN}[0]${C_RESET} 返回上级"
+                echo -e " ${C_GRAY}(回车=不锁定，交给系统动态路由)${C_RESET}"
+            read -rp " 请选择序号（回车=不锁定）: " ip_sel
+            
+            if [[ "${ip_sel:-}" == "0" ]]; then
+                say "已返回上级（未改动锁定设置）"
+                selected_fixed_ip=""
+                __abort_lock_choose=1
+            fi
+
+            if [[ "${__abort_lock_choose:-0}" != "1" ]] && [[ "$ip_sel" =~ ^[1-9]$ ]] && [[ "$ip_sel" -le $n ]]; then
+                selected_fixed_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+            fi
+        fi
+
+        if [[ "${__abort_lock_choose:-0}" == "1" ]]; then
+            unset __abort_lock_choose
+            continue
+        fi
+
+        # --- 【核心改进：变化检测】 ---
+        if [[ "$pref" == "$old_mode" && "$selected_fixed_ip" == "$old_fixed_ip" ]]; then
+            ok "配置与当前运行中一致，无需更改，跳过重启。"
+            continue
+        fi
+
+        # 写入配置
+        if [[ -n "$selected_fixed_ip" ]]; then
+            safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $mode, "fixed_ip": $ip, "ip_version": $v})}' \
+              --arg tag "$target_tag" --arg mode "$pref" --arg ip "$selected_fixed_ip" --arg v "$target_v"
+            ok "已锁定出口 IP: $selected_fixed_ip"
         else
-          ok "已跳过设置全局出口 IP（仅保存偏好，不重启）"
+            safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $mode})}' --arg tag "$target_tag" --arg mode "$pref"
+            safe_json_edit "$META" 'del(.[$tag].fixed_ip) | del(.[$tag].ip_version)' --arg tag "$target_tag"
+            say "已设置为系统动态分配出口"
+        fi
+
+        # 只有在真正发生变化时才重启
+        if ! restart_xray; then
+          warn "⚡ 重启失败，正在尝试回退..."
+          safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $m, "fixed_ip": $ip})}' --arg tag "$target_tag" --arg m "$old_mode" --arg ip "$old_fixed_ip"
+          restart_xray
         fi
         ;;
 
-      3)
-        # --- 节点选择层级 ---
-        local tags_raw=""
-        [[ -f "$CONFIG" ]] && tags_raw+=$(jq -r '.inbounds[].tag // empty' "$CONFIG")
-        [[ -f "$META" ]] && tags_raw+=$'\n'$(jq -r 'keys[]' "$META")
-        mapfile -t ALL_TAGS < <(echo "$tags_raw" | grep -v '^$' | sort -u)
-
-        if [ ${#ALL_TAGS[@]} -eq 0 ]; then
-          warn "当前没有任何节点可配置。"
-          break
+      6)
+        if [[ "$old_mode" == "follow_global" ]]; then
+            ok "当前已是跟随模式，跳过重启。"
+            continue
         fi
-
-        local i=0
-        for tag in "${ALL_TAGS[@]}"; do
-          i=$((i+1))
-          local current_v
-          current_v=$(jq -r --arg t "$tag" '.[$t].ip_version // "跟随全局"' "$META" 2>/dev/null)
-          local current_ip
-          current_ip=$(jq -r --arg t "$tag" '.[$t].fixed_ip // "动态抓取"' "$META" 2>/dev/null)
-          echo -e " ${C_GREEN}[$i]${C_RESET} ${C_YELLOW}${tag}${C_RESET} ${C_GRAY}(版本:${current_v} | IP:${current_ip})${C_RESET}"
-        done
-        echo -e " ${C_GREEN}[0]${C_RESET} 返回上级"
-
-        read -rp "请输入节点序号: " n_idx
-        [[ "$n_idx" == "0" || -z "$n_idx" ]] && continue
-        local target_tag="${ALL_TAGS[$((n_idx-1))]}"
-
-        # --- 详细 IP 选择层级 ---
-        echo -e "\n➜ 为节点 [${C_YELLOW}${target_tag}${C_RESET}] 配置出口:"
-        say "1. 强制 IPv4 列表"
-        say "2. 强制 IPv6 列表"
-        say "3. 跟随全局设置"
-        say "0. 返回"
-
-        read -rp "选择 [0-3]: " v_choice
-        case "$v_choice" in
-          1|2)
-            local p_flag="4"
-            [[ "$v_choice" == "2" ]] && p_flag="6"
-
-            echo -e "\n正在检测可用 IPv${p_flag} 出口及归属地..."
-            mapfile -t avail_ips < <(get_all_ips_with_geo "$p_flag")
-
-            if [ ${#avail_ips[@]} -eq 0 ]; then
-              err "未检测到可用的 IPv${p_flag} 公网地址"
-              continue
-            fi
-
-            local j=0
-            for line in "${avail_ips[@]}"; do
-              j=$((j+1))
-              echo -e " ${C_GREEN}[$j]${C_RESET} ${C_CYAN}${line}${C_RESET}"
-            done
-            echo -e " ${C_GREEN}[0]${C_RESET} 取消"
-
-            read -rp "请选择具体的 IP 出口序号: " ip_idx
-            [[ "$ip_idx" == "0" || -z "$ip_idx" ]] && continue
-
-            local chosen_raw="${avail_ips[$((ip_idx-1))]}"
-            local chosen_ip
-            chosen_ip=$(echo "$chosen_raw" | awk '{print $1}')
-
-            # 1) 写入 Meta：锁定版本和具体 IP（展示/记录）
-            safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_version": "v'$p_flag'", "fixed_ip": $ip})}' \
-              --arg tag "$target_tag" --arg ip "$chosen_ip"
-            ok "已锁定节点出口为: $chosen_raw"
-
-            # 2) 同步写入模型配置（可选：你实现了才会真正生效）
-            if command -v apply_node_egress_lock_to_model >/dev/null 2>&1; then
-              apply_node_egress_lock_to_model "$target_tag" "$chosen_ip" || {
-                warn "已写入 META，但写入模型配置失败（所以可能仍不会生效）"
-              }
-            fi
-
-            # 3) 立刻生效
-            restart_xray
-            ;;
-          3)
-            # 清理 Meta（跟随全局）
-            safe_json_edit "$META" 'del(.[ $tag ].ip_version) | del(.[ $tag ].fixed_ip)' --arg tag "$target_tag"
-            ok "已恢复为跟随全局"
-
-            # 同步清理模型配置（如果你实现了该函数）
-            if command -v clear_node_egress_lock_from_model >/dev/null 2>&1; then
-              clear_node_egress_lock_from_model "$target_tag" || true
-            fi
-
-            restart_xray
-            ;;
-          0) continue ;;
-        esac
+        chattr -i "$META" 2>/dev/null || true
+        safe_json_edit "$META" 'del(.[$tag].ip_mode) | del(.[$tag].fixed_ip) | del(.[$tag].ip_version)' --arg tag "$target_tag"
+        ok "✔ 节点已恢复跟随服务器全局策略。"
+        restart_xray
         ;;
       0) return ;;
     esac
   done
 }
-
-
-
 # 手动添加 SOCKS5 或 HTTP 落地
 add_manual_proxy_outbound() {
     local type_choice="$1"
@@ -3230,6 +3500,13 @@ outbound_menu() {
       6) set_node_routing ;;
       7) list_and_del_routing_rules ;;
       8) repair_config_structure ;;
+      6)
+        mkdir -p /etc/xray >/dev/null 2>&1 || true
+        echo "off" > /etc/xray/ip_pref
+        rm -f /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 >/dev/null 2>&1 || true
+        ok "已停止全局策略：off（不干预 IP 版本；节点策略可优先生效）"
+        restart_xray
+        ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac

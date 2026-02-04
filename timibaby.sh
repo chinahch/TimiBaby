@@ -397,7 +397,8 @@ get_all_ips_with_geo() {
     if [[ "$proto" == "4" ]]; then
         mapfile -t all_addr_info < <(ip -4 -o addr show | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
     else
-        mapfile -t all_addr_info < <(ip -6 -o addr show scope global| grep -v "temporary" | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
+        # 注意：scope global 也会包含 ULA(fd/fc)，后面会再过滤
+        mapfile -t all_addr_info < <(ip -6 -o addr show scope global | grep -v "temporary" | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
     fi
 
     for line in "${all_addr_info[@]}"; do
@@ -405,12 +406,31 @@ get_all_ips_with_geo() {
         local lip=$(echo "$line" | awk '{print $2}')
         [[ -z "$lip" ]] && continue
 
+        # ========== 新增：先做“不可锁地址”过滤 ==========
+        if [[ "$proto" == "6" ]]; then
+            # 过滤：link-local / ULA / loopback
+            [[ "$lip" =~ ^(fe80:|fd|fc|::1) ]] && continue
+            # 仅允许 2000::/3（2xxx 或 3xxx 开头）
+            [[ ! "$lip" =~ ^[23] ]] && continue
+        fi
+        # ============================================
+
         local is_private=0
         if [[ "$proto" == "4" ]]; then
             [[ "$lip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|100\.) ]] && is_private=1
         else
+            # 上面已经过滤掉 fe80/fd/fc/::1，这里保留逻辑不影响
             [[ "$lip" =~ ^(fd|fc|fe80:|::1) ]] && is_private=1
         fi
+
+        # ========== 新增：IPv4 NAT 私网(非 tun/wg/tap) 不显示 ==========
+        if [[ "$proto" == "4" && "$is_private" -eq 1 ]]; then
+            # 只有 tun/wg/tap 的私网才当“落地口”列出；eth0 上的 10.x/172/192/100.* 直接跳过
+            if [[ ! "$iface" =~ ^(tun|wg|tap) ]]; then
+                continue
+            fi
+        fi
+        # ===========================================================
 
         local pub_ip=""
         if [[ "$is_private" -eq 0 ]]; then

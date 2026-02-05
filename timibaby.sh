@@ -262,6 +262,10 @@ get_public_ipv4_ensure() {
         fi
     fi
 }
+
+
+
+
 # 获取公网 IPv6 (增加实时校验)
 get_public_ipv6_ensure() {
     local ip6=""
@@ -1843,8 +1847,10 @@ add_node() {
   if [[ "$proto" == "4" ]]; then argo_menu_wrapper; return; fi
   
   GLOBAL_IPV4=$(get_public_ipv4_ensure)
-  local PUBLIC_HOST
-  PUBLIC_HOST="$(get_public_host_ensure)"
+local PUBLIC_HOST
+PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
+[[ -z "$PUBLIC_HOST" ]] && PUBLIC_HOST="$(get_public_ipv4_ensure)"
+
 
   if [[ "$proto" == "1" ]]; then
       read -rp "端口 (留空随机, 输入0返回): " port

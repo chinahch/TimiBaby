@@ -247,22 +247,49 @@ update_ip_async() {
     ) &
 }
 
-# 获取当前 IP (如果缓存有就读缓存，没有就强制获取)
+# 获取当前服务器的“入口”公网 IP (适配 NAT 环境)
 get_public_ipv4_ensure() {
+    # 1. 优先级最高：读取用户手动设置的入口域名或 IP (如 seed.lazycat.cv)
+    local saved_host
+    saved_host="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
+    if [[ -n "$saved_host" ]]; then
+        echo -n "$saved_host"
+        return
+    fi
+
+    # 2. 优先级第二：尝试通过当前 SSH 会话获取入口 IP
+    # $SSH_CONNECTION 的第 3 位通常是服务器接听请求的公网 IP
+    local ssh_entry
+    ssh_entry=$(echo "$SSH_CONNECTION" | awk '{print $3}')
+    
+    # 关键点：如果 SSH 获取到的是公网 IP（非 10., 172., 192. 等），则直接使用
+    if [[ -n "$ssh_entry" ]] && ! [[ "$ssh_entry" =~ ^(10\.|172\.|192\.168\.|127\.) ]]; then
+        echo -n "$ssh_entry" | tee "$IP_CACHE_FILE"
+        return
+    fi
+
+    # 3. 优先级第三：读取缓存 (如果缓存里不是私有 IP)
     if [[ -f "$IP_CACHE_FILE" ]]; then
-        cat "$IP_CACHE_FILE"
-    else
-        local ip
-        ip=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me/ip)
-        if [[ -n "$ip" ]]; then
-            echo "$ip" | tee "$IP_CACHE_FILE"
-        else
-            # 最后的 fallback
-            ip -4 addr | grep -v '127.0.0.1' | grep -v 'docker' | awk '{print $2}' | cut -d/ -f1 | head -n1
+        local cached_ip
+        cached_ip=$(cat "$IP_CACHE_FILE")
+        if ! [[ "$cached_ip" =~ ^(10\.|172\.|192\.168\.|127\.) ]]; then
+            echo -n "$cached_ip"
+            return
         fi
     fi
-}
 
+    # 4. 优先级第四：通过外部 API 获取 (出口 IP)
+    local egress_ip
+    egress_ip=$(curl -s -4 --connect-timeout 3 --max-time 5 https://api.ipify.org || curl -s -4 --connect-timeout 3 --max-time 5 https://ifconfig.me/ip)
+    
+    # 5. 最后保底：如果是 NAT 环境拿不到入口 IP，只能暂时显示出口 IP
+    if [[ -n "$egress_ip" ]]; then
+        echo -n "$egress_ip" | tee "$IP_CACHE_FILE"
+    else
+        # 最后的最后，抓网卡 IP
+        ip -4 addr show scope global | grep -vE '127\.0\.0\.1' | awk '{print $2}' | cut -d/ -f1 | head -n1
+    fi
+}
 
 
 
@@ -280,19 +307,47 @@ get_public_ipv6_ensure() {
     fi
 }
 
+# 1. 获取纯中文国家名称
+get_country_name_zh() {
+  local ip; ip=$(get_public_ipv4_ensure)
+  local country; country=$(curl -s -4 --connect-timeout 2 --max-time 3 "http://ip-api.com/json/${ip}?fields=country&lang=zh-CN" | jq -r '.country // "未知"')
+  echo -n "$country"
+}
+
+# 2. 自动获取 A-Z 排序后缀 (自动补位：如果 A 没被占用就用 A)
+get_node_letter_suffix() {
+  local prefix="$1"
+  local country="$2"
+  local alphabet=(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z)
+  
+  # 汇总当前所有已存在的标签
+  local existing_tags=$( (jq -r '.inbounds[].tag // empty' "$CONFIG" 2>/dev/null; jq -r 'keys[]' "$META" 2>/dev/null) | sort -u)
+  
+  # 遍历 A-Z，找到第一个没被占用的字母
+  for letter in "${alphabet[@]}"; do
+    local candidate="${prefix}-${country}${letter}"
+    if ! echo "$existing_tags" | grep -qx "$candidate"; then
+      echo -n "$letter"
+      return
+    fi
+  done
+  echo -n "Z$(date +%s)" # 极端情况：A-Z 全满则使用时间戳
+}
+
+
 # 获取 IP 地理位置与类型 (中文增强版)
 get_ip_country() {
     local ip="$1"
     # 处理空值或非法输入
     [[ -z "$ip" || "$ip" == "未知" || "$ip" == "null" || "$ip" == "??" ]] && echo "未知" && return
 
-    # 1) 内存缓存：避免对同一 IP 多次请求
+    # 1) 内存缓存：避免对同一 IP 多次请求 (脚本运行期间有效)
     if [[ -n "${GEO_CACHE[$ip]:-}" ]]; then
         echo "${GEO_CACHE[$ip]}"
         return
     fi
 
-    # 2) 内网地址识别
+    # 2) 内网地址识别 (正则增强)
     if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|127\.|169\.254\.|fc00:|fd00:|fe80:|::1) ]]; then
         echo "内网" && return
     fi
@@ -314,25 +369,22 @@ get_ip_country() {
         local is_business=$(echo "$ip_data" | jq -r '.is_business // false' 2>/dev/null)
         local asn_type=$(echo "$ip_data" | jq -r '.asn.type // "unknown"' 2>/dev/null | tr '[:upper:]' '[:lower:]')
 
-        # --- 增强版判断逻辑：优先级排列 ---
+        # --- 判断逻辑优先级 ---
         if [[ "$is_hosting" == "true" || "$asn_type" == "hosting" || "$asn_type" == "data center" ]]; then
-            # 只要 API 标记为托管或 ASN 类型为 hosting，即判定为机房
             type_label="机房"
         elif [[ "$is_mobile" == "true" ]]; then
             type_label="移动网"
         elif [[ "$is_business" == "true" || "$asn_type" == "business" || "$asn_type" == "education" ]]; then
-            # 商宽或教育网合并显示
             type_label="商宽"
         elif [[ "$asn_type" == "isp" || "$asn_type" == "residential" ]]; then
-            # 只有明确标记为 ISP 或 Residential 时才显示家宽
             type_label="家宽"
         else
-            # 无法确定时，保持“通用”或“未知类型”，不盲目判定为家宽
             type_label="通用"
         fi
     fi
 
     local result="${country} [${type_label}]"
+    # 存入内存缓存
     GEO_CACHE["$ip"]="$result"
     echo "$result"
 }
@@ -1833,15 +1885,12 @@ fix_errors() {
 
 add_node() {
   ensure_runtime_deps
-    ensure_dirs
+  ensure_dirs
   install_singleton_wrapper >/dev/null 2>&1 || true
-    if command -v systemctl >/dev/null 2>&1 && is_real_systemd; then
+  if command -v systemctl >/dev/null 2>&1 && is_real_systemd; then
     systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service' || install_systemd_service >/dev/null 2>&1 || true
   fi
 
-  
-  # 移除之前的强制降级逻辑，确保使用你当前的 26.1.23 环境
-  
   while true; do
     echo -e "\n${C_CYAN}>>> 添加节点${C_RESET}"
     say "1) SOCKS5"
@@ -1856,15 +1905,28 @@ add_node() {
     warn "无效输入"
   done
 
+  # --- 自定义命名逻辑 ---
+  echo -e "\n${C_YELLOW}➜ 节点命名设置${C_RESET}"
+  read -rp " 请输入自定义前缀 (例如 lazycat): " custom_prefix
+  custom_prefix=${custom_prefix:-"node"}
+  
+  local zh_country; zh_country=$(get_country_name_zh)
+  local letter; letter=$(get_node_letter_suffix "$custom_prefix" "$zh_country")
+  
+  # 构造最终标签名：自定义-国家字母 (例如: lazycat-香港A)
+  local tag="${custom_prefix}-${zh_country}${letter}"
+  say "自动生成节点名: ${C_GREEN}${tag}${C_RESET}"
+  # --------------------
+
   if [[ "$proto" == "3" ]]; then add_hysteria2_node; return; fi
   if [[ "$proto" == "4" ]]; then argo_menu_wrapper; return; fi
-  
+
   GLOBAL_IPV4=$(get_public_ipv4_ensure)
-local PUBLIC_HOST
-PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
-[[ -z "$PUBLIC_HOST" ]] && PUBLIC_HOST="$(get_public_ipv4_ensure)"
+  local PUBLIC_HOST
+  PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
+  [[ -z "$PUBLIC_HOST" ]] && PUBLIC_HOST="$(get_public_ipv4_ensure)"
 
-
+  # === SOCKS5 逻辑 ===
   if [[ "$proto" == "1" ]]; then
       read -rp "端口 (留空随机, 输入0返回): " port
       [[ "$port" == "0" ]] && return
@@ -1875,7 +1937,7 @@ PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
       read -rp "密码 (默认 pass123, 输入0返回): " pass
       [[ "$pass" == "0" ]] && return
       pass=${pass:-pass123}
-      local tag="sk5-$(get_country_code)-${port}"
+
       safe_json_edit "$CONFIG" \
         '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
         --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag"
@@ -1884,8 +1946,9 @@ PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
       print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${PUBLIC_HOST}:${port}#${tag}"
   fi
 
+  # === VLESS-REALITY 逻辑 ===
   if [[ "$proto" == "2" ]]; then
-    local port uuid server_name key_pair private_key public_key short_id tag
+    local port uuid server_name key_pair private_key public_key short_id
     while true; do
        safe_read port "请输入端口号 (留空随机, 输入0返回): "
        [[ "$port" == "0" ]] && return
@@ -1902,8 +1965,6 @@ PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
     server_name="${input_sni:-www.microsoft.com}"
     
     uuid=$(uuidgen)
-    
-    # 获取 Xray 执行路径
     local xray_cmd=$(_xray_bin)
     [[ ! -x "$xray_cmd" ]] && xray_cmd=$(command -v xray)
     
@@ -1913,48 +1974,26 @@ PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
         xray_cmd="/usr/local/bin/xray"
     fi
 
-    # --- 核心修复：兼容新版 xray x25519 输出（PublicKey/Password/Hash32） ---
-# 更加强悍的提取函数：忽略大小写，兼容多种分隔符
-extract_kv() {
-  local pat="$1"
-  # 兼容多种冒号分隔符、空格以及新旧版标签名
-  grep -iE "$pat" | awk -F':' '{print $2}' | tr -d '[:space:]'
-}
+    # 提取密钥函数
+    extract_kv() {
+      local pat="$1"
+      grep -iE "$pat" | awk -F':' '{print $2}' | tr -d '[:space:]'
+    }
 
-# 在 add_node 函数中 VLESS-REALITY 分支下的修改：
-key_pair=$($xray_cmd x25519 2>/dev/null)
+    key_pair=$($xray_cmd x25519 2>/dev/null)
+    private_key=$(echo "$key_pair" | extract_kv 'private')
+    public_key=$(echo "$key_pair" | extract_kv 'public|password')
 
-# 兼容各种版本的输出标签
-private_key=$(echo "$key_pair" | extract_kv 'private')
-public_key=$(echo "$key_pair" | extract_kv 'public|password')
+    if [[ -z "$public_key" && -n "$private_key" ]]; then
+      public_key=$($xray_cmd x25519 -i "$private_key" 2>/dev/null | extract_kv 'public|password')
+    fi
 
-# 终极保险：如果还是没取到，手动用私钥推导公钥
-if [[ -z "$public_key" && -n "$private_key" ]]; then
-  public_key=$($xray_cmd x25519 -i "$private_key" 2>/dev/null | extract_kv 'public|password')
-fi
-
-# 如果还是空，直接报错停止，不进入写入流程
-if [[ -z "$private_key" || -z "$public_key" ]]; then
-    err "致命错误：无法通过 Xray 核心生成有效的 x25519 密钥对"
-    return 1
-fi
-
-key_pair=$($xray_cmd x25519 2>/dev/null)
-
-# PrivateKey / Private key
-private_key=$(echo "$key_pair" | extract_kv 'privatekey|private key|private')
-
-# 兼容：PublicKey / Public key / Password（新版用 Password 代替旧 PublicKey）
-public_key=$(echo "$key_pair" | extract_kv 'publickey|public key|password')
-
-# 如果首轮没取到（极少数情况），用私钥再算一次，同样兼容 Password/PublicKey
-if [[ -z "$public_key" && -n "$private_key" ]]; then
-  public_key=$($xray_cmd x25519 -i "$private_key" 2>/dev/null | extract_kv 'publickey|public key|password')
-fi
-
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        err "致命错误：无法通过 Xray 核心生成有效的 x25519 密钥对"
+        return 1
+    fi
 
     short_id=$(openssl rand -hex 4)
-    tag=$(generate_unique_tag)
 
     safe_json_edit "$CONFIG" \
        '.inbounds += [{"type": "vless","tag": $tag,"listen": "::","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],"tls": {"enabled": true,"server_name": $server,"reality": {"enabled": true,"handshake": { "server": $server, "server_port": 443 },"private_key": $prikey,"short_id": [ $sid ]}}}]' \
@@ -1963,37 +2002,32 @@ fi
     safe_json_edit "$META" '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:"chrome"}}' \
        --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port"
 
-    # 写入后：必须重启成功
-if ! restart_xray; then
-  err "Xray 重启失败：该节点未生效，已回滚"
-  safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
-  safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-  return
-fi
+    if ! restart_xray; then
+      err "Xray 重启失败：已回滚"
+      safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
+      safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
+      return
+    fi
 
-# 重启成功后：必须监听端口，否则也回滚（避免“假可用”）
-port_status "$port"
-case $? in
-  0) ;; # xray 正在监听
-  1)
-    err "端口 $port 被其他进程占用：该节点不可用，已回滚"
-    safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
-    safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-    restart_xray >/dev/null 2>&1 || true
-    return
-    ;;
-  2)
-    err "Xray 未监听 $port：该节点不可用，已回滚（请看 /var/log/xray.log）"
-    safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
-    safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-    restart_xray >/dev/null 2>&1 || true
-    return
-    ;;
-esac
+    port_status "$port"
+    case $? in
+      0) ;; 
+      1)
+        err "端口 $port 被占用：已回滚"
+        safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
+        safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
+        restart_xray >/dev/null 2>&1 || true
+        return ;;
+      2)
+        err "Xray 未监听 $port：已回滚"
+        safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
+        safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
+        restart_xray >/dev/null 2>&1 || true
+        return ;;
+    esac
 
-local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
-print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
-
+    local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
+    print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
   fi
 }
 
@@ -2386,9 +2420,9 @@ view_nodes_menu() {
   view_nodes_menu # 递归返回列表
 }
 
-# 修改后的删除节点函数：支持自动清理关联路由规则
 delete_node() {
-  echo -e "\n${C_CYAN}=== 删除节点 ===${C_RESET}"
+  echo -e "\n${C_CYAN}=== 删除节点 (支持多选) ===${C_RESET}"
+  echo -e "${C_GRAY}提示：输入多个序号可用空格或逗号分隔，如: 1 3 5 或 1,2,5${C_RESET}\n"
 
   local tags_raw=""
   # 1. 汇总所有配置中的标签 (Config + Meta)
@@ -2404,98 +2438,116 @@ delete_node() {
       return
   fi
 
-  # 3. 显示列表
+  # 3. 显示列表 (精准识别协议类型)
   local i=0
   for tag in "${ALL_TAGS[@]}"; do
-      i=$((i+1))
-      local type_info="未知"
-      [[ "$tag" == *"vless"* ]] && type_info="VLESS"
-      [[ "$tag" == *"sk5"* ]] && type_info="SOCKS5"
-      [[ "$tag" == *"Hy2"* ]] && type_info="Hysteria2"
-      [[ "$tag" == *"Argo"* ]] && type_info="Argo"
+      i=$((i+1))  # 修正：算术运算必须使用 $(( ))
       
-      echo -e " ${C_GREEN}[$i]${C_RESET} ${C_YELLOW}${tag}${C_RESET} ${C_GRAY}(${type_info})${C_RESET}"
+      # --- 精准获取协议类型逻辑 ---
+      # 优先从 Meta 数据获取，Meta 里的 protocol 优先级最高
+      local type_info=$(jq -r --arg t "$tag" '.[$t].protocol // .[$t].type // empty' "$META" 2>/dev/null)
+      
+      # 如果 Meta 没存，则去 Config 的 inbounds 里精准查找 protocol 字段
+      if [[ -z "$type_info" || "$type_info" == "null" ]]; then
+          type_info=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .protocol // .type // empty' "$CONFIG" 2>/dev/null)
+      fi
+      
+      # 格式化显示名称 (统一转为小写后判断)
+      local display_type="未知"
+      case "${type_info,,}" in
+          vless)     display_type="VLESS" ;;
+          socks)     display_type="SOCKS5" ;;
+          hysteria2) display_type="Hysteria2" ;;
+          argo)      display_type="Argo" ;;
+          vmess)     display_type="VMess" ;;
+          trojan)    display_type="Trojan" ;;
+          *)         display_type="未知" ;;
+      esac
+      
+      echo -e " ${C_GREEN}[$i]${C_RESET} ${C_YELLOW}${tag}${C_RESET} ${C_GRAY}(${display_type})${C_RESET}"
   done
   echo -e " ${C_RED}[00]${C_RESET} 删除全部节点"
   echo -e " ${C_GREEN}[0]${C_RESET} 取消返回"
   echo ""
 
-  read -rp "请输入要删除的节点序号 [0-00]: " choice
+  read -rp "请输入要删除的节点序号: " choice
   [[ "$choice" == "0" || -z "$choice" ]] && return
 
-  # --- 逻辑 A: 全量删除 (00) 并清理所有规则 ---
+  # --- 逻辑 A: 全量删除 (00) ---
   if [[ "$choice" == "00" ]]; then
       echo -e ""
       warn "⚠️  确定要删除所有 ${#ALL_TAGS[@]} 个节点及相关的所有分流规则吗？"
       read -rp "请输入 y 确认: " confirm
       if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
           say "正在执行全量清理..."
+          # 停止并删除所有 Hysteria2 服务
           for target_tag in "${ALL_TAGS[@]}"; do
-              # 清理 Hysteria2 / Argo 相关服务与进程
               if [[ "$target_tag" =~ Hy2 ]]; then
-                  local port=$(echo "$target_tag" | grep -oE '[0-9]+')
-                  [[ -n "$port" ]] && systemctl disable --now "hysteria2-${port}" 2>/dev/null && rm -f "/etc/systemd/system/hysteria2-${port}.service" "/etc/hysteria2/${port}.yaml"
+                  local port=$(jq -r --arg t "$target_tag" '.[$t].port // empty' "$META" 2>/dev/null)
+                  [[ -z "$port" || "$port" == "null" ]] && port=$(echo "$target_tag" | grep -oE '[0-9]+')
+                  [[ -n "$port" ]] && systemctl disable --now "hysteria2-${port}" 2>/dev/null && rm -f "/etc/systemd/system/hysteria2-${port}.service"
               fi
-              [[ "$target_tag" =~ Argo ]] && pkill -f "cloudflared" 2>/dev/null && pkill -f "xray" 2>/dev/null
           done
-
-          # 一键排空配置、元数据和所有关联规则
           safe_json_edit "$CONFIG" '.inbounds = [] | .route.rules = []'
           safe_json_edit "$META" '{}'
-
-          systemctl daemon-reload 2>/dev/null
+          pkill -f "cloudflared" 2>/dev/null
           restart_xray
-          ok "所有节点及关联规则已清理完毕。"
-      else
-          say "操作已取消。"
+          ok "已清理全部节点及规则。"
       fi
       read -rp "按回车继续..." _
       return
   fi
 
-  # --- 逻辑 B: 删除单个节点并同步清理其规则 ---
-  local target_tag=""
-  if [[ "$choice" =~ ^[0-9]+$ ]]; then
-      if [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ]; then
-          target_tag="${ALL_TAGS[$((choice-1))]}"
-      else
-          warn "无效序号"
-          return
-      fi
-  else
-      target_tag="$choice"
-  fi
-
-  if [[ -z "$target_tag" ]]; then warn "未选择有效节点"; return; fi
-
-  say "正在执行级联删除: ${C_RED}${target_tag}${C_RESET} ..."
+  # --- 逻辑 B: 多选删除处理 ---
+  local -a selected_tags=()
+  local clean_choice="${choice//,/ }" # 将逗号换成空格统一处理
   
-  # 1. 核心删除：从入站和元数据中移除
-  safe_json_edit "$CONFIG" "del(.inbounds[] | select(.tag==\$t))" --arg t "$target_tag"
-  safe_json_edit "$META" "del(.[\$t])" --arg t "$target_tag"
-
-  # 2. 自动清理：移除所有引用了该节点标签的路由规则
-  # 这里的 jq 逻辑会同时匹配字符串或数组形式的 inbound 标签
-  safe_json_edit "$CONFIG" '
-    (.route.rules //= []) | 
-    del(.route.rules[] | select(
-      if (.inbound|type)=="array" then (.inbound | index($t) != null) else (.inbound == $t) end
-    ))
-  ' --arg t "$target_tag"
-
-  # 3. 特殊服务清理
-  if [[ "$target_tag" =~ Hy2 ]]; then
-      local port=$(echo "$target_tag" | grep -oE '[0-9]+')
-      if [[ -n "$port" ]]; then
-          systemctl disable --now "hysteria2-${port}" 2>/dev/null
-          rm -f "/etc/systemd/system/hysteria2-${port}.service" "/etc/hysteria2/${port}.yaml"
+  for idx in $clean_choice; do
+      if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "$i" ]; then
+          selected_tags+=("${ALL_TAGS[$((idx-1))]}")
       fi
-  fi
-  [[ "$target_tag" =~ Argo ]] && pkill -f "cloudflared" 2>/dev/null && pkill -f "xray" 2>/dev/null
+  done
 
-  systemctl daemon-reload 2>/dev/null
+  # 数组去重
+  mapfile -t selected_tags < <(printf "%s\n" "${selected_tags[@]}" | sort -u)
+
+  if [ ${#selected_tags[@]} -eq 0 ]; then
+      warn "未选择任何有效序号。"
+      return
+  fi
+
+  # 确认预览
+  echo -e "\n${C_RED}确认删除以下节点？${C_RESET}"
+  for t in "${selected_tags[@]}"; do echo -e " - ${C_YELLOW}$t${C_RESET}"; done
+  read -rp "输入 y 确认执行: " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+
+  # 开始循环删除
+  for target_tag in "${selected_tags[@]}"; do
+      say "清理中: $target_tag ..."
+      
+      # 1. 从 config.json 和 nodes_meta.json 移除
+      safe_json_edit "$CONFIG" "del(.inbounds[] | select(.tag==\$t))" --arg t "$target_tag"
+      safe_json_edit "$META" "del(.[\$t])" --arg t "$target_tag"
+
+      # 2. 自动清理路由规则 (同时处理字符串和数组格式的入站)
+      safe_json_edit "$CONFIG" '
+        (.route.rules //= []) | 
+        del(.route.rules[] | select(
+          if (.inbound|type)=="array" then (.inbound | index($t) != null) else (.inbound == $t) end
+        ))
+      ' --arg t "$target_tag"
+
+      # 3. 特殊服务级联清理
+      if [[ "$target_tag" =~ Hy2 ]]; then
+          local p=$(echo "$target_tag" | grep -oE '[0-9]+')
+          [[ -n "$p" ]] && systemctl disable --now "hysteria2-$p" 2>/dev/null && rm -f "/etc/systemd/system/hysteria2-$p.service"
+      fi
+      [[ "$target_tag" =~ Argo ]] && pkill -f "cloudflared" 2>/dev/null
+  done
+
   restart_xray
-  ok "节点 [${target_tag}] 及其关联规则已成功移除。"
+  ok "所选节点已成功移除。"
   read -rp "按回车返回..." _
 }
 

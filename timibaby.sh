@@ -1076,7 +1076,7 @@ ensure_cmd() {
 ensure_runtime_deps() {
   if (( DEPS_CHECKED == 1 )); then return 0; fi
 
-  # 依赖清单：补上 unzip（Xray zip 解压必须）
+  # 依赖清单
   local need=(curl jq uuidgen openssl ss lsof unzip)
 
   # 已齐全则不做任何 update/install
@@ -1089,7 +1089,13 @@ ensure_runtime_deps() {
     return 0
   fi
 
-  say "首次运行，正在补全依赖..."
+  say "正在为 $(detect_os) 补全依赖..."
+
+  # === 针对 Alpine 的核心修复点 ===
+  if [[ "$(detect_os)" == "alpine" ]]; then
+    warn "Alpine 环境：正在更新软件源索引..."
+    apk update >/dev/null 2>&1
+  fi
 
   ensure_cmd curl     curl         curl        curl       curl
   ensure_cmd jq       jq           jq          jq         jq
@@ -1099,22 +1105,22 @@ ensure_runtime_deps() {
   ensure_cmd lsof     lsof         lsof        lsof       lsof
   ensure_cmd unzip    unzip        unzip       unzip      unzip
 
-  # 如果 Debian/Ubuntu 上因为「apt 缺 update」导致安装失败，这里统一补一次 update 并重试缺包
+  # Debian/Ubuntu 的补跑逻辑保持不变
   if [[ "${OS_ID:-}" =~ ^(debian|ubuntu)$ ]] && ((${#_APT_RETRY_PKGS[@]} > 0)); then
-    warn "检测到 apt 安装可能因未 update 失败：补一次 apt-get update 后重试安装：${_APT_RETRY_PKGS[*]}"
+    warn "检测到 apt 安装可能因未 update 失败：补一次 apt-get update 后重试安装..."
     apt-get update -y >/dev/null 2>&1 || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${_APT_RETRY_PKGS[@]}" >/dev/null 2>&1 || true
     _APT_RETRY_PKGS=()
   fi
 
-  # 最终严格校验：缺哪个就报哪个（不再假成功）
+  # 最终严格校验
   local missing=()
   for c in "${need[@]}"; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
 
   if ((${#missing[@]} > 0)); then
-    warn "仍有依赖缺失：${missing[*]}（请检查软件源/DNS/网络后重试）"
+    err "仍有依赖缺失：${missing[*]}"
     return 1
   fi
 

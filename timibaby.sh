@@ -1076,7 +1076,7 @@ ensure_cmd() {
 ensure_runtime_deps() {
   if (( DEPS_CHECKED == 1 )); then return 0; fi
 
-  # 依赖清单
+  # 依赖清单：补上 unzip（Xray zip 解压必须）
   local need=(curl jq uuidgen openssl ss lsof unzip)
 
   # 已齐全则不做任何 update/install
@@ -1089,13 +1089,7 @@ ensure_runtime_deps() {
     return 0
   fi
 
-  say "正在为 $(detect_os) 补全依赖..."
-
-  # === 针对 Alpine 的核心修复点 ===
-  if [[ "$(detect_os)" == "alpine" ]]; then
-    warn "Alpine 环境：正在更新软件源索引..."
-    apk update >/dev/null 2>&1
-  fi
+  say "首次运行，正在补全依赖..."
 
   ensure_cmd curl     curl         curl        curl       curl
   ensure_cmd jq       jq           jq          jq         jq
@@ -1105,22 +1099,22 @@ ensure_runtime_deps() {
   ensure_cmd lsof     lsof         lsof        lsof       lsof
   ensure_cmd unzip    unzip        unzip       unzip      unzip
 
-  # Debian/Ubuntu 的补跑逻辑保持不变
+  # 如果 Debian/Ubuntu 上因为「apt 缺 update」导致安装失败，这里统一补一次 update 并重试缺包
   if [[ "${OS_ID:-}" =~ ^(debian|ubuntu)$ ]] && ((${#_APT_RETRY_PKGS[@]} > 0)); then
-    warn "检测到 apt 安装可能因未 update 失败：补一次 apt-get update 后重试安装..."
+    warn "检测到 apt 安装可能因未 update 失败：补一次 apt-get update 后重试安装：${_APT_RETRY_PKGS[*]}"
     apt-get update -y >/dev/null 2>&1 || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${_APT_RETRY_PKGS[@]}" >/dev/null 2>&1 || true
     _APT_RETRY_PKGS=()
   fi
 
-  # 最终严格校验
+  # 最终严格校验：缺哪个就报哪个（不再假成功）
   local missing=()
   for c in "${need[@]}"; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
 
   if ((${#missing[@]} > 0)); then
-    err "仍有依赖缺失：${missing[*]}"
+    warn "仍有依赖缺失：${missing[*]}（请检查软件源/DNS/网络后重试）"
     return 1
   fi
 
@@ -1849,6 +1843,8 @@ add_node() {
   if [[ "$proto" == "4" ]]; then argo_menu_wrapper; return; fi
   
   GLOBAL_IPV4=$(get_public_ipv4_ensure)
+  local PUBLIC_HOST
+  PUBLIC_HOST="$(get_public_host_ensure)"
 
   if [[ "$proto" == "1" ]]; then
       read -rp "端口 (留空随机, 输入0返回): " port
@@ -1866,7 +1862,7 @@ add_node() {
         --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag"
       restart_xray
       local creds=$(printf "%s:%s" "$user" "$pass" | base64 -w0)
-      print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${GLOBAL_IPV4}:${port}#${tag}"
+      print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${PUBLIC_HOST}:${port}#${tag}"
   fi
 
   if [[ "$proto" == "2" ]]; then
@@ -1976,7 +1972,7 @@ case $? in
     ;;
 esac
 
-local link="vless://${uuid}@${GLOBAL_IPV4}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
+local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
 print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
 
   fi
@@ -1986,6 +1982,9 @@ print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$li
 add_hysteria2_node() {
   ensure_runtime_deps
   GLOBAL_IPV4=$(get_public_ipv4_ensure)
+
+  local PUBLIC_HOST
+  PUBLIC_HOST="$(get_public_host_ensure)"
   
   read -rp "Hysteria2 端口 (留空随机): " input_port
   local port=${input_port:-$(get_random_allowed_port "udp")}
@@ -2043,7 +2042,7 @@ EOF
   jq --arg tag "$tag" --arg port "$port" --arg sni "$sni" --arg obfs "$obfs" --arg auth "$auth" \
     '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, obfs:$obfs, auth:$auth}}' "$META" >"$tmpm" && mv "$tmpm" "$META"
 
-  local link="hysteria2://${auth}@${GLOBAL_IPV4}:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
+  local link="hysteria2://${auth}@${PUBLIC_HOST}:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
   print_card "Hysteria2 成功" "$tag" "端口: $port" "$link"
   read -rp "按回车继续..." _
 }
@@ -3383,8 +3382,10 @@ _node_ip_mode_menu() {
         [[ "$target_v" == "v6" ]] && { TARGET_IP_LIST=("${V6_LIST[@]}"); target_count=$v6_count; } \
                                   || { TARGET_IP_LIST=("${V4_LIST[@]}"); target_count=$v4_count; }
 
-        if [[ $target_count -gt 1 ]]; then
-            echo -e "\n${C_CYAN}检测到该节点有多个 ${target_v^^} 出口，请选择要锁定的 IP：${C_RESET}"
+        local __abort_lock_choose=0
+
+        if [[ $target_count -ge 1 ]]; then
+            echo -e "\n${C_CYAN}检测到该节点有 ${target_count} 个 ${target_v^^} 出口，请选择要锁定的 IP：${C_RESET}"
             local n=0
             for line in "${TARGET_IP_LIST[@]}"; do
                 n=$((n+1))
@@ -3400,7 +3401,7 @@ _node_ip_mode_menu() {
                 __abort_lock_choose=1
             fi
 
-            if [[ "${__abort_lock_choose:-0}" != "1" ]] && [[ "$ip_sel" =~ ^[1-9]$ ]] && [[ "$ip_sel" -le $n ]]; then
+            if [[ "${__abort_lock_choose:-0}" != "1" ]] && [[ "$ip_sel" =~ ^[0-9]+$ ]] && (( ip_sel >= 1 && ip_sel <= n )); then
                 selected_fixed_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
             fi
         fi

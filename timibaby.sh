@@ -1211,7 +1211,17 @@ install_xray_if_needed() {
       exit 2
     fi
 
+    # 1. 安装二进制主程序
     install -m 0755 "$bin" /usr/local/bin/xray
+
+    # 2. 【新增】安装资源文件 (geosite.dat 和 geoip.dat)
+    # 这样分流规则（如 geosite:tiktok）才能被内核正确解析
+    if [[ -f "geosite.dat" ]]; then
+      install -m 0644 "geosite.dat" /usr/local/bin/geosite.dat
+    fi
+    if [[ -f "geoip.dat" ]]; then
+      install -m 0644 "geoip.dat" /usr/local/bin/geoip.dat
+    fi
   )
   local rc=$?
   rm -rf "$tmp"
@@ -1221,7 +1231,7 @@ install_xray_if_needed() {
     return 1
   fi
 
-  ok "Xray 核心已就绪"
+  ok "Xray 核心及资源文件已就绪"
   return 0
 }
 

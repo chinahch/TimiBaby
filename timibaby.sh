@@ -348,34 +348,37 @@ test_outbound_connection() {
     local type="$1"
     local server="$2"
     local port="$3"
-    local user="$4"
-    local pass="$5"
+    local user="${4:-}"
+    local pass="${5:-}"
 
-    # 1. 加密协议直接跳过，节省等待时间
+    # 加密协议：脚本不做明文探测（保持你原逻辑）
     if [[ "$type" =~ ^(ss|vless|vmess|hysteria2)$ ]]; then
         echo -e "➜ ${C_YELLOW}提示：${type^^} 加密协议请在客户端测试。${C_RESET}"
         return 0
     fi
 
     say "正在探测落地出口 (极速模式)..."
-    # 移除原有的 sleep 2 以实现秒开测试
 
     local proxy_url=""
-    [[ "$type" == "socks" ]] && proxy_url="socks5://" || proxy_url="http://"
+    [[ "$type" == "socks" ]] && proxy_url="socks5h://" || proxy_url="http://"
+
+    # socks/http 认证拼接
     if [[ -n "$user" && -n "$pass" ]]; then
         proxy_url+="${user}:${pass}@"
     fi
     proxy_url+="${server}:${port}"
 
-    # 2. 优化：将 --max-time 从 8s 降低至 3s，增加连接超时限制 --connect-timeout 2
-    local test_ip
-    test_ip=$(curl -s -x "$proxy_url" --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null || echo "FAILED")
+    # 关键：curl 失败要 return 1
+    local test_ip=""
+    test_ip="$(curl -sS -x "$proxy_url" --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null | tr -d '\r\n')"
 
-    if [[ "$test_ip" == "FAILED" || -z "$test_ip" ]]; then
-        err "测试失败：节点连接超时 (3s)。"
-    else
-        ok "测试成功！出口 IP: ${C_YELLOW}${test_ip}${C_RESET}"
+    if [[ -z "$test_ip" ]]; then
+        err "测试失败：节点连接超时/不可用 (3s)。"
+        return 1
     fi
+
+    ok "测试成功！出口 IP: ${C_YELLOW}${test_ip}${C_RESET}"
+    return 0
 }
 
 
@@ -3456,7 +3459,8 @@ _node_ip_mode_menu() {
     esac
   done
 }
-# 手动添加 SOCKS5 或 HTTP 落地
+# 手动添加 SOCKS5 或 HTTP 落地（先测后加，修复版）
+# 手动添加 SOCKS5 或 HTTP 落地（修复 jq $u/$pw 未传参导致的配置损坏）
 add_manual_proxy_outbound() {
     local type_choice="$1"
     local proto="socks"
@@ -3467,6 +3471,11 @@ add_manual_proxy_outbound() {
     [[ "$server" == "0" || -z "$server" ]] && return
     read -rp "端口: " port
     [[ -z "$port" ]] && return
+
+    # 端口清洗：只保留数字
+    port="$(echo "$port" | tr -cd '0-9')"
+    [[ -z "$port" ]] && { err "端口不合法"; return 1; }
+
     read -rp "用户名 (可选): " user
     read -rp "密码 (可选): " pass
 
@@ -3481,21 +3490,38 @@ add_manual_proxy_outbound() {
     test_outbound_connection "$proto" "$server" "$port" "$user" "$pass"
     [[ $? -ne 0 ]] && { warn "落地测试未通过，已取消添加。"; return 1; }
 
-    # 3) 构建 JSON
+    # 3) 构建 JSON（关键修复：把 u/pw 传给 jq）
     local new_node
     if [[ -n "$user" && -n "$pass" ]]; then
-        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg pr "$proto" \
-            '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber), username: $u, password: $pw}')
+        new_node="$(
+          jq -n \
+            --arg t  "$tag" \
+            --arg s  "$server" \
+            --arg p  "$port" \
+            --arg pr "$proto" \
+            --arg u  "$user" \
+            --arg pw "$pass" \
+            '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber), username: $u, password: $pw}'
+        )"
     else
-        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg pr "$proto" \
-            '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber)}')
+        # 任意一项为空就当无认证（避免生成 username 有值但 password 为空这种“半残配置”）
+        new_node="$(
+          jq -n \
+            --arg t  "$tag" \
+            --arg s  "$server" \
+            --arg p  "$port" \
+            --arg pr "$proto" \
+            '{type: $pr, tag: $t, server: $s, server_port: ($p|tonumber)}'
+        )"
     fi
 
+    # 4) 先写入沙盒校验（你原逻辑是对的）
     local sandbox="/tmp/sb_proxy_check.json"
     cp "$CONFIG" "$sandbox"
-    jq --argjson node "$new_node" '(.outbounds //= []) | .outbounds += [$node]' "$sandbox" > "${sandbox}.tmp" && mv "${sandbox}.tmp" "$sandbox"
 
-    # 4) 关键修改：移除 >/dev/null 2>&1，让真实的报错显现出来
+    jq --argjson node "$new_node" '(.outbounds //= []) | .outbounds += [$node]' \
+      "$sandbox" > "${sandbox}.tmp" && mv "${sandbox}.tmp" "$sandbox"
+
     if _check_model_config "$sandbox"; then
         mv "$sandbox" "$CONFIG"
         ok "落地 [${tag}] 已成功保存！"
@@ -3505,6 +3531,9 @@ add_manual_proxy_outbound() {
         return 1
     fi
 }
+
+
+
 # 1. 落地出口主菜单
 outbound_menu() {
   while true; do

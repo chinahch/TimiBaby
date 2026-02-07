@@ -2037,7 +2037,7 @@ add_hysteria2_node() {
   GLOBAL_IPV4=$(get_public_ipv4_ensure)
 
   local PUBLIC_HOST
-  PUBLIC_HOST="$(get_public_host_ensure)"
+  PUBLIC_HOST="$(get_public_ipv4_ensure)"
   
   read -rp "Hysteria2 端口 (留空随机): " input_port
   local port=${input_port:-$(get_random_allowed_port "udp")}

@@ -1556,7 +1556,7 @@ install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
   # ========================================================
-  # 1. 生成 xray-sync (修复版：支持 SS + 单节点 IP 模式 + IP 绑定)
+  # 1. 生成 xray-sync (智能版：自动识别 v4/v6 环境 + 支持 SS)
   # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
@@ -1572,20 +1572,38 @@ LOG_PATH="/var/log/xray.log"
 mkdir -p "$(dirname "$OUT_CFG")" "$(dirname "$LOG_PATH")" >/dev/null 2>&1 || true
 [[ -f "$META_CFG" ]] || echo "{}" > "$META_CFG"
 
-# --- 全局 IP 偏好设置 ---
+# --- 全局 IP 偏好设置 (读取) ---
 PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
-case "$PREF" in
-  v6pref|v6) DS="UseIPv6v4" ;;
-  v4pref|v4) DS="UseIPv4v6" ;;
-  v6only)    DS="ForceIPv6" ;;
-  v4only)    DS="ForceIPv4" ;;
-  *)         DS="UseIPv6v4" ;;
+
+# --- 🚀 智能环境感知逻辑 ---
+# 如果用户没有手动指定偏好 (PREF 为空)，则自动检测网络环境
+if [[ -z "$PREF" || "$PREF" == "(未设置)" || "$PREF" == "follow_global" ]]; then
+    # 尝试连接一个可靠的 IPv4 地址 (使用 api.ipify.org 或 8.8.8.8)
+    # 只要能通，就默认 v4 优先；完全不通，则认为是 IPv6 Only 环境
+    if curl -s -4 --connect-timeout 1 --max-time 2 https://api.ipify.org >/dev/null 2>&1; then
+        PREF_AUTO="v4pref"
+    elif ping -4 -c 1 -W 1 8.8.8.8 >/dev/null 2>&1; then
+        PREF_AUTO="v4pref"
+    else
+        PREF_AUTO="v6pref"
+    fi
+else
+    PREF_AUTO="$PREF"
+fi
+
+# 根据最终决定的 PREF 设置 Xray 的 domainStrategy
+case "${PREF_AUTO}" in
+  v6pref|v6) DS="UseIPv6v4" ;;  # IPv6 优先
+  v4pref|v4) DS="UseIPv4v6" ;;  # IPv4 优先
+  v6only)    DS="ForceIPv6" ;;  # 仅 IPv6
+  v4only)    DS="ForceIPv4" ;;  # 仅 IPv4
+  *)         DS="UseIPv4v6" ;;  # 默认保底 v4 优先
 esac
 
-# --- 全局默认出口 IP ---
+# --- 全局默认出口 IP (用于锁定) ---
 GLOBAL_IP=""
-[[ "$PREF" == "v6only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v6" 2>/dev/null | tr -d '\r\n ' || true)"
-[[ "$PREF" == "v4only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v4" 2>/dev/null | tr -d '\r\n ' || true)"
+[[ "$PREF_AUTO" == "v6only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v6" 2>/dev/null | tr -d '\r\n ' || true)"
+[[ "$PREF_AUTO" == "v4only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v4" 2>/dev/null | tr -d '\r\n ' || true)"
 
 jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "::");
@@ -1599,7 +1617,7 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta 
     elif m == "v4only" then "direct-v4only"
     else "direct" end;
 
-  # --- Inbound 翻译 (新增 Shadowsocks 支持) ---
+  # --- Inbound 翻译 (含 Shadowsocks) ---
   def mk_inbound:
     if .type == "socks" then
       { tag: (.tag // "socks-in"), listen: _listen, port: _port, protocol: "socks",

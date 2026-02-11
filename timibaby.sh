@@ -2400,7 +2400,6 @@ view_nodes_menu() {
       if [[ "$check_type" == "vless" ]]; then
           display_type="VLESS-REALITY"
       elif [[ "$check_type" == "argo" ]]; then
-          # 核心修复点：通过 fixed_ip 判定 Argo 类型
           if [[ -n "$fixed_ip" && "$fixed_ip" != "null" && "$fixed_ip" != "" ]]; then
               display_type="ARGO-FIXED"
           else
@@ -2419,7 +2418,7 @@ view_nodes_menu() {
       
       # 5. 严格垂直对齐打印
       local line_color="$C_YELLOW"
-      [[ "$check_type" != "vless" && "$check_type" != "socks" ]] && line_color="$C_PURPLE"
+      [[ "$check_type" != "vless" && "$check_type" != "socks" && "$check_type" != "shadowsocks" ]] && line_color="$C_PURPLE"
       
       # 限制标签显示长度并执行单行打印
       local short_tag="${tag:0:20}"
@@ -2446,7 +2445,19 @@ view_nodes_menu() {
 
   # 展示详情卡片
   local final_link=""
-  if [[ "${t_type,,}" == "socks" ]]; then
+  
+  # === 修复开始：添加 Shadowsocks 支持 ===
+  if [[ "${t_type,,}" == "shadowsocks" ]]; then
+      local method=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .method // "aes-256-gcm"' "$CONFIG" 2>/dev/null)
+      local pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .password // ""' "$CONFIG" 2>/dev/null)
+      
+      local userinfo="${method}:${pass}"
+      local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
+      final_link="ss://${b64_creds}@${t_ip}:${t_port}#${target_tag}"
+      
+      print_card "Shadowsocks 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n加密: ${method}\n密码: ${pass}" "$final_link"
+
+  elif [[ "${t_type,,}" == "socks" ]]; then
       local user=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].username // "user"' "$CONFIG" 2>/dev/null)
       local pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].password // "pass"' "$CONFIG" 2>/dev/null)
       final_link="socks://$(printf "%s:%s" "$user" "$pass" | base64 -w0)@${t_ip}:${t_port}#${target_tag}"

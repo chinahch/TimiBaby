@@ -1556,7 +1556,7 @@ install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
   # ========================================================
-  # 1. 生成 xray-sync (修复版：支持单节点 IP 模式 + IP 绑定)
+  # 1. 生成 xray-sync (修复版：支持 SS + 单节点 IP 模式 + IP 绑定)
   # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
@@ -1599,12 +1599,16 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta 
     elif m == "v4only" then "direct-v4only"
     else "direct" end;
 
-  # --- Inbound 翻译 ---
+  # --- Inbound 翻译 (新增 Shadowsocks 支持) ---
   def mk_inbound:
     if .type == "socks" then
       { tag: (.tag // "socks-in"), listen: _listen, port: _port, protocol: "socks",
         settings: { auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
         accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true },
+        sniffing: { enabled: true, destOverride: ["http","tls"] } }
+    elif .type == "shadowsocks" then
+      { tag: (.tag // "ss-in"), listen: _listen, port: _port, protocol: "shadowsocks",
+        settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" },
         sniffing: { enabled: true, destOverride: ["http","tls"] } }
     elif .type == "vless" then
       { tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
@@ -1897,11 +1901,12 @@ add_node() {
     say "2) VLESS-REALITY"
     say "3) Hysteria2"
     say "4) CF Tunnel 隧道"
+    say "5) Shadowsocks (SS)"
     say "0) 返回主菜单"
     safe_read proto "输入协议编号: "
     proto=${proto:-1}
     [[ "$proto" == "0" ]] && return
-    [[ "$proto" =~ ^[1-4]$ ]] && break
+    [[ "$proto" =~ ^[1-5]$ ]] && break
     warn "无效输入"
   done
 
@@ -1944,6 +1949,43 @@ add_node() {
       restart_xray
       local creds=$(printf "%s:%s" "$user" "$pass" | base64 -w0)
       print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${PUBLIC_HOST}:${port}#${tag}"
+  fi
+
+  # === Shadowsocks 逻辑 (新增) ===
+  if [[ "$proto" == "5" ]]; then
+      read -rp "端口 (留空随机, 输入0返回): " port
+      [[ "$port" == "0" ]] && return
+      [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
+      
+      # SS 加密方式 (默认 aes-256-gcm)
+      local method="aes-256-gcm"
+      # read -rp "加密方式 (默认 aes-256-gcm): " input_method
+      # [[ -n "$input_method" ]] && method="$input_method"
+
+      # SS 密码 (默认随机)
+      local def_pass
+      def_pass=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+      read -rp "密码 (默认随机, 输入0返回): " pass
+      [[ "$pass" == "0" ]] && return
+      pass=${pass:-$def_pass}
+
+      # 1. 写入 config.json
+      safe_json_edit "$CONFIG" \
+        '.inbounds += [{"type":"shadowsocks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"method":$method,"password":$pass}]' \
+        --arg port "$port" --arg method "$method" --arg pass "$pass" --arg tag "$tag"
+      
+      # 2. 写入 Meta (方便查看详情)
+      safe_json_edit "$META" '. + {($tag): {type:"shadowsocks", port:$port, method:$method, password:$pass}}' \
+         --arg tag "$tag" --arg port "$port" --arg method "$method" --arg pass "$pass"
+
+      restart_xray
+      
+      # 3. 生成链接 (ss://base64(method:password)@ip:port#tag)
+      local userinfo="${method}:${pass}"
+      local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
+      local link="ss://${b64_creds}@${PUBLIC_HOST}:${port}#${tag}"
+      
+      print_card "Shadowsocks 成功" "$tag" "端口: $port\n加密: $method\n密码: $pass" "$link"
   fi
 
   # === VLESS-REALITY 逻辑 ===

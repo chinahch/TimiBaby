@@ -1838,6 +1838,9 @@ restart_xray() {
   rm -f "${IP_CACHE_FILE}_xray" "${IP_CACHE_FILE}_xray_status" /tmp/ip_probe.lock 2>/dev/null
   install_singleton_wrapper >/dev/null 2>&1 || true
 
+  # 👇 新增：每次重启 Xray 时，重新下发底层的 tc 限速规则
+  apply_port_limits
+
   # 2. 先同步主模型并做 Xray 语法校验
   if ! sync_xray_config >/dev/null 2>&1; then
     err "配置文件不合法（Xray 校验未通过）"
@@ -3913,7 +3916,109 @@ set_node_routing() {
   restart_xray
 }
 
+# ============= 新增：TC 端口级限速核心逻辑 (兼容 Alpine/BusyBox + 无警告终极版) =============
+apply_port_limits() {
+    # 依赖检查：确保 tc 命令存在
+    if ! command -v tc >/dev/null 2>&1; then
+        apt-get install -y iproute2 >/dev/null 2>&1 || yum install -y iproute >/dev/null 2>&1 || apk add --no-cache iproute2 >/dev/null 2>&1
+    fi
 
+    # 获取服务器主公网网卡名称 (采用 awk，完美兼容 BusyBox 环境)
+    local iface
+    iface=$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    [[ -z "$iface" ]] && return
+
+    # 清除旧的限速规则，避免叠加报错
+    tc qdisc del dev "$iface" root 2>/dev/null
+
+    # 读取 Meta 数据，过滤出所有设置了 speed_limit 的节点
+    local limits
+    limits=$(jq -r 'to_entries[]? | select(.value.speed_limit != null) | "\(.value.port):\(.value.speed_limit)"' "$META" 2>/dev/null)
+    
+    # 如果没有任何限速配置，直接返回
+    [[ -z "$limits" ]] && return
+
+    # 建立根队列 (HTB) 和默认无限制流量类 (追加 2>/dev/null 屏蔽大带宽 quantum 警告)
+    tc qdisc add dev "$iface" root handle 1: htb default 10 2>/dev/null
+    tc class add dev "$iface" parent 1: classid 1:10 htb rate 10000mbit 2>/dev/null
+
+    local class_id=11
+    for limit in $limits; do
+        local port="${limit%%:*}"
+        local speed="${limit##*:}" # Mbps
+        
+        [[ -z "$port" || "$port" == "null" ]] && continue
+
+        # 为该端口创建限速子类 (屏蔽 quantum 警告)
+        tc class add dev "$iface" parent 1: classid 1:$class_id htb rate "${speed}mbit" 2>/dev/null
+
+        # 区分 IPv4 (prio 1) 和 IPv6 (prio 2) 的优先级，防止内核冲突报错
+        tc filter add dev "$iface" protocol ip parent 1:0 prio 1 u32 match ip sport "$port" 0xffff flowid 1:$class_id 2>/dev/null
+        tc filter add dev "$iface" protocol ipv6 parent 1:0 prio 2 u32 match ip6 sport "$port" 0xffff flowid 1:$class_id 2>/dev/null
+
+        class_id=$((class_id + 1))
+    done
+}
+
+# ============= 新增：节点限速管理 UI =============
+node_speed_limit_menu() {
+    echo -e "\n${C_CYAN}=== 节点限速管理 (单节点下载限速) ===${C_RESET}"
+    echo -e "${C_GRAY}说明：基于系统底层的流量控制，对公网直连节点(VLESS/SS/Hy2等)生效。${C_RESET}\n"
+    
+    # 聚合所有节点标签
+    local tags_raw=""
+    [[ -f "$CONFIG" ]] && tags_raw+=$(jq -r '.inbounds[].tag // empty' "$CONFIG" 2>/dev/null)
+    [[ -f "$META" ]] && tags_raw+=$'\n'$(jq -r 'keys[]' "$META" 2>/dev/null)
+    mapfile -t ALL_TAGS < <(echo "$tags_raw" | grep -v '^$' | sort -u)
+
+    if [ ${#ALL_TAGS[@]} -eq 0 ]; then
+        warn "当前没有任何节点。"
+        read -rp "按回车返回..." _
+        return
+    fi
+
+    local i=0
+    for tag in "${ALL_TAGS[@]}"; do
+        i=$((i+1))
+        local port
+        port=$(jq -r --arg t "$tag" '.[$t].port // empty' "$META" 2>/dev/null)
+        [[ -z "$port" || "$port" == "null" ]] && port=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | (.port // .listen_port) // empty' "$CONFIG" 2>/dev/null)
+        
+        local speed
+        speed=$(jq -r --arg t "$tag" '.[$t].speed_limit // "无限制"' "$META" 2>/dev/null)
+        
+        echo -e " ${C_GREEN}[$i]${C_RESET} ${C_YELLOW}${tag}${C_RESET} (端口: ${port}) -> 当前限速: ${C_PURPLE}${speed}${C_RESET} ${C_GRAY}Mbps${C_RESET}"
+    done
+    echo -e " ${C_GREEN}[0]${C_RESET} 取消返回"
+
+    read -rp "请选择要限速的节点序号: " choice
+    [[ "$choice" == "0" || -z "$choice" ]] && return
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$i" ]; then
+        warn "无效序号"
+        return
+    fi
+
+    local target_tag="${ALL_TAGS[$((choice-1))]}"
+    
+    echo -e "\n正在设置节点: ${C_YELLOW}${target_tag}${C_RESET}"
+    read -rp "请输入最高下载速度 (单位 Mbps, 输入 0 解除限速): " speed_limit
+    
+    if [[ ! "$speed_limit" =~ ^[0-9]+$ ]]; then
+        warn "输入无效，必须为纯正整数。"
+        return
+    fi
+
+    if [[ "$speed_limit" == "0" ]]; then
+        safe_json_edit "$META" 'del(.[$tag].speed_limit)' --arg tag "$target_tag"
+        ok "已解除节点 [${target_tag}] 的限速限制。"
+    else
+        safe_json_edit "$META" '. + {($tag): (.[$tag] + {"speed_limit": $limit})}' --arg tag "$target_tag" --argjson limit "$speed_limit"
+        ok "已成功设置节点 [${target_tag}] 限速为 ${speed_limit} Mbps。"
+    fi
+    
+    apply_port_limits
+    read -rp "按回车返回..." _
+}
 
 
 
@@ -3934,21 +4039,24 @@ main_menu() {
     echo -e " ${C_GREEN}4.${C_RESET} 状态维护 "
     echo -e " ${C_GREEN}5.${C_RESET} 网络切换 "
     echo -e " ${C_GREEN}6.${C_RESET} 落地出口 "
+    echo -e " ${C_GREEN}7.${C_RESET} 节点限速 ${C_YELLOW}(New)${C_RESET}" # 👈 新增这一行
     echo -e " ${C_GREEN}0.${C_RESET} 退出脚本"
     echo -e ""
     echo -e "${C_BLUE}──────────────────────────────────────────────────────────────${C_RESET}"
     
-    if ! safe_read choice " 请输入选项 [0-6]: "; then
-  echo
-  exit 0
-fi
+    if ! safe_read choice " 请输入选项 [0-7]: "; then # 👈 注意改成 0-7
+      echo
+      exit 0
+    fi
+    
     case "$choice" in
       1) add_node ;;
       2) view_nodes_menu ;;
       3) delete_node ;;
       4) status_menu ;;
       5) ip_version_menu ;;
-      6) outbound_menu ;; # 新功能入口
+      6) outbound_menu ;;
+      7) node_speed_limit_menu ;; # 👈 新增触发函数
       0) exit 0 ;;
       *) warn "无效输入" ;;
     esac

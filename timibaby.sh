@@ -2111,7 +2111,7 @@ add_hysteria2_node() {
   if ! check_nat_allow "$port" "udp"; then warn "不符合 NAT 规则"; return; fi
   if port_status "$port" | grep -q 0; then warn "端口被占用"; return; fi
 
-  # Install Hy2 (Simplified check)
+  # 安装 Hy2 核心
   if ! command -v hysteria >/dev/null 2>&1; then
       local arch=$(uname -m); [[ "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
       curl -sSL "https://github.com/apernet/hysteria/releases/download/app/v2.6.2/hysteria-linux-${arch}" -o /usr/local/bin/hysteria
@@ -2123,19 +2123,28 @@ add_hysteria2_node() {
   local key="/etc/hysteria2/${port}.key"
   local sni="www.bing.com"
   local auth=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
-  local obfs=$(openssl rand -base64 8 | tr -d '=+/' | cut -c1-8)
 
+  # 生成自签名证书
   openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$key" -out "$cert" -days 3650 -subj "/CN=$sni" >/dev/null 2>&1
 
+  # --- 关键修改：移除 obfs 并改用标准缩进格式 ---
   cat > "/etc/hysteria2/${port}.yaml" <<EOF
 listen: :${port}
-tls: { cert: ${cert}, key: ${key} }
-auth: { type: password, password: ${auth} }
-obfs: { type: salamander, salamander: { password: ${obfs} } }
-masquerade: { type: proxy, proxy: { url: https://${sni}/, rewriteHost: true, insecure: true } }
+tls:
+  cert: ${cert}
+  key: ${key}
+auth:
+  type: password
+  password: ${auth}
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${sni}/
+    rewriteHost: true
+    insecure: true
 EOF
 
-  # Service setup
+  # 服务设置
   local svc="hysteria2-${port}"
   if [[ "$(detect_init_system)" == "systemd" ]]; then
       cat > "/etc/systemd/system/${svc}.service" <<EOF
@@ -2151,17 +2160,19 @@ WantedBy=multi-user.target
 EOF
       systemctl daemon-reload; systemctl enable --now "$svc"
   else
-      # OpenRC / Fallback logic from original script
+      # OpenRC / Fallback logic
       nohup /usr/local/bin/hysteria server -c "/etc/hysteria2/${port}.yaml" >/dev/null 2>&1 &
   fi
 
+  # 更新元数据 (移除 obfs 字段)
   local tag="Hy2-${port}"
   local tmpm=$(mktemp)
-  jq --arg tag "$tag" --arg port "$port" --arg sni "$sni" --arg obfs "$obfs" --arg auth "$auth" \
-    '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, obfs:$obfs, auth:$auth}}' "$META" >"$tmpm" && mv "$tmpm" "$META"
+  jq --arg tag "$tag" --arg port "$port" --arg sni "$sni" --arg auth "$auth" \
+    '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, auth:$auth}}' "$META" >"$tmpm" && mv "$tmpm" "$META"
 
-  local link="hysteria2://${auth}@${PUBLIC_HOST}:${port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${tag}"
-  print_card "Hysteria2 成功" "$tag" "端口: $port" "$link"
+  # 分享链接 (移除 obfs 相关的查询参数)
+  local link="hysteria2://${auth}@${PUBLIC_HOST}:${port}?sni=${sni}&insecure=1#${tag}"
+  print_card "Hysteria2 成功 (已移除混淆)" "$tag" "端口: $port" "$link"
   read -rp "按回车继续..." _
 }
 

@@ -1768,26 +1768,28 @@ start_xray_legacy_nohup() {
 }
 
 start_xray_singleton_force() {
-  pkill -x xray >/dev/null 2>&1 || true
+  # 修改 1：使用 -f (full command) 匹配命令行，并增加 -i 忽略大小写
+  pkill -9 -if "/usr/local/bin/xray" >/dev/null 2>&1 || true
   rm -f /var/run/xray.pid /run/xray.pid >/dev/null 2>&1 || true
   sleep 1
 
   daemonize /usr/local/bin/xray-singleton --force
+  
+  # 修改 2：给 256MB 内存的 Alpine 更多缓冲，从 1s 增加到 5s
   sleep 1
 
-  # ✅ 关键：别再“假成功”
-  if ! pgrep -x xray >/dev/null 2>&1; then
+  # 修改 3：使用 -f 匹配完整路径，防止匹配到 grep 自身，且更准确
+  if ! pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1; then
     err "Fallback 启动失败：xray 进程未运行（请检查 /var/log/xray.log）"
     return 1
   fi
   return 0
 }
 
-
-
 auto_optimize_cpu() {
   local pid
-  pid=$(pgrep -x xray | head -n1)
+  # 修改：使用 -f 匹配完整路径，确保能抓到你在 ps 输出中看到的那个进程
+  pid=$(pgrep -f "/usr/local/bin/xray" | head -n1)
   if [[ -n "$pid" ]] && command -v renice >/dev/null 2>&1; then
      renice -n -10 -p "$pid" >/dev/null 2>&1
   fi

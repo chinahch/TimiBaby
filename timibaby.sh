@@ -2488,11 +2488,14 @@ view_nodes_menu() {
       print_card "VLESS-REALITY 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\nSNI: ${sni}\nPublic Key: ${pbk}\nShort ID: ${sid}" "$final_link"
 
   elif [[ "${t_type,,}" == "hysteria2" ]]; then
-      local auth=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth')
-      local obfs=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].obfs')
-      local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni')
-      final_link="hysteria2://${auth}@${t_ip}:${t_port}?obfs=salamander&obfs-password=${obfs}&sni=${sni}&insecure=1#${target_tag}"
-      print_card "Hysteria2 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n认证: ${auth}\n混淆: ${obfs}\nSNI: ${sni}" "$final_link"
+      local auth=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth // empty')
+      local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.bing.com"')
+      
+      # 关键修改：移除 obfs 相关的链接参数
+      final_link="hysteria2://${auth}@${t_ip}:${t_port}?sni=${sni}&insecure=1#${target_tag}"
+      
+      # 优化显示：去掉混淆行的输出
+      print_card "Hysteria2 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n认证: ${auth}\nSNI: ${sni}" "$final_link"
 
   elif [[ "${t_type,,}" == "argo" ]]; then
       final_link=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].raw')

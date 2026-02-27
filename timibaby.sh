@@ -704,7 +704,7 @@ EOF
      --arg pref "$pref" \
      --argjson fvd "$fvd_json" \
      --argjson meta "$meta_json" '
-    def _listen: (.listen // "::");
+    def _listen: (.listen // "0.0.0.0");
     def _port: ((.listen_port // .port // 0) | tonumber);
 
     # ---------------- Inbounds ----------------
@@ -1070,6 +1070,7 @@ _sb_any_port_listening() {
 ensure_dirs() {
   # 统一使用 /etc/xray，自动兼容迁移旧目录 /etc/xray（只迁移一次，不删旧目录）
   mkdir -p "${XRAY_BASE_DIR}"
+  mkdir -p /usr/local/etc/xray && rm -f /usr/local/etc/xray/config.json && ln -sf /etc/xray/xray_config.json /usr/local/etc/xray/config.json
 
   if [[ -d /etc/xray ]]; then
     # 仅当新路径缺失时迁移
@@ -1606,7 +1607,7 @@ GLOBAL_IP=""
 [[ "$PREF_AUTO" == "v4only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v4" 2>/dev/null | tr -d '\r\n ' || true)"
 
 jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta "$META_CFG" '
-  def _listen: (.listen // "::");
+  def _listen: (.listen // "0.0.0.0");
   def _port: ((.listen_port // .port // 0) | tonumber);
 
   # --- 映射模式到 Outbound Tag ---
@@ -2061,7 +2062,7 @@ add_node() {
     short_id=$(openssl rand -hex 4)
 
     safe_json_edit "$CONFIG" \
-       '.inbounds += [{"type": "vless","tag": $tag,"listen": "::","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],"tls": {"enabled": true,"server_name": $server,"reality": {"enabled": true,"handshake": { "server": $server, "server_port": 443 },"private_key": $prikey,"short_id": [ $sid ]}}}]' \
+       '.inbounds += [{"type": "vless","tag": $tag,"listen": "0.0.0.0","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],"tls": {"enabled": true,"server_name": $server,"reality": {"enabled": true,"handshake": { "server": $server, "server_port": 443 },"private_key": $prikey,"short_id": [ $sid ]}}}]' \
        --arg port "$port" --arg uuid "$uuid" --arg prikey "$private_key" --arg sid "$short_id" --arg server "$server_name" --arg tag "$tag"
 
     safe_json_edit "$META" '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:"chrome"}}' \

@@ -1892,13 +1892,99 @@ restart_xray() {
   return 1
 }
 
+# ============= 新增：自动检测并修复 MTU / PMTUD 黑洞 =============
+auto_fix_mtu_mss() {
+    say "正在检测 MTU / PMTUD 黑洞问题..."
+    
+    # 获取默认公网出口网卡
+    local iface
+    iface=$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    
+    if [[ -z "$iface" ]]; then
+        warn "未找到默认公网网卡，跳过 MTU 修复。"
+        return 0
+    fi
+
+    # 获取当前网卡实际 MTU 和 路由表建议的 MTU
+    local current_mtu route_mtu target_mtu
+    current_mtu=$(ip link show "$iface" 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')
+    route_mtu=$(ip route get 1.1.1.1 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')
+    
+    target_mtu=1420 # 默认云厂商安全下限
+    
+    if [[ -n "$route_mtu" && "$route_mtu" -lt 1500 ]]; then
+        target_mtu="$route_mtu"
+    fi
+
+    say "当前网卡 $iface MTU: ${current_mtu:-未知}, 建议 MTU: $target_mtu"
+
+    # 1. 修复 MTU
+    if [[ "$current_mtu" != "$target_mtu" && -n "$current_mtu" ]]; then
+        warn "检测到潜在的 MTU 黑洞风险，正在自动修复 (调整网卡 MTU 为 $target_mtu)..."
+        ip link set dev "$iface" mtu "$target_mtu" 2>/dev/null
+        
+        # 针对 systemd-networkd 环境进行永久化写入
+        if [[ -d /etc/systemd/network ]]; then
+            local net_file
+            net_file=$(grep -rl "Name=$iface" /etc/systemd/network/ 2>/dev/null | head -n 1)
+            if [[ -n "$net_file" ]]; then
+                if grep -q '^MTUBytes=' "$net_file"; then
+                    sed -i "s/^MTUBytes=.*/MTUBytes=$target_mtu/" "$net_file"
+                else
+                    sed -i "/\[Link\]/a MTUBytes=$target_mtu" "$net_file"
+                fi
+                systemctl restart systemd-networkd 2>/dev/null
+            fi
+        fi
+        ok "网卡 $iface MTU 已调整为 $target_mtu"
+    fi
+
+    # 2. 添加 TCP MSS Clamping 保险丝 (无论 MTU 是否修改都加上，防止多层套娃导致的包过大)
+    say "正在应用 TCP MSS Clamping 规则 (彻底根治伪连卡死)..."
+    if command -v iptables >/dev/null 2>&1; then
+        # OUTPUT 链 (本机发出的流量)
+        if ! iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+        fi
+        # FORWARD 链 (转发的流量)
+        if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+        fi
+        
+        # 尝试保存 iptables 规则使其持久化
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1
+        elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        fi
+        ok "TCP MSS Clamp 规则已生效。"
+    else
+        warn "未找到 iptables，跳过 MSS 修复。"
+    fi
+}
+
 
 # --- System Check & Fix Logic from original script (Simplified integration) ---
 system_check() {
   local issues=0
   if command -v xray >/dev/null 2>&1; then ok "xray 已安装"; else err "xray 未安装"; issues=1; fi
   if ! sync_xray_config >/dev/null 2>&1; then err "Xray 配置同步/校验失败"; issues=1; else ok "Xray 配置可用"; fi
-  # hy2 检测逻辑保持原样（函数内部自己处理）
+  
+  # --- 新增 MTU 黑洞检测 ---
+  local iface current_mtu route_mtu
+  iface=$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+  if [[ -n "$iface" ]]; then
+      current_mtu=$(ip link show "$iface" 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')
+      route_mtu=$(ip route get 1.1.1.1 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')
+      
+      if [[ -n "$route_mtu" && "$route_mtu" -lt 1500 && "$current_mtu" != "$route_mtu" ]]; then
+          err "检测到网卡 $iface 存在 MTU 不匹配 (当前:$current_mtu -> 建议:$route_mtu)，易导致节点有延迟但不通"
+          issues=1
+      else
+          ok "网络 MTU 状态良好"
+      fi
+  fi
+  
   return "$issues"
 }
 
@@ -1906,6 +1992,10 @@ fix_errors() {
   ensure_runtime_deps
   install_xray_if_needed
   install_systemd_service
+  
+  # --- 新增触发自动修复 MTU 和 TCP MSS ---
+  auto_fix_mtu_mss
+  
   # Hysteria 修复逻辑保留原脚本
 }
 

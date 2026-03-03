@@ -1557,7 +1557,7 @@ install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
   # ========================================================
-  # 1. 生成 xray-sync (智能路由修正版：彻底解决 V6 锁定下的 V4 访问)
+  # 1. 生成 xray-sync (智能路由修正版：彻底适配 Alpine jq 语法)
   # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
@@ -1582,6 +1582,7 @@ case "${G_PREF}" in
   *)         DS="UseIPv4v6" ;;
 esac
 
+# 核心修复：为 + 拼接操作增加明确的括号层级
 jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "0.0.0.0");
   def _port: ((.listen_port // .port // 0) | tonumber);
@@ -1612,18 +1613,17 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
         sniffing: { enabled: true, destOverride: ["http","tls"] } }
     else empty end;
 
-  . as $root | ($meta[0]) as $m_data |
+  . as $root | ($meta[0] // {}) as $m_data |
   ([ $root.inbounds[]? | select(.type=="vless") | .tls.server_name // .tls.reality.handshake.server // empty ] | unique) as $reality_domains |
 
   {
     log: { loglevel: "warning", access: $log, error: $log },
-    # DNS 模块，确保护网环境解析正常
     dns: {
       servers: ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"],
       queryStrategy: $ds
     },
-    inbounds: ($root.inbounds // [] | map(mk_inbound)),
-    outbounds: [
+    inbounds: ( ($root.inbounds // []) | map(mk_inbound) ),
+    outbounds: ( [
       { protocol: "freedom", tag: "direct", settings: { domainStrategy: $ds } },
       { protocol: "freedom", tag: "direct-v4", settings: { domainStrategy: "UseIPv4" } },
       { protocol: "freedom", tag: "direct-v6", settings: { domainStrategy: "UseIPv6" } },
@@ -1632,28 +1632,22 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
     ] + ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({
           protocol: "freedom", 
           tag: ("bind-" + .key), 
-          # 核心修复：这里必须用 AsIs，不能强制锁死协议族
           settings: { domainStrategy: "AsIs" },
           sendThrough: .value.fixed_ip
-        })),
+        })) ),
     routing: {
       domainStrategy: $ds,
       rules: (
-        # 1. Reality 握手保底走 V4
         (if ($reality_domains | length > 0) then [{ type: "field", domain: ($reality_domains | map("domain:" + .)), outboundTag: "direct-v4" }] else [] end) +
-        # 2. 核心补丁：如果节点锁了 V6，但请求是 V4 目标，强制劫持到 direct-v4 出口（跳过锁定）
         ($m_data | to_entries | map(select(.value.fixed_ip != null and .value.ip_version == "v6")) | map({
             type: "field", inboundTag: [.key], ip: ["0.0.0.0/0"], outboundTag: "direct-v4"
         })) +
-        # 3. 反之亦然：如果锁了 V4，但请求是 V6 目标，强制劫持到 direct-v6
         ($m_data | to_entries | map(select(.value.fixed_ip != null and .value.ip_version == "v4")) | map({
             type: "field", inboundTag: [.key], ip: ["::/0"], outboundTag: "direct-v6"
         })) +
-        # 4. 正常的锁定绑定（此时剩下的流量都是协议匹配的）
         ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({
             type: "field", inboundTag: [.key], outboundTag: ("bind-" + .key)
         })) +
-        # 5. 常规模式规则
         ($m_data | to_entries | map(select(.value.ip_mode != null)) | map({
             type: "field", inboundTag: [.key], outboundTag: _mode_tag(.value.ip_mode)
         }))
@@ -1664,7 +1658,7 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
 SYNC
   chmod +x /usr/local/bin/xray-sync
 
-  # 守护程序生成
+  # 守护程序生成 (针对 Alpine 增加 /run 目录兼容性)
   cat > /usr/local/bin/xray-singleton <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail

@@ -3168,7 +3168,6 @@ show_menu_banner() {
 # ============= 新增：状态维护子菜单 (UI优化+纯卸载逻辑) =============
 status_menu() {
   while true; do
-    # 已移除 clear，保留历史记录
     echo -e "\n${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
     echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 "
     echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 "
@@ -3195,52 +3194,82 @@ status_menu() {
           ;;
       4) 
           echo ""
-          warn "⚠️  警告：此操作将删除所有节点配置、日志、服务文件以及脚本自身！"
-          read -rp "确认彻底卸载？(y/N): " confirm
-          if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-              say "正在停止服务..."
-              systemctl stop xray 2>/dev/null
-              pkill -f xray 2>/dev/null
-              pkill -f hysteria 2>/dev/null
+          warn "⚠️  极端警告：此操作将彻底抹除所有节点、内核优化、限速规则、自启动服务及脚本自身！"
+          read -rp "请输入 'YES' (全大写) 确认彻底卸载: " confirm
+          if [[ "$confirm" == "YES" ]]; then
+              say "正在启动深度清理程序..."
+
+              # 1. 停止并禁用所有相关服务
+              say "正在清理核心进程与服务..."
+              if command -v systemctl >/dev/null 2>&1; then
+                  systemctl disable --now xray 2>/dev/null
+                  # 动态查找并停止所有 Hysteria2 端口服务
+                  local hy2_services=$(systemctl list-units --type=service --all | grep 'hysteria2-' | awk '{print $1}')
+                  for svc in $hy2_services; do
+                      systemctl disable --now "$svc" 2>/dev/null
+                  done
+              fi
+              # 兼容 OpenRC
+              rc-update del xray default 2>/dev/null
               
-              say "正在清除文件..."
-              # 清除 Xray 相关
-              rm -rf /etc/xray /var/log/xray.log /usr/local/bin/xray /usr/local/bin/xray-singleton /usr/local/bin/xray-sync
+              # 强力杀掉进程
+              pkill -9 -f "xray" 2>/dev/null
+              pkill -9 -f "hysteria" 2>/dev/null
+              pkill -9 -f "cloudflared" 2>/dev/null
+
+              # 2. 还原网络与内核改动 (TC/IPTables/MSS)
+              say "正在还原网络限速与内核参数..."
+              # 清理 TC 队列
+              local iface=$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+              if [[ -n "$iface" ]]; then
+                  tc qdisc del dev "$iface" root 2>/dev/null
+              fi
+              # 清理 IPTables 规则 (MSS Clamping)
+              if command -v iptables >/dev/null 2>&1; then
+                  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+                  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+              fi
+
+              # 3. 清理计划任务 (Cron)
+              say "正在移除计划任务守护..."
+              if command -v crontab >/dev/null 2>&1; then
+                  crontab -l 2>/dev/null | grep -v "xray-watchdog" | crontab - 2>/dev/null || true
+              fi
+
+              # 4. 物理删除所有文件目录
+              say "正在删除配置文件、日志与二进制文件..."
+              rm -rf /etc/xray /etc/hysteria2 /root/agsbx /var/log/xray.log
+              rm -f /usr/local/bin/xray /usr/local/bin/hysteria /usr/local/bin/xray-singleton /usr/local/bin/xray-sync
               rm -f /etc/systemd/system/xray.service /etc/init.d/xray
-              
-              # 清除 Hysteria 相关
-              rm -rf /etc/hysteria2 /usr/local/bin/hysteria
               rm -f /etc/systemd/system/hysteria2-*.service
+              rm -f /etc/logrotate.d/xray
+
+              # 5. 清理别名与缓存
+              say "正在清理快捷指令与环境缓存..."
+              sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
+              rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "${IP_CACHE_FILE}_xray"* "/tmp/my_ip_cache"
+
+              [[ -x "$(command -v systemctl)" ]] && systemctl daemon-reload 2>/dev/null
               
-              # 清除 Argo 相关
-              rm -rf /root/agsbx
-              
-              # 清除缓存与快捷指令
-              rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"
-              sed -i '/alias my=/d' /root/.bashrc
-              sed -i '/alias MY=/d' /root/.bashrc
-              
-              systemctl daemon-reload 2>/dev/null
-              
-              # === 脚本自毁逻辑 ===
-              local self_path
-              self_path=$(readlink -f "$0") 
+              # 6. 脚本自毁逻辑
+              local self_path=$(readlink -f "$0")
+              ok "卸载完成！系统已恢复至洁净状态。"
               if [[ -f "$self_path" ]]; then
                   rm -f "$self_path"
-                  say "已删除脚本文件: $self_path"
+                  echo -e "${C_GREEN}脚本文件已自毁。再见，江湖！${C_RESET}"
               fi
-              
-              ok "卸载完成，江湖再见！"
               exit 0
           else
-              say "已取消卸载。"
+              say "已取消卸载操作。"
               sleep 1
           fi
-          ;;      0) return ;;
+          ;;
+      0) return ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
   done
 }
+
 
 # === 将“节点锁定出口IP”真正写入模型配置（/etc/xray/config.json） ===
 # === 将“节点锁定出口IP”写入模型配置（/etc/xray/config.json） ===
@@ -3503,6 +3532,7 @@ _global_ip_version_menu() {
 }
 
 # === 完美对齐+精准调色版：网络切换主菜单 ===
+# === 网络切换主菜单 (全量恢复版) ===
 ip_version_menu() {
   while true; do
     # 1. 获取全局状态
@@ -3523,37 +3553,52 @@ ip_version_menu() {
     local i=0
     for tag in "${ALL_TAGS[@]}"; do
       i=$((i+1))
-      # 从元数据 nodes_meta.json 读取模式
       local node_mode
       node_mode=$(jq -r --arg t "$tag" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
       
       local status_text=""
       if [[ "$node_mode" == "follow_global" || "$node_mode" == "follow" || "$node_mode" == "null" || -z "$node_mode" ]]; then
-        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
         status_text="${C_PURPLE}(当前：跟随全局 → ${C_RESET}${g_label}${C_PURPLE})${C_RESET}"
       else
         local n_label
         n_label="$(_ip_mode_desc "$node_mode")"
-        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
         status_text="${C_PURPLE}(独立设置：${C_RESET}${n_label}${C_PURPLE})${C_RESET}"
       fi
 
-      # 核心修复：\033[40G 会强制将光标移至第 40 列，无论前面的节点名是中文还是英文，后面的括号都会在同一列对齐
       printf " ${C_GREEN}[%d]${C_RESET} ${C_YELLOW}%s\033[40G%b\n" "$i" "$tag" "$status_text"
     done
 
-    # 4. 服务器全局策略行同样使用 \033[40G 强制对齐
     local g_idx=$((i+1))
+    local r_idx=$((i+2))
+
     printf " ${C_GREEN}[%d]${C_RESET} ${C_CYAN}服务器全局策略\033[40G${C_PURPLE}(当前全局：${C_RESET}%s${C_PURPLE})${C_RESET}\n" "$g_idx" "$g_label"
-    
+    printf " ${C_GREEN}[%d]${C_RESET} ${C_PURPLE}一键恢复当前全局：跟随全局${C_RESET}\n" "$r_idx"
     echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单\n"
 
     local pick
     safe_read pick "请选择序号: "
     [[ -z "${pick:-}" || "$pick" == "0" ]] && return
     
+    # === 核心修改逻辑：全量恢复 [4] ===
+    if [[ "$pick" == "$r_idx" ]]; then
+        read -rp " 确认清除所有设定（含全局策略）并恢复初始状态？(y/N): " confirm_r
+        if [[ "$confirm_r" == "y" || "$confirm_r" == "Y" ]]; then
+            # 1. 解锁并删除全局配置文件
+            chattr -i /etc/xray/ip_pref 2>/dev/null || true
+            rm -f /etc/xray/ip_pref /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6
+            
+            # 2. 清除所有节点独立元数据
+            chattr -i "$META" 2>/dev/null || true
+            safe_json_edit "$META" 'map_values(del(.ip_mode) | del(.fixed_ip) | del(.ip_version))'
+            
+            ok "✔ 已全部恢复为初始状态（跟随全局）。"
+            restart_xray
+        fi
+        continue
+    fi
+
     if ! [[ "$pick" =~ ^[0-9]+$ ]]; then
-      warn "输入无效：请输入数字序号。"
+      warn "输入无效。"
       continue
     fi
 
@@ -3563,7 +3608,7 @@ ip_version_menu() {
     fi
 
     if (( pick < 1 || pick > ${#ALL_TAGS[@]} )); then
-      warn "输入无效：序号超出范围。"
+      warn "序号超出范围。"
       continue
     fi
 

@@ -1557,7 +1557,7 @@ install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
   # ========================================================
-  # 1. 生成 xray-sync (智能版：自动识别 v4/v6 环境 + 支持 SS)
+  # 1. 生成 xray-sync (智能路由修正版：彻底解决 V6 锁定下的 V4 访问)
   # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
@@ -1570,47 +1570,21 @@ META_CFG="${XRAY_BASE_DIR}/nodes_meta.json"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
 LOG_PATH="/var/log/xray.log"
 
-mkdir -p "$(dirname "$OUT_CFG")" "$(dirname "$LOG_PATH")" >/dev/null 2>&1 || true
-[[ -f "$META_CFG" ]] || echo "{}" > "$META_CFG"
+# --- 统一变量获取 ---
+G_PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
+[[ -z "$G_PREF" || "$G_PREF" == "follow_global" || "$G_PREF" == "off" ]] && G_PREF="v4pref"
 
-# --- 全局 IP 偏好设置 (读取) ---
-PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
-
-# --- 🚀 智能环境感知逻辑 ---
-# 如果用户没有手动指定偏好 (PREF 为空)，则自动检测网络环境
-if [[ -z "$PREF" || "$PREF" == "(未设置)" || "$PREF" == "follow_global" ]]; then
-    # 尝试连接一个可靠的 IPv4 地址 (使用 api.ipify.org 或 8.8.8.8)
-    # 只要能通，就默认 v4 优先；完全不通，则认为是 IPv6 Only 环境
-    if curl -s -4 --connect-timeout 1 --max-time 2 https://api.ipify.org >/dev/null 2>&1; then
-        PREF_AUTO="v4pref"
-    elif ping -4 -c 1 -W 1 8.8.8.8 >/dev/null 2>&1; then
-        PREF_AUTO="v4pref"
-    else
-        PREF_AUTO="v6pref"
-    fi
-else
-    PREF_AUTO="$PREF"
-fi
-
-# 根据最终决定的 PREF 设置 Xray 的 domainStrategy
-case "${PREF_AUTO}" in
-  v6pref|v6) DS="UseIPv6v4" ;;  # IPv6 优先
-  v4pref|v4) DS="UseIPv4v6" ;;  # IPv4 优先
-  v6only)    DS="ForceIPv6" ;;  # 仅 IPv6
-  v4only)    DS="ForceIPv4" ;;  # 仅 IPv4
-  *)         DS="UseIPv4v6" ;;  # 默认保底 v4 优先
+case "${G_PREF}" in
+  v6pref|v6) DS="UseIPv6v4" ;;
+  v4pref|v4) DS="UseIPv4v6" ;;
+  v6only)    DS="ForceIPv6" ;;
+  v4only)    DS="ForceIPv4" ;;
+  *)         DS="UseIPv4v6" ;;
 esac
 
-# --- 全局默认出口 IP (用于锁定) ---
-GLOBAL_IP=""
-[[ "$PREF_AUTO" == "v6only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v6" 2>/dev/null | tr -d '\r\n ' || true)"
-[[ "$PREF_AUTO" == "v4only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v4" 2>/dev/null | tr -d '\r\n ' || true)"
-
-jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta "$META_CFG" '
+jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "0.0.0.0");
   def _port: ((.listen_port // .port // 0) | tonumber);
-
-  # --- 映射模式到 Outbound Tag ---
   def _mode_tag(m):
     if m == "v6pref" then "direct-v6pref"
     elif m == "v4pref" then "direct-v4pref"
@@ -1618,16 +1592,11 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta 
     elif m == "v4only" then "direct-v4only"
     else "direct" end;
 
-  # --- Inbound 翻译 (含 Shadowsocks) ---
   def mk_inbound:
     if .type == "socks" then
       { tag: (.tag // "socks-in"), listen: _listen, port: _port, protocol: "socks",
         settings: { auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
         accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true },
-        sniffing: { enabled: true, destOverride: ["http","tls"] } }
-    elif .type == "shadowsocks" then
-      { tag: (.tag // "ss-in"), listen: _listen, port: _port, protocol: "shadowsocks",
-        settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" },
         sniffing: { enabled: true, destOverride: ["http","tls"] } }
     elif .type == "vless" then
       { tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
@@ -1637,58 +1606,57 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta 
         xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
         privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // []) } },
         sniffing: { enabled: true, destOverride: ["http","tls"] } }
-    else empty end;
-
-  # --- Outbound 翻译 ---
-  def mk_outbound:
-    if .type == "direct" then
-      { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
-      + (if ((.sendThrough // .send_through // "") | length) > 0 then { sendThrough: (.sendThrough // .send_through) } else {} end)
-    elif .type == "socks" then
-      { protocol: "socks", tag: (.tag // "socks-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber),
-        users: (if ((.username // "") != "" and (.password // "") != "") then [{user: .username, pass: .password}] else [] end) }] } }
     elif .type == "shadowsocks" then
-      { protocol: "shadowsocks", tag: (.tag // "ss-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), method: (.method // "aes-256-gcm"), password: (.password // "") }] } }
-    elif .type == "vless" then
-      { protocol: "vless", tag: (.tag // "vless-out"), settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), encryption: "none", flow: (.flow // empty) }] }] },
-        streamSettings: { network: (.transport.type // .network // "tcp"), security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
-        realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then { show: false, fingerprint: (.tls.utls.fingerprint // .fp // "chrome"), serverName: (.tls.server_name // .sni // "www.microsoft.com"), publicKey: (.tls.reality.public_key // .pbk // ""), shortId: (if ((.tls.reality.short_id // []) | length) > 0 then (.tls.reality.short_id[0] | tostring) else (.sid // "") end), spiderX: "/" } else empty end) } }
+      { tag: (.tag // "ss-in"), listen: _listen, port: _port, protocol: "shadowsocks",
+        settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" },
+        sniffing: { enabled: true, destOverride: ["http","tls"] } }
     else empty end;
 
-  . as $root |
-  ($meta[0]) as $m_data |
-
-  # 1. 基础出站
-  (($root.outbounds // []) | map(mk_outbound) | map(select(. != null))) as $base_outbounds |
-
-  # 2. 注入特定 IP 策略的出站
-  ([
-    { tag: "direct-v6pref", ds: "UseIPv6v4" },
-    { tag: "direct-v4pref", ds: "UseIPv4v6" },
-    { tag: "direct-v6only", ds: "ForceIPv6" },
-    { tag: "direct-v4only", ds: "ForceIPv4" },
-    { tag: "direct-v4",     ds: "ForceIPv4" }
-  ] | map({ protocol: "freedom", tag: .tag, settings: { domainStrategy: .ds } })) as $spec_outbounds |
-
-  # 3. 注入 fixed_ip 出站
-  ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map(
-    . as $e | { protocol: "freedom", tag: ("bind-" + $e.key), settings: { domainStrategy: $ds }, sendThrough: $e.value.fixed_ip }
-  )) as $bind_outbounds |
+  . as $root | ($meta[0]) as $m_data |
+  ([ $root.inbounds[]? | select(.type=="vless") | .tls.server_name // .tls.reality.handshake.server // empty ] | unique) as $reality_domains |
 
   {
     log: { loglevel: "warning", access: $log, error: $log },
-    inbounds: ((($root.inbounds // []) | map(mk_inbound)) | map(select(. != null))),
-    outbounds: ($base_outbounds + $spec_outbounds + $bind_outbounds) | 
-               map(if .tag == "direct" and ($gip|length > 0) and (.sendThrough == null) then . + {sendThrough: $gip} else . end),
+    # DNS 模块，确保护网环境解析正常
+    dns: {
+      servers: ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"],
+      queryStrategy: $ds
+    },
+    inbounds: ($root.inbounds // [] | map(mk_inbound)),
+    outbounds: [
+      { protocol: "freedom", tag: "direct", settings: { domainStrategy: $ds } },
+      { protocol: "freedom", tag: "direct-v4", settings: { domainStrategy: "UseIPv4" } },
+      { protocol: "freedom", tag: "direct-v6", settings: { domainStrategy: "UseIPv6" } },
+      { protocol: "freedom", tag: "direct-v6pref", settings: { domainStrategy: "UseIPv6v4" } },
+      { protocol: "freedom", tag: "direct-v4pref", settings: { domainStrategy: "UseIPv4v6" } }
+    ] + ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({
+          protocol: "freedom", 
+          tag: ("bind-" + .key), 
+          # 核心修复：这里必须用 AsIs，不能强制锁死协议族
+          settings: { domainStrategy: "AsIs" },
+          sendThrough: .value.fixed_ip
+        })),
     routing: {
       domainStrategy: $ds,
       rules: (
-        # 优先权 1: fixed_ip 绑定
-        ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({ type: "field", inboundTag: [.key], outboundTag: ("bind-" + .key) })) +
-        # 优先权 2: 单节点 ip_mode (v6only/v4only 等)
-        ($m_data | to_entries | map(select(.value.ip_mode != null)) | map({ type: "field", inboundTag: [.key], outboundTag: _mode_tag(.value.ip_mode) })) +
-        # 优先权 3: 自定义路由规则
-        (($root.route.rules // []) | map(select(.outbound != null) | { type: "field", outboundTag: .outbound, inboundTag: (if .inbound then (if (.inbound|type)=="array" then .inbound else [.inbound] end) else null end), domain: .domain, ip: .ip } | with_entries(select(.value != null))))
+        # 1. Reality 握手保底走 V4
+        (if ($reality_domains | length > 0) then [{ type: "field", domain: ($reality_domains | map("domain:" + .)), outboundTag: "direct-v4" }] else [] end) +
+        # 2. 核心补丁：如果节点锁了 V6，但请求是 V4 目标，强制劫持到 direct-v4 出口（跳过锁定）
+        ($m_data | to_entries | map(select(.value.fixed_ip != null and .value.ip_version == "v6")) | map({
+            type: "field", inboundTag: [.key], ip: ["0.0.0.0/0"], outboundTag: "direct-v4"
+        })) +
+        # 3. 反之亦然：如果锁了 V4，但请求是 V6 目标，强制劫持到 direct-v6
+        ($m_data | to_entries | map(select(.value.fixed_ip != null and .value.ip_version == "v4")) | map({
+            type: "field", inboundTag: [.key], ip: ["::/0"], outboundTag: "direct-v6"
+        })) +
+        # 4. 正常的锁定绑定（此时剩下的流量都是协议匹配的）
+        ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({
+            type: "field", inboundTag: [.key], outboundTag: ("bind-" + .key)
+        })) +
+        # 5. 常规模式规则
+        ($m_data | to_entries | map(select(.value.ip_mode != null)) | map({
+            type: "field", inboundTag: [.key], outboundTag: _mode_tag(.value.ip_mode)
+        }))
       )
     }
   }
@@ -1696,9 +1664,7 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta 
 SYNC
   chmod +x /usr/local/bin/xray-sync
 
-  # ========================================================
-  # 2. 生成 xray-singleton (单例守护程序)
-  # ========================================================
+  # 守护程序生成
   cat > /usr/local/bin/xray-singleton <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1707,22 +1673,11 @@ PIDFILE="/run/xray.pid"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
 BIN="/usr/local/bin/xray"
 LOG="/var/log/xray.log"
-
 /usr/local/bin/xray-sync >/dev/null 2>&1 || true
-
-if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then
-  echo "[$(date)] [xray-singleton] Config Error" >> "$LOG"
-  exit 1
-fi
-
-if [[ "${1:-}" != "--force" ]]; then
-  if [[ -f "$PIDFILE" ]] && ps -p "$(cat "$PIDFILE")" -o comm= | grep -q 'xray'; then exit 0; fi
-fi
-
+if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then exit 1; fi
 pkill -x xray >/dev/null 2>&1 || true
 setsid "$BIN" run -c "$OUT_CFG" >> "$LOG" 2>&1 &
 echo $! > "$PIDFILE"
-exit 0
 WRAP
   chmod +x /usr/local/bin/xray-singleton
 }

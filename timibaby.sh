@@ -54,7 +54,7 @@ _ip_mode_desc() {
     v6pref) echo "优选IPv6(回退IPv4+失败域名走v4)" ;;
     v4only) echo "IPv4 only(完全不用IPv6)" ;;
     v6only) echo "IPv6 only(完全不用IPv4)" ;;
-    off)    echo "已停止(不干预IP版本)" ;;
+    off)    echo "跟随全局" ;;  # 这里改成了你想要的“跟随全局”
     follow_global|follow|"(未设置)"|"") echo "跟随全局" ;;
     *)      echo "$1" ;;
   esac
@@ -1557,7 +1557,7 @@ install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
   # ========================================================
-  # 1. 生成 xray-sync (忽略大小写全功能版)
+  # 1. 生成 xray-sync (忽略大小写全功能版 + 智能分流修复版)
   # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
@@ -1668,7 +1668,24 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
         ( [ $root.route.rules[]? | select(.outbound != null and (.outbound | ascii_upcase | startswith("DIRECT") | not)) | mk_rule ] ) +
         ( [ $root.route.rules[]? | select(.kind != null) | mk_rule ] ) +
         ( if ($reality_domains | length > 0) then [{ type: "field", domain: ($reality_domains | map("domain:" + .)), outboundTag: "DIRECT-V4" }] else [] end ) +
-        ( $m_data | to_entries | map(select(.value.fixed_ip != null)) | map({ type: "field", inboundTag: [.key | ascii_upcase], outboundTag: ("BIND-" + .key | ascii_upcase) }) ) +
+        
+        # 核心修复段：智能分流 (避免单栈锁定导致另一端断网)
+        ( $m_data | to_entries | map(select(.value.fixed_ip != null)) | map(
+            if (.value.ip_version == "v6" and (.value.ip_mode == "v6pref")) then
+                (
+                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: ("BIND-" + .key | ascii_upcase) },
+                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: "DIRECT-V4" }
+                )
+            elif (.value.ip_version == "v4" and (.value.ip_mode == "v4pref")) then
+                (
+                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: ("BIND-" + .key | ascii_upcase) },
+                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: "DIRECT-V6" }
+                )
+            else
+                { type: "field", inboundTag: [.key | ascii_upcase], outboundTag: ("BIND-" + .key | ascii_upcase) }
+            end
+        ) | flatten ) +
+        
         ( $m_data | to_entries | map(select(.value.ip_mode != null)) | map({ type: "field", inboundTag: [.key | ascii_upcase], outboundTag: (_mode_tag(.value.ip_mode)) }) ) +
         [ { type: "field", network: "tcp,udp", outboundTag: "DIRECT" } ]
       )
@@ -3470,7 +3487,8 @@ _global_ip_version_menu() {
   done
 }
 
-# === 完美对齐+精准调色版：网络切换主菜单 ===
+# === 完美对齐+一键恢复版：网络切换主菜单 ===
+# === 完美对齐+核弹重置版：网络切换主菜单 ===
 ip_version_menu() {
   while true; do
     # 1. 获取全局状态
@@ -3491,28 +3509,27 @@ ip_version_menu() {
     local i=0
     for tag in "${ALL_TAGS[@]}"; do
       i=$((i+1))
-      # 从元数据 nodes_meta.json 读取模式
       local node_mode
       node_mode=$(jq -r --arg t "$tag" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
       
       local status_text=""
       if [[ "$node_mode" == "follow_global" || "$node_mode" == "follow" || "$node_mode" == "null" || -z "$node_mode" ]]; then
-        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
         status_text="${C_PURPLE}(当前：跟随全局 → ${C_RESET}${g_label}${C_PURPLE})${C_RESET}"
       else
         local n_label
         n_label="$(_ip_mode_desc "$node_mode")"
-        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
         status_text="${C_PURPLE}(独立设置：${C_RESET}${n_label}${C_PURPLE})${C_RESET}"
       fi
-
-      # 核心修复：\033[40G 会强制将光标移至第 40 列，无论前面的节点名是中文还是英文，后面的括号都会在同一列对齐
       printf " ${C_GREEN}[%d]${C_RESET} ${C_YELLOW}%s\033[40G%b\n" "$i" "$tag" "$status_text"
     done
 
-    # 4. 服务器全局策略行同样使用 \033[40G 强制对齐
+    # 4. 服务器全局策略
     local g_idx=$((i+1))
     printf " ${C_GREEN}[%d]${C_RESET} ${C_CYAN}服务器全局策略\033[40G${C_PURPLE}(当前全局：${C_RESET}%s${C_PURPLE})${C_RESET}\n" "$g_idx" "$g_label"
+    
+    # 5. 【升级】核弹级一键重置选项 (颜色标红警示)
+    local r_idx=$((i+2))
+    printf " ${C_GREEN}[%d]${C_RESET} ${C_RED}一键重置：恢复全局 并 清除所有节点独立设置${C_RESET}\n" "$r_idx"
     
     echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单\n"
 
@@ -3525,8 +3542,28 @@ ip_version_menu() {
       continue
     fi
 
+    # 处理全局策略二级菜单
     if (( pick == g_idx )); then
       _global_ip_version_menu
+      continue
+    fi
+
+    # 处理核弹级一键重置逻辑
+    if (( pick == r_idx )); then
+      say "正在执行深度清理..."
+      # a. 清理全局设置
+      chattr -i /etc/xray/ip_pref /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 2>/dev/null || true
+      echo "off" > /etc/xray/ip_pref
+      rm -f /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 >/dev/null 2>&1 || true
+      
+      # b. 批量清理所有节点的独立设置 (直接操作 META)
+      if [[ -f "$META" ]]; then
+          chattr -i "$META" 2>/dev/null || true
+          safe_json_edit "$META" 'map_values(del(.ip_mode, .fixed_ip, .ip_version))' >/dev/null 2>&1 || true
+      fi
+
+      ok "✔ 已成功重置全局策略，并清空了所有节点的独立网络设置！"
+      restart_xray
       continue
     fi
 
@@ -3537,6 +3574,77 @@ ip_version_menu() {
 
     _node_ip_mode_menu "${ALL_TAGS[$((pick-1))]}"
   done
+}
+
+# ============= 完全独立的 Hysteria2 网络配置刷新 =============
+# ============= 完全独立的 Hysteria2 网络配置刷新 (路由语法终极修复版) =============
+sync_hy2_network() {
+    local tags; tags=$(jq -r 'to_entries[] | select(.value.type=="hysteria2") | .key' "$META" 2>/dev/null)
+    [[ -z "$tags" ]] && return 0
+
+    local g_pref; g_pref=$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || echo "v4")
+    local g_v4; g_v4=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
+    local g_v6; g_v6=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
+
+    for t in $tags; do
+        local port; port=$(jq -r --arg t "$t" '.[$t].port' "$META")
+        local ip_mode; ip_mode=$(jq -r --arg t "$t" '.[$t].ip_mode // "follow_global"' "$META")
+        local fixed_ip; fixed_ip=$(jq -r --arg t "$t" '.[$t].fixed_ip // empty' "$META")
+        
+        local eff_mode="$ip_mode"
+        local eff_ip="$fixed_ip"
+        
+        if [[ "$eff_mode" == "follow_global" || "$eff_mode" == "follow" || "$eff_mode" == "null" || -z "$eff_mode" ]]; then
+            eff_mode="$g_pref"
+            [[ "$g_pref" =~ v6 ]] && eff_ip="$g_v6" || eff_ip="$g_v4"
+        fi
+        
+        local hy2_mode="auto"
+        case "$eff_mode" in
+            v4pref|v4) hy2_mode="46" ;;
+            v6pref|v6) hy2_mode="64" ;;
+            v4only)    hy2_mode="4" ;;
+            v6only)    hy2_mode="6" ;;
+            off)       hy2_mode="auto"; eff_ip="" ;;
+            *)         hy2_mode="auto" ;;
+        esac
+        
+        local cfg="/etc/hysteria2/${port}.yaml"
+        if [[ -f "$cfg" ]]; then
+            # 1. 强力清理旧的 outbounds 和 acl
+            sed -i '/^outbound:/,$d' "$cfg"
+            sed -i '/^outbounds:/,$d' "$cfg"
+            sed -i '/^acl:/,$d' "$cfg"
+            
+            # 2. 追加正确的服务器端出站设置与严格 ACL 语法
+            if [[ "$hy2_mode" != "auto" || -n "$eff_ip" ]]; then
+                echo "outbounds:" >> "$cfg"
+                echo "  - name: my_egress" >> "$cfg"
+                echo "    type: direct" >> "$cfg"
+                echo "    direct:" >> "$cfg"
+                echo "      mode: \"$hy2_mode\"" >> "$cfg"
+                if [[ -n "$eff_ip" && "$eff_ip" != "null" ]]; then
+                    if [[ "$eff_ip" == *:* ]]; then
+                        echo "      bindIPv6: \"$eff_ip\"" >> "$cfg"
+                    else
+                        echo "      bindIPv4: \"$eff_ip\"" >> "$cfg"
+                    fi
+                fi
+                echo "acl:" >> "$cfg"
+                echo "  inline:" >> "$cfg"
+                # 核心修复：必须是 策略(规则) 的格式
+                echo "    - \"my_egress(all)\"" >> "$cfg"
+            fi
+            
+            # 3. 独立重启 HY2 进程使其生效
+            if command -v systemctl >/dev/null 2>&1 && [[ -f "/etc/systemd/system/hysteria2-${port}.service" ]]; then
+                systemctl restart "hysteria2-${port}" 2>/dev/null || true
+            else
+                pkill -f "hysteria server -c $cfg" 2>/dev/null || true
+                nohup /usr/local/bin/hysteria server -c "$cfg" >/dev/null 2>&1 &
+            fi
+        fi
+    done
 }
 
 # === 单节点网络模式：支持变化检测与 IP 锁定 ===
@@ -3648,11 +3756,19 @@ _node_ip_mode_menu() {
             say "已设置为系统动态分配出口"
         fi
 
-        # 只有在真正发生变化时才重启
-        if ! restart_xray; then
-          warn "⚡ 重启失败，正在尝试回退..."
-          safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $m, "fixed_ip": $ip})}' --arg tag "$target_tag" --arg m "$old_mode" --arg ip "$old_fixed_ip"
-          restart_xray
+        # --- 【智能分离重启逻辑】 ---
+        local node_type
+        node_type=$(jq -r --arg t "$target_tag" '.[$t].type // empty' "$META" 2>/dev/null)
+        
+        if [[ "${node_type,,}" == "hysteria2" ]]; then
+            sync_hy2_network
+            ok "✔ Hysteria2 网络配置已生效并独立重启！(未影响 Xray)"
+        else
+            if ! restart_xray; then
+              warn "⚡ 重启失败，正在尝试回退..."
+              safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $m, "fixed_ip": $ip})}' --arg tag "$target_tag" --arg m "$old_mode" --arg ip "$old_fixed_ip"
+              restart_xray
+            fi
         fi
         ;;
 
@@ -3664,7 +3780,17 @@ _node_ip_mode_menu() {
         chattr -i "$META" 2>/dev/null || true
         safe_json_edit "$META" 'del(.[$tag].ip_mode) | del(.[$tag].fixed_ip) | del(.[$tag].ip_version)' --arg tag "$target_tag"
         ok "✔ 节点已恢复跟随服务器全局策略。"
-        restart_xray
+        
+        # --- 【恢复模式：智能分离重启逻辑】 ---
+        local node_type
+        node_type=$(jq -r --arg t "$target_tag" '.[$t].type // empty' "$META" 2>/dev/null)
+        
+        if [[ "${node_type,,}" == "hysteria2" ]]; then
+            sync_hy2_network
+            ok "✔ Hysteria2 网络配置已恢复并独立重启！"
+        else
+            restart_xray
+        fi
         ;;
       0) return ;;
     esac

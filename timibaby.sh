@@ -1557,7 +1557,7 @@ install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
   # ========================================================
-  # 1. 生成 xray-sync (智能路由修正版：彻底适配 Alpine jq 语法)
+  # 1. 生成 xray-sync (智能版：自动识别 v4/v6 环境 + 支持 SS)
   # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
@@ -1570,22 +1570,47 @@ META_CFG="${XRAY_BASE_DIR}/nodes_meta.json"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
 LOG_PATH="/var/log/xray.log"
 
-# --- 统一变量获取 ---
-G_PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
-[[ -z "$G_PREF" || "$G_PREF" == "follow_global" || "$G_PREF" == "off" ]] && G_PREF="v4pref"
+mkdir -p "$(dirname "$OUT_CFG")" "$(dirname "$LOG_PATH")" >/dev/null 2>&1 || true
+[[ -f "$META_CFG" ]] || echo "{}" > "$META_CFG"
 
-case "${G_PREF}" in
-  v6pref|v6) DS="UseIPv6v4" ;;
-  v4pref|v4) DS="UseIPv4v6" ;;
-  v6only)    DS="ForceIPv6" ;;
-  v4only)    DS="ForceIPv4" ;;
-  *)         DS="UseIPv4v6" ;;
+# --- 全局 IP 偏好设置 (读取) ---
+PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
+
+# --- 🚀 智能环境感知逻辑 ---
+# 如果用户没有手动指定偏好 (PREF 为空)，则自动检测网络环境
+if [[ -z "$PREF" || "$PREF" == "(未设置)" || "$PREF" == "follow_global" ]]; then
+    # 尝试连接一个可靠的 IPv4 地址 (使用 api.ipify.org 或 8.8.8.8)
+    # 只要能通，就默认 v4 优先；完全不通，则认为是 IPv6 Only 环境
+    if curl -s -4 --connect-timeout 1 --max-time 2 https://api.ipify.org >/dev/null 2>&1; then
+        PREF_AUTO="v4pref"
+    elif ping -4 -c 1 -W 1 8.8.8.8 >/dev/null 2>&1; then
+        PREF_AUTO="v4pref"
+    else
+        PREF_AUTO="v6pref"
+    fi
+else
+    PREF_AUTO="$PREF"
+fi
+
+# 根据最终决定的 PREF 设置 Xray 的 domainStrategy
+case "${PREF_AUTO}" in
+  v6pref|v6) DS="UseIPv6v4" ;;  # IPv6 优先
+  v4pref|v4) DS="UseIPv4v6" ;;  # IPv4 优先
+  v6only)    DS="ForceIPv6" ;;  # 仅 IPv6
+  v4only)    DS="ForceIPv4" ;;  # 仅 IPv4
+  *)         DS="UseIPv4v6" ;;  # 默认保底 v4 优先
 esac
 
-# 核心修复：为 + 拼接操作增加明确的括号层级
-jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
+# --- 全局默认出口 IP (用于锁定) ---
+GLOBAL_IP=""
+[[ "$PREF_AUTO" == "v6only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v6" 2>/dev/null | tr -d '\r\n ' || true)"
+[[ "$PREF_AUTO" == "v4only" ]] && GLOBAL_IP="$(cat "${XRAY_BASE_DIR}/global_egress_ip_v4" 2>/dev/null | tr -d '\r\n ' || true)"
+
+jq --arg log "$LOG_PATH" --arg ds "$DS" --arg gip "$GLOBAL_IP" --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "0.0.0.0");
   def _port: ((.listen_port // .port // 0) | tonumber);
+
+  # --- 映射模式到 Outbound Tag ---
   def _mode_tag(m):
     if m == "v6pref" then "direct-v6pref"
     elif m == "v4pref" then "direct-v4pref"
@@ -1593,11 +1618,16 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
     elif m == "v4only" then "direct-v4only"
     else "direct" end;
 
+  # --- Inbound 翻译 (含 Shadowsocks) ---
   def mk_inbound:
     if .type == "socks" then
       { tag: (.tag // "socks-in"), listen: _listen, port: _port, protocol: "socks",
         settings: { auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
         accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true },
+        sniffing: { enabled: true, destOverride: ["http","tls"] } }
+    elif .type == "shadowsocks" then
+      { tag: (.tag // "ss-in"), listen: _listen, port: _port, protocol: "shadowsocks",
+        settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" },
         sniffing: { enabled: true, destOverride: ["http","tls"] } }
     elif .type == "vless" then
       { tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
@@ -1607,50 +1637,58 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
         xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
         privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // []) } },
         sniffing: { enabled: true, destOverride: ["http","tls"] } }
-    elif .type == "shadowsocks" then
-      { tag: (.tag // "ss-in"), listen: _listen, port: _port, protocol: "shadowsocks",
-        settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" },
-        sniffing: { enabled: true, destOverride: ["http","tls"] } }
     else empty end;
 
-  . as $root | ($meta[0] // {}) as $m_data |
-  ([ $root.inbounds[]? | select(.type=="vless") | .tls.server_name // .tls.reality.handshake.server // empty ] | unique) as $reality_domains |
+  # --- Outbound 翻译 ---
+  def mk_outbound:
+    if .type == "direct" then
+      { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
+      + (if ((.sendThrough // .send_through // "") | length) > 0 then { sendThrough: (.sendThrough // .send_through) } else {} end)
+    elif .type == "socks" then
+      { protocol: "socks", tag: (.tag // "socks-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber),
+        users: (if ((.username // "") != "" and (.password // "") != "") then [{user: .username, pass: .password}] else [] end) }] } }
+    elif .type == "shadowsocks" then
+      { protocol: "shadowsocks", tag: (.tag // "ss-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), method: (.method // "aes-256-gcm"), password: (.password // "") }] } }
+    elif .type == "vless" then
+      { protocol: "vless", tag: (.tag // "vless-out"), settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), encryption: "none", flow: (.flow // empty) }] }] },
+        streamSettings: { network: (.transport.type // .network // "tcp"), security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
+        realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then { show: false, fingerprint: (.tls.utls.fingerprint // .fp // "chrome"), serverName: (.tls.server_name // .sni // "www.microsoft.com"), publicKey: (.tls.reality.public_key // .pbk // ""), shortId: (if ((.tls.reality.short_id // []) | length) > 0 then (.tls.reality.short_id[0] | tostring) else (.sid // "") end), spiderX: "/" } else empty end) } }
+    else empty end;
+
+  . as $root |
+  ($meta[0]) as $m_data |
+
+  # 1. 基础出站
+  (($root.outbounds // []) | map(mk_outbound) | map(select(. != null))) as $base_outbounds |
+
+  # 2. 注入特定 IP 策略的出站
+  ([
+    { tag: "direct-v6pref", ds: "UseIPv6v4" },
+    { tag: "direct-v4pref", ds: "UseIPv4v6" },
+    { tag: "direct-v6only", ds: "ForceIPv6" },
+    { tag: "direct-v4only", ds: "ForceIPv4" },
+    { tag: "direct-v4",     ds: "ForceIPv4" }
+  ] | map({ protocol: "freedom", tag: .tag, settings: { domainStrategy: .ds } })) as $spec_outbounds |
+
+  # 3. 注入 fixed_ip 出站
+  ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map(
+    . as $e | { protocol: "freedom", tag: ("bind-" + $e.key), settings: { domainStrategy: $ds }, sendThrough: $e.value.fixed_ip }
+  )) as $bind_outbounds |
 
   {
     log: { loglevel: "warning", access: $log, error: $log },
-    dns: {
-      servers: ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"],
-      queryStrategy: $ds
-    },
-    inbounds: ( ($root.inbounds // []) | map(mk_inbound) ),
-    outbounds: ( [
-      { protocol: "freedom", tag: "direct", settings: { domainStrategy: $ds } },
-      { protocol: "freedom", tag: "direct-v4", settings: { domainStrategy: "UseIPv4" } },
-      { protocol: "freedom", tag: "direct-v6", settings: { domainStrategy: "UseIPv6" } },
-      { protocol: "freedom", tag: "direct-v6pref", settings: { domainStrategy: "UseIPv6v4" } },
-      { protocol: "freedom", tag: "direct-v4pref", settings: { domainStrategy: "UseIPv4v6" } }
-    ] + ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({
-          protocol: "freedom", 
-          tag: ("bind-" + .key), 
-          settings: { domainStrategy: "AsIs" },
-          sendThrough: .value.fixed_ip
-        })) ),
+    inbounds: ((($root.inbounds // []) | map(mk_inbound)) | map(select(. != null))),
+    outbounds: ($base_outbounds + $spec_outbounds + $bind_outbounds) | 
+               map(if .tag == "direct" and ($gip|length > 0) and (.sendThrough == null) then . + {sendThrough: $gip} else . end),
     routing: {
       domainStrategy: $ds,
       rules: (
-        (if ($reality_domains | length > 0) then [{ type: "field", domain: ($reality_domains | map("domain:" + .)), outboundTag: "direct-v4" }] else [] end) +
-        ($m_data | to_entries | map(select(.value.fixed_ip != null and .value.ip_version == "v6")) | map({
-            type: "field", inboundTag: [.key], ip: ["0.0.0.0/0"], outboundTag: "direct-v4"
-        })) +
-        ($m_data | to_entries | map(select(.value.fixed_ip != null and .value.ip_version == "v4")) | map({
-            type: "field", inboundTag: [.key], ip: ["::/0"], outboundTag: "direct-v6"
-        })) +
-        ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({
-            type: "field", inboundTag: [.key], outboundTag: ("bind-" + .key)
-        })) +
-        ($m_data | to_entries | map(select(.value.ip_mode != null)) | map({
-            type: "field", inboundTag: [.key], outboundTag: _mode_tag(.value.ip_mode)
-        }))
+        # 优先权 1: fixed_ip 绑定
+        ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({ type: "field", inboundTag: [.key], outboundTag: ("bind-" + .key) })) +
+        # 优先权 2: 单节点 ip_mode (v6only/v4only 等)
+        ($m_data | to_entries | map(select(.value.ip_mode != null)) | map({ type: "field", inboundTag: [.key], outboundTag: _mode_tag(.value.ip_mode) })) +
+        # 优先权 3: 自定义路由规则
+        (($root.route.rules // []) | map(select(.outbound != null) | { type: "field", outboundTag: .outbound, inboundTag: (if .inbound then (if (.inbound|type)=="array" then .inbound else [.inbound] end) else null end), domain: .domain, ip: .ip } | with_entries(select(.value != null))))
       )
     }
   }
@@ -1658,7 +1696,9 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
 SYNC
   chmod +x /usr/local/bin/xray-sync
 
-  # 守护程序生成 (针对 Alpine 增加 /run 目录兼容性)
+  # ========================================================
+  # 2. 生成 xray-singleton (单例守护程序)
+  # ========================================================
   cat > /usr/local/bin/xray-singleton <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1667,11 +1707,22 @@ PIDFILE="/run/xray.pid"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
 BIN="/usr/local/bin/xray"
 LOG="/var/log/xray.log"
+
 /usr/local/bin/xray-sync >/dev/null 2>&1 || true
-if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then exit 1; fi
+
+if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then
+  echo "[$(date)] [xray-singleton] Config Error" >> "$LOG"
+  exit 1
+fi
+
+if [[ "${1:-}" != "--force" ]]; then
+  if [[ -f "$PIDFILE" ]] && ps -p "$(cat "$PIDFILE")" -o comm= | grep -q 'xray'; then exit 0; fi
+fi
+
 pkill -x xray >/dev/null 2>&1 || true
 setsid "$BIN" run -c "$OUT_CFG" >> "$LOG" 2>&1 &
 echo $! > "$PIDFILE"
+exit 0
 WRAP
   chmod +x /usr/local/bin/xray-singleton
 }
@@ -3117,6 +3168,7 @@ show_menu_banner() {
 # ============= 新增：状态维护子菜单 (UI优化+纯卸载逻辑) =============
 status_menu() {
   while true; do
+    # 已移除 clear，保留历史记录
     echo -e "\n${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
     echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 "
     echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 "
@@ -3143,82 +3195,52 @@ status_menu() {
           ;;
       4) 
           echo ""
-          warn "⚠️  极端警告：此操作将彻底抹除所有节点、内核优化、限速规则、自启动服务及脚本自身！"
-          read -rp "请输入 'YES' (全大写) 确认彻底卸载: " confirm
-          if [[ "$confirm" == "YES" ]]; then
-              say "正在启动深度清理程序..."
-
-              # 1. 停止并禁用所有相关服务
-              say "正在清理核心进程与服务..."
-              if command -v systemctl >/dev/null 2>&1; then
-                  systemctl disable --now xray 2>/dev/null
-                  # 动态查找并停止所有 Hysteria2 端口服务
-                  local hy2_services=$(systemctl list-units --type=service --all | grep 'hysteria2-' | awk '{print $1}')
-                  for svc in $hy2_services; do
-                      systemctl disable --now "$svc" 2>/dev/null
-                  done
-              fi
-              # 兼容 OpenRC
-              rc-update del xray default 2>/dev/null
+          warn "⚠️  警告：此操作将删除所有节点配置、日志、服务文件以及脚本自身！"
+          read -rp "确认彻底卸载？(y/N): " confirm
+          if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+              say "正在停止服务..."
+              systemctl stop xray 2>/dev/null
+              pkill -f xray 2>/dev/null
+              pkill -f hysteria 2>/dev/null
               
-              # 强力杀掉进程
-              pkill -9 -f "xray" 2>/dev/null
-              pkill -9 -f "hysteria" 2>/dev/null
-              pkill -9 -f "cloudflared" 2>/dev/null
-
-              # 2. 还原网络与内核改动 (TC/IPTables/MSS)
-              say "正在还原网络限速与内核参数..."
-              # 清理 TC 队列
-              local iface=$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-              if [[ -n "$iface" ]]; then
-                  tc qdisc del dev "$iface" root 2>/dev/null
-              fi
-              # 清理 IPTables 规则 (MSS Clamping)
-              if command -v iptables >/dev/null 2>&1; then
-                  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-                  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-              fi
-
-              # 3. 清理计划任务 (Cron)
-              say "正在移除计划任务守护..."
-              if command -v crontab >/dev/null 2>&1; then
-                  crontab -l 2>/dev/null | grep -v "xray-watchdog" | crontab - 2>/dev/null || true
-              fi
-
-              # 4. 物理删除所有文件目录
-              say "正在删除配置文件、日志与二进制文件..."
-              rm -rf /etc/xray /etc/hysteria2 /root/agsbx /var/log/xray.log
-              rm -f /usr/local/bin/xray /usr/local/bin/hysteria /usr/local/bin/xray-singleton /usr/local/bin/xray-sync
+              say "正在清除文件..."
+              # 清除 Xray 相关
+              rm -rf /etc/xray /var/log/xray.log /usr/local/bin/xray /usr/local/bin/xray-singleton /usr/local/bin/xray-sync
               rm -f /etc/systemd/system/xray.service /etc/init.d/xray
-              rm -f /etc/systemd/system/hysteria2-*.service
-              rm -f /etc/logrotate.d/xray
-
-              # 5. 清理别名与缓存
-              say "正在清理快捷指令与环境缓存..."
-              sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
-              rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "${IP_CACHE_FILE}_xray"* "/tmp/my_ip_cache"
-
-              [[ -x "$(command -v systemctl)" ]] && systemctl daemon-reload 2>/dev/null
               
-              # 6. 脚本自毁逻辑
-              local self_path=$(readlink -f "$0")
-              ok "卸载完成！系统已恢复至洁净状态。"
+              # 清除 Hysteria 相关
+              rm -rf /etc/hysteria2 /usr/local/bin/hysteria
+              rm -f /etc/systemd/system/hysteria2-*.service
+              
+              # 清除 Argo 相关
+              rm -rf /root/agsbx
+              
+              # 清除缓存与快捷指令
+              rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"
+              sed -i '/alias my=/d' /root/.bashrc
+              sed -i '/alias MY=/d' /root/.bashrc
+              
+              systemctl daemon-reload 2>/dev/null
+              
+              # === 脚本自毁逻辑 ===
+              local self_path
+              self_path=$(readlink -f "$0") 
               if [[ -f "$self_path" ]]; then
                   rm -f "$self_path"
-                  echo -e "${C_GREEN}脚本文件已自毁。再见，江湖！${C_RESET}"
+                  say "已删除脚本文件: $self_path"
               fi
+              
+              ok "卸载完成，江湖再见！"
               exit 0
           else
-              say "已取消卸载操作。"
+              say "已取消卸载。"
               sleep 1
           fi
-          ;;
-      0) return ;;
+          ;;      0) return ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
   done
 }
-
 
 # === 将“节点锁定出口IP”真正写入模型配置（/etc/xray/config.json） ===
 # === 将“节点锁定出口IP”写入模型配置（/etc/xray/config.json） ===
@@ -3481,7 +3503,6 @@ _global_ip_version_menu() {
 }
 
 # === 完美对齐+精准调色版：网络切换主菜单 ===
-# === 网络切换主菜单 (全量恢复版) ===
 ip_version_menu() {
   while true; do
     # 1. 获取全局状态
@@ -3502,52 +3523,37 @@ ip_version_menu() {
     local i=0
     for tag in "${ALL_TAGS[@]}"; do
       i=$((i+1))
+      # 从元数据 nodes_meta.json 读取模式
       local node_mode
       node_mode=$(jq -r --arg t "$tag" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
       
       local status_text=""
       if [[ "$node_mode" == "follow_global" || "$node_mode" == "follow" || "$node_mode" == "null" || -z "$node_mode" ]]; then
+        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
         status_text="${C_PURPLE}(当前：跟随全局 → ${C_RESET}${g_label}${C_PURPLE})${C_RESET}"
       else
         local n_label
         n_label="$(_ip_mode_desc "$node_mode")"
+        # 括号与提示文字设为紫色 (${C_PURPLE})，具体的策略值设为白色 (${C_RESET})
         status_text="${C_PURPLE}(独立设置：${C_RESET}${n_label}${C_PURPLE})${C_RESET}"
       fi
 
+      # 核心修复：\033[40G 会强制将光标移至第 40 列，无论前面的节点名是中文还是英文，后面的括号都会在同一列对齐
       printf " ${C_GREEN}[%d]${C_RESET} ${C_YELLOW}%s\033[40G%b\n" "$i" "$tag" "$status_text"
     done
 
+    # 4. 服务器全局策略行同样使用 \033[40G 强制对齐
     local g_idx=$((i+1))
-    local r_idx=$((i+2))
-
     printf " ${C_GREEN}[%d]${C_RESET} ${C_CYAN}服务器全局策略\033[40G${C_PURPLE}(当前全局：${C_RESET}%s${C_PURPLE})${C_RESET}\n" "$g_idx" "$g_label"
-    printf " ${C_GREEN}[%d]${C_RESET} ${C_PURPLE}一键恢复当前全局：跟随全局${C_RESET}\n" "$r_idx"
+    
     echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单\n"
 
     local pick
     safe_read pick "请选择序号: "
     [[ -z "${pick:-}" || "$pick" == "0" ]] && return
     
-    # === 核心修改逻辑：全量恢复 [4] ===
-    if [[ "$pick" == "$r_idx" ]]; then
-        read -rp " 确认清除所有设定（含全局策略）并恢复初始状态？(y/N): " confirm_r
-        if [[ "$confirm_r" == "y" || "$confirm_r" == "Y" ]]; then
-            # 1. 解锁并删除全局配置文件
-            chattr -i /etc/xray/ip_pref 2>/dev/null || true
-            rm -f /etc/xray/ip_pref /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6
-            
-            # 2. 清除所有节点独立元数据
-            chattr -i "$META" 2>/dev/null || true
-            safe_json_edit "$META" 'map_values(del(.ip_mode) | del(.fixed_ip) | del(.ip_version))'
-            
-            ok "✔ 已全部恢复为初始状态（跟随全局）。"
-            restart_xray
-        fi
-        continue
-    fi
-
     if ! [[ "$pick" =~ ^[0-9]+$ ]]; then
-      warn "输入无效。"
+      warn "输入无效：请输入数字序号。"
       continue
     fi
 
@@ -3557,7 +3563,7 @@ ip_version_menu() {
     fi
 
     if (( pick < 1 || pick > ${#ALL_TAGS[@]} )); then
-      warn "序号超出范围。"
+      warn "输入无效：序号超出范围。"
       continue
     fi
 

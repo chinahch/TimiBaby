@@ -3153,7 +3153,7 @@ show_menu_banner() {
 # ============= 新增：状态维护子菜单 (UI优化+纯卸载逻辑) =============
 status_menu() {
   while true; do
-    # 已移除 clear，保留历史记录
+    # 保留交互感，不强行 clear
     echo -e "\n${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
     echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 "
     echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 "
@@ -3180,48 +3180,71 @@ status_menu() {
           ;;
       4) 
           echo ""
-          warn "⚠️  警告：此操作将删除所有节点配置、日志、服务文件以及脚本自身！"
-          read -rp "确认彻底卸载？(y/N): " confirm
+          warn "⚠️  警告：此操作将永久删除所有节点配置、内核程序、运行日志、服务文件以及脚本自身！"
+          read -rp " 确认要彻底卸载并自毁脚本吗？(y/N): " confirm
           if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-              say "正在停止服务..."
+              say "正在执行强力清理程序..."
+
+              # 1. 停止并禁用所有相关服务
+              say "停止服务项..."
               systemctl stop xray 2>/dev/null
-              pkill -f xray 2>/dev/null
-              pkill -f hysteria 2>/dev/null
-              
-              say "正在清除文件..."
-              # 清除 Xray 相关
+              systemctl disable xray 2>/dev/null
+              # 自动搜索并停止所有动态生成的 Hysteria2 服务
+              if command -v systemctl >/dev/null 2>&1; then
+                  local hy2_services
+                  hy2_services=$(systemctl list-unit-files | grep "hysteria2-" | awk '{print $1}')
+                  for svc in $hy2_services; do
+                      systemctl stop "$svc" 2>/dev/null
+                      systemctl disable "$svc" 2>/dev/null
+                      rm -f "/etc/systemd/system/$svc"
+                  done
+              fi
+
+              # 2. 强力终止残留进程
+              say "终止残留进程 (Xray/Hy2/Argo)..."
+              pkill -9 -f "/usr/local/bin/xray" 2>/dev/null
+              pkill -9 -f "hysteria server" 2>/dev/null
+              pkill -9 -f "cloudflared" 2>/dev/null
+              pkill -9 -f "xray-singleton" 2>/dev/null
+
+              # 3. 清除所有二进制程序与目录
+              say "抹除核心文件与配置..."
+              # Xray 相关
               rm -rf /etc/xray /var/log/xray.log /usr/local/bin/xray /usr/local/bin/xray-singleton /usr/local/bin/xray-sync
               rm -f /etc/systemd/system/xray.service /etc/init.d/xray
-              
-              # 清除 Hysteria 相关
+              # Hysteria 相关
               rm -rf /etc/hysteria2 /usr/local/bin/hysteria
-              rm -f /etc/systemd/system/hysteria2-*.service
-              
-              # 清除 Argo 相关
+              # Argo 相关
               rm -rf /root/agsbx
-              
-              # 清除缓存与快捷指令
-              rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"
+
+              # 4. 清除缓存、环境变量与快捷指令
+              say "清理环境变量与别名..."
+              rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"*
               sed -i '/alias my=/d' /root/.bashrc
               sed -i '/alias MY=/d' /root/.bashrc
               
+              # 刷新系统服务列表
               systemctl daemon-reload 2>/dev/null
-              
-              # === 脚本自毁逻辑 ===
+
+              # 5. 脚本自毁逻辑
               local self_path
               self_path=$(readlink -f "$0") 
+              
+              ok "卸载完成！服务器已恢复洁净状态。"
+              
               if [[ -f "$self_path" ]]; then
+                  say "脚本自毁中: $self_path"
                   rm -f "$self_path"
-                  say "已删除脚本文件: $self_path"
               fi
               
-              ok "卸载完成，江湖再见！"
+              echo -e "${C_PURPLE}江湖再见，祝你一路顺风！${C_RESET}"
               exit 0
           else
               say "已取消卸载。"
               sleep 1
           fi
-          ;;      0) return ;;
+          ;;
+      0) return ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
   done

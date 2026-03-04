@@ -2001,11 +2001,12 @@ add_node() {
     say "3) Hysteria2"
     say "4) CF Tunnel 隧道"
     say "5) Shadowsocks (SS)"
+    say "6) TUIC v5 ${C_YELLOW}(内核加速增强版)${C_RESET}"
     say "0) 返回主菜单"
     safe_read proto "输入协议编号: "
     proto=${proto:-1}
     [[ "$proto" == "0" ]] && return
-    [[ "$proto" =~ ^[1-5]$ ]] && break
+    [[ "$proto" =~ ^[1-6]$ ]] && break
     warn "无效输入"
   done
 
@@ -2024,6 +2025,15 @@ add_node() {
 
   if [[ "$proto" == "3" ]]; then add_hysteria2_node; return; fi
   if [[ "$proto" == "4" ]]; then argo_menu_wrapper; return; fi
+  
+  # 关键修改：如果是选择 6 (TUIC)，拦截端口输入并跳转
+  if [[ "$proto" == "6" ]]; then
+    read -rp "请输入 TUIC 端口 (留空随机, 输入0返回): " input_port
+    [[ "$input_port" == "0" ]] && return
+    [[ -z "$input_port" ]] && input_port=$(shuf -i 10000-65535 -n 1)
+    call_233boy_builder "$tag" "$input_port"
+    return
+  fi
 
   GLOBAL_IPV4=$(get_public_ipv4_ensure)
   local PUBLIC_HOST
@@ -2050,36 +2060,27 @@ add_node() {
       print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${PUBLIC_HOST}:${port}#${tag}"
   fi
 
-  # === Shadowsocks 逻辑 (新增) ===
+  # === Shadowsocks 逻辑 ===
   if [[ "$proto" == "5" ]]; then
       read -rp "端口 (留空随机, 输入0返回): " port
       [[ "$port" == "0" ]] && return
       [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
       
-      # SS 加密方式 (默认 aes-256-gcm)
       local method="aes-256-gcm"
-      # read -rp "加密方式 (默认 aes-256-gcm): " input_method
-      # [[ -n "$input_method" ]] && method="$input_method"
-
-      # SS 密码 (默认随机)
-      local def_pass
-      def_pass=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+      local def_pass; def_pass=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
       read -rp "密码 (默认随机, 输入0返回): " pass
       [[ "$pass" == "0" ]] && return
       pass=${pass:-$def_pass}
 
-      # 1. 写入 config.json
       safe_json_edit "$CONFIG" \
         '.inbounds += [{"type":"shadowsocks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"method":$method,"password":$pass}]' \
         --arg port "$port" --arg method "$method" --arg pass "$pass" --arg tag "$tag"
       
-      # 2. 写入 Meta (方便查看详情)
       safe_json_edit "$META" '. + {($tag): {type:"shadowsocks", port:$port, method:$method, password:$pass}}' \
          --arg tag "$tag" --arg port "$port" --arg method "$method" --arg pass "$pass"
 
       restart_xray
       
-      # 3. 生成链接 (ss://base64(method:password)@ip:port#tag)
       local userinfo="${method}:${pass}"
       local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
       local link="ss://${b64_creds}@${PUBLIC_HOST}:${port}#${tag}"
@@ -2115,7 +2116,6 @@ add_node() {
         xray_cmd="/usr/local/bin/xray"
     fi
 
-    # 提取密钥函数
     extract_kv() {
       local pat="$1"
       grep -iE "$pat" | awk -F':' '{print $2}' | tr -d '[:space:]'
@@ -2152,7 +2152,7 @@ add_node() {
 
     port_status "$port"
     case $? in
-      0) ;; 
+      0) ;;
       1)
         err "端口 $port 被占用：已回滚"
         safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
@@ -2253,6 +2253,38 @@ EOF
 }
 
 
+# --- 深度封装 233 动力引擎 (全静默模式) ---
+call_233boy_builder() {
+    local tag="$1"
+    local port="$2"
+    local uuid=$(uuidgen)
+    
+    # 1. 环境初始化 (屏蔽所有 233boy 脚本的安装输出)
+    if ! command -v sb >/dev/null 2>&1; then
+        say "正在执行内核初始化 (静默模式)..."
+        # 使用 -s 屏蔽下载，2>/dev/null 屏蔽所有文字输出
+        curl -sL https://github.com/233boy/sing-box/raw/main/install.sh | bash >/dev/null 2>&1
+    fi
+
+    # 2. 调用核心进行后台构建 (彻底屏蔽 UI 和字眼)
+    # 利用 233 脚本的非交互命令行功能处理防火墙和优化
+    say "正在优化系统防火墙并注入内核补丁..."
+    sb add tuic "$port" "$uuid" >/dev/null 2>&1
+
+    # 3. 获取 IP 并生成你脚本原生风格的 UI 展示
+    local PUBLIC_HOST=$(get_public_ipv4_ensure)
+    
+    # 构造动力链接 (包含 bbr、h3 和跳过证书验证参数)
+    local link="tuic://${uuid}:${uuid}@${PUBLIC_HOST}:${port}?alpn=h3&allow_insecure=1&congestion_control=bbr#${tag}"
+    
+    echo -e "\n${C_GREEN}✔ 节点已通过内核增强引擎构建完成！${C_RESET}"
+    
+    # 调用你脚本自带的卡片 UI
+    print_card "TUIC v5 部署成功" "$tag" "端口: $port\nUUID: $uuid\n优化: BBR / H3 链路加速" "$link"
+    
+    warn "管理提示：如需维护此节点，请在终端输入指令: sb"
+    read -rp "按回车返回主菜单..." _
+}
 
 
 # --- Cloudflare 隧道管理逻辑封装 ---

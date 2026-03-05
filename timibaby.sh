@@ -640,6 +640,7 @@ _xray_test_config() {
   "$bin" -test -c "$cfg" && return 0
   return 1
 }
+
 _translate_model_to_xray() {
   local model_cfg="$1"
   local out_cfg="$2"
@@ -649,24 +650,21 @@ _translate_model_to_xray() {
 
   # === 全局 IP 偏好 -> freedom.domainStrategy ===
   local pref ds
-  pref="$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '
- ' || true)"
+  pref="$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || true)"
   case "$pref" in
-    off)       ds="AsIs"      ;;  # 停止全局策略：不干预（让节点策略/默认行为决定）
-    v6pref|v6) ds="UseIPv6v4" ;;  # IPv6优选 + 可回退IPv4（不断网）
-    v4pref|v4) ds="UseIPv4v6" ;;  # IPv4优选 + 可回退IPv6
-    v6only)    ds="UseIPv6" ;;  # 真全局 IPv6 only
-    v4only)    ds="UseIPv4" ;;  # 真全局 IPv4 only
-    *)         ds="AsIs"      ;;  # 未设置：不强行改策略
+    off)       ds="AsIs"      ;; 
+    v6pref|v6) ds="UseIPv6v4" ;; 
+    v4pref|v4) ds="UseIPv4v6" ;; 
+    v6only)    ds="UseIPv6" ;; 
+    v4only)    ds="UseIPv4" ;; 
+    *)         ds="AsIs"      ;; 
   esac
 
-  # === META（用于单节点 ip_mode）===
   local meta_json="{}"
   if [[ -s "$META" ]]; then
     meta_json="$(cat "$META" 2>/dev/null || echo '{}')"
   fi
 
-  # === v6pref：强制 IPv4 域名名单（全局 v6pref 或 任意节点 v6pref 时启用）===
   local fvd_json="[]"
   local need_fvd=0
   if [[ "$pref" == "v6pref" || "$pref" == "v6" ]]; then
@@ -686,16 +684,12 @@ x.com
 openai.com
 EOF
     fi
-
-    # 生成 ["domain:discord.com","domain:x.com", ...]
     fvd_json="$(
       awk '
-        {gsub("
-","");}
+        {gsub("\r","");}
         NF && $0 !~ /^[[:space:]]*#/ {print "domain:"$0}
       ' /etc/xray/force_v4_domains.txt \
-      | jq -Rsc 'split("
-") | map(select(length>0))'
+      | jq -Rsc 'split("\n") | map(select(length>0))'
     )"
   fi
 
@@ -711,195 +705,91 @@ EOF
     def mk_inbound:
       if .type == "socks" then
         {
-          tag: (.tag // "socks-in"),
-          listen: _listen,
-          port: _port,
-          protocol: "socks",
+          tag: (.tag // "socks-in"), listen: _listen, port: _port, protocol: "socks",
           settings: {
             auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
-            accounts: ((.users // []) | map({user: .username, pass: .password})),
-            udp: true
+            accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true
           },
           sniffing: { enabled: true, destOverride: ["http", "tls"] }
         }
       elif .type == "vless" then
-        {
-          tag: (.tag // "vless-in"),
-          listen: _listen,
-          port: _port,
-          protocol: "vless",
-          settings: {
-            clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})),
-            decryption: "none"
-          },
-          streamSettings: {
-            network: "tcp",
-            security: "reality",
-            realitySettings: {
-              show: false,
-              dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring)
-                     + ":" +
-                     (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)),
-              xver: 0,
-              serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
-              privateKey: (.tls.reality.private_key // ""),
-              shortIds: (.tls.reality.short_id // [])
-            }
-          },
-          sniffing: { enabled: true, destOverride: ["http", "tls"] }
-        }
-      else
-        empty
-      end;
+        if (.server_seed != null and .server_seed != "") then
+          {
+            tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
+            settings: {
+              clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})),
+              decryption: .server_seed
+            },
+            streamSettings: { network: "tcp", security: "none" },
+            sniffing: { enabled: true, destOverride: ["http", "tls"] }
+          }
+        else
+          {
+            tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
+            settings: {
+              clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})),
+              decryption: "none"
+            },
+            streamSettings: {
+              network: "tcp", security: "reality",
+              realitySettings: {
+                show: false,
+                dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring) + ":" + (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)),
+                xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
+                privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // [])
+              }
+            },
+            sniffing: { enabled: true, destOverride: ["http", "tls"] }
+          }
+        end
+      else empty end;
 
     # ---------------- Outbounds ----------------
     def mk_outbound:
       if .type == "direct" then
-        (
-          { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
-          + (if ((.sendThrough // .send_through // "") | length) > 0
-             then { sendThrough: (.sendThrough // .send_through) }
-             else {}
-            end)
-        )
+        ({ protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
+         + (if ((.sendThrough // .send_through // "") | length) > 0 then { sendThrough: (.sendThrough // .send_through) } else {} end))
       elif .type == "socks" then
-        {
-          protocol: "socks",
-          tag: (.tag // "socks-out"),
-          settings: {
-            servers: [{
-              address: (.server // ""),
-              port: ((.server_port // 0) | tonumber),
-              users: (if ((.username // "") != "" and (.password // "") != "")
-                      then [{user: .username, pass: .password}]
-                      else []
-                     end)
-            }]
-          }
-        }
+        { protocol: "socks", tag: (.tag // "socks-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: (if ((.username // "") != "" and (.password // "") != "") then [{user: .username, pass: .password}] else [] end) }] } }
       elif .type == "shadowsocks" then
-        {
-          protocol: "shadowsocks",
-          tag: (.tag // "ss-out"),
-          settings: {
-            servers: [{
-              address: (.server // ""),
-              port: ((.server_port // 0) | tonumber),
-              method: (.method // "aes-256-gcm"),
-              password: (.password // "")
-            }]
-          }
-        }
+        { protocol: "shadowsocks", tag: (.tag // "ss-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), method: (.method // "aes-256-gcm"), password: (.password // "") }] } }
       elif .type == "vless" then
-        {
-          protocol: "vless",
-          tag: (.tag // "vless-out"),
-          settings: {
-            vnext: [{
-              address: (.server // ""),
-              port: ((.server_port // 0) | tonumber),
-              users: [{
-                id: (.uuid // .id // ""),
-                encryption: "none",
-                flow: (.flow // empty)
-              }]
-            }]
-          },
-          streamSettings: {
-            network: (.transport.type // .network // "tcp"),
-            security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
-            realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then {
-              show: false,
-              fingerprint: (.tls.utls.fingerprint // .fp // "chrome"),
-              serverName: (.tls.server_name // .sni // "www.microsoft.com"),
-              publicKey: (.tls.reality.public_key // .pbk // ""),
-              shortId: (if ((.tls.reality.short_id // []) | length) > 0
-                        then (.tls.reality.short_id[0] | tostring)
-                        else (.sid // "")
-                       end),
-              spiderX: "/"
-            } else empty end),
-            tcpSettings: (if ((.transport.type // .network // "tcp") == "tcp")
-                          then { header: { type: (.transport.header_type // .headerType // "none") } }
-                          else empty
-                         end)
+        if (.client_seed != null and .client_seed != "") then
+          {
+            protocol: "vless", tag: (.tag // "vless-out"),
+            settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), encryption: .client_seed, flow: (.flow // empty) }] }] },
+            streamSettings: { network: (.transport.type // .network // "tcp"), security: "none" }
           }
-        }
+        else
+          {
+            protocol: "vless", tag: (.tag // "vless-out"),
+            settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), encryption: "none", flow: (.flow // empty) }] }] },
+            streamSettings: {
+              network: (.transport.type // .network // "tcp"),
+              security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
+              realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then { show: false, fingerprint: (.tls.utls.fingerprint // .fp // "chrome"), serverName: (.tls.server_name // .sni // "www.microsoft.com"), publicKey: (.tls.reality.public_key // .pbk // ""), shortId: (if ((.tls.reality.short_id // []) | length) > 0 then (.tls.reality.short_id[0] | tostring) else (.sid // "") end), spiderX: "/" } else empty end),
+              tcpSettings: (if ((.transport.type // .network // "tcp") == "tcp") then { header: { type: (.transport.header_type // .headerType // "none") } } else empty end)
+            }
+          }
+        end
       elif .type == "vmess" then
-        {
-          protocol: "vmess",
-          tag: (.tag // "vmess-out"),
-          settings: {
-            vnext: [{
-              address: (.server // ""),
-              port: ((.server_port // 0) | tonumber),
-              users: [{
-                id: (.uuid // .id // ""),
-                security: "auto",
-                alterId: 0
-              }]
-            }]
-          },
-          streamSettings: {
-            network: (.transport.type // .network // "tcp"),
-            security: (if (.tls.enabled == true or .tls != null) then "tls" else "none" end),
-            tlsSettings: (if (.tls.enabled == true or .tls != null)
-                          then { serverName: (.tls.server_name // .sni // ""), allowInsecure: true }
-                          else empty
-                         end),
-            wsSettings: (if (.transport.type == "ws")
-                         then { path: (.transport.ws_settings.path // ""), headers: { Host: (.transport.ws_settings.headers.Host // "") } }
-                         else empty
-                        end)
-          }
-        }
+        { protocol: "vmess", tag: (.tag // "vmess-out"), settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), security: "auto", alterId: 0 }] }] }, streamSettings: { network: (.transport.type // .network // "tcp"), security: (if (.tls.enabled == true or .tls != null) then "tls" else "none" end), tlsSettings: (if (.tls.enabled == true or .tls != null) then { serverName: (.tls.server_name // .sni // ""), allowInsecure: true } else empty end), wsSettings: (if (.transport.type == "ws") then { path: (.transport.ws_settings.path // ""), headers: { Host: (.transport.ws_settings.headers.Host // "") } } else empty end) } }
       else
         { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
       end;
 
-    # --- 单节点 ip_mode：把「规则里 outboundTag=direct」按 inboundTag 映射到不同 direct-* ---
     def _mode_for(t): ($meta[t].ip_mode // empty);
-    def _direct_tag(m):
-      if m=="v6pref" then "direct-v6pref"
-      elif m=="v4pref" then "direct-v4pref"
-      elif m=="v6only" then "direct-v6only"
-      elif m=="v4only" then "direct-v4only"
-      else "direct" end;
-    def _map_outbound(ob; inb):
-      if ob!="direct" then ob
-      elif (inb|length)==1 then _direct_tag(_mode_for(inb[0]))
-      else ob end;
+    def _direct_tag(m): if m=="v6pref" then "direct-v6pref" elif m=="v4pref" then "direct-v4pref" elif m=="v6only" then "direct-v6only" elif m=="v4only" then "direct-v4only" else "direct" end;
+    def _map_outbound(ob; inb): if ob!="direct" then ob elif (inb|length)==1 then _direct_tag(_mode_for(inb[0])) else ob end;
 
-    # ---------------- Routing rules (支持 domain 分流) ----------------
+    # ---------------- Routing rules ----------------
     def mk_rule:
-      (
-        (if (.inbound | type) == "array" then .inbound else [(.inbound // empty)] end) as $inb
-        | (
-          {
-            type: "field",
-            outboundTag: _map_outbound((.outbound // "direct"); $inb),
-            inboundTag: $inb
-          }
-          +
-          (if (.domain? != null)
-            then { domain: (if (.domain|type)=="array" then .domain else [(.domain|tostring)] end) }
-            else {}
-           end)
-          +
-          (if (.ip? != null)
-            then { ip: (if (.ip|type)=="array" then .ip else [(.ip|tostring)] end) }
-            else {}
-           end)
-          +
-          (if (.port? != null)
-            then { port: (if (.port|type)=="array" then .port else [(.port|tostring)] end) }
-            else {}
-           end)
-          +
-          (if (.protocol? != null)
-            then { protocol: (if (.protocol|type)=="array" then .protocol else [(.protocol|tostring)] end) }
-            else {}
-           end)
+      ( (if (.inbound | type) == "array" then .inbound else [(.inbound // empty)] end) as $inb
+        | ( { type: "field", outboundTag: _map_outbound((.outbound // "direct"); $inb), inboundTag: $inb }
+          + (if (.domain? != null) then { domain: (if (.domain|type)=="array" then .domain else [(.domain|tostring)] end) } else {} end)
+          + (if (.ip? != null) then { ip: (if (.ip|type)=="array" then .ip else [(.ip|tostring)] end) } else {} end)
+          + (if (.port? != null) then { port: (if (.port|type)=="array" then .port else [(.port|tostring)] end) } else {} end)
+          + (if (.protocol? != null) then { protocol: (if (.protocol|type)=="array" then .protocol else [(.protocol|tostring)] end) } else {} end)
         )
       );
 
@@ -908,76 +798,34 @@ EOF
         {
           log: { loglevel: "warning", access: $log, error: $log },
           inbounds: ((($root.inbounds // []) | map(mk_inbound)) // []),
-          outbounds:
-            (
-              (($root.outbounds // []) | map(mk_outbound))
-              | (if (map(select(.tag=="direct")) | length) == 0
-                 then . + [{protocol:"freedom", tag:"direct", settings:{domainStrategy:$ds}}]
-                 else .
-                end)
+          outbounds: ( (($root.outbounds // []) | map(mk_outbound))
+              | (if (map(select(.tag=="direct")) | length) == 0 then . + [{protocol:"freedom", tag:"direct", settings:{domainStrategy:$ds}}] else . end)
               | (if (map(select(.tag=="block")) | length) == 0 then . + [{protocol:"blackhole", tag:"block", settings:{}}] else . end)
-              | (if (map(select(.tag=="direct-v6pref")) | length) == 0
-                 then . + [{protocol:"freedom", tag:"direct-v6pref", settings:{domainStrategy:"UseIPv6v4"}}]
-                 else .
-                end)
-              | (if (map(select(.tag=="direct-v4pref")) | length) == 0
-                 then . + [{protocol:"freedom", tag:"direct-v4pref", settings:{domainStrategy:"UseIPv4v6"}}]
-                 else .
-                end)
-              | (if (map(select(.tag=="direct-v6only")) | length) == 0
-                 then . + [{protocol:"freedom", tag:"direct-v6only", settings:{domainStrategy:"UseIPv6"}}]
-                 else .
-                end)
-              | (if (map(select(.tag=="direct-v4only")) | length) == 0
-                 then . + [{protocol:"freedom", tag:"direct-v4only", settings:{domainStrategy:"UseIPv4"}}]
-                 else .
-                end)
-              | (if (map(select(.tag=="direct-v4")) | length) == 0
-                 then . + [{protocol:"freedom", tag:"direct-v4", settings:{domainStrategy:"UseIPv4"}}]
-                 else .
-                end)
+              | (if (map(select(.tag=="direct-v6pref")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v6pref", settings:{domainStrategy:"UseIPv6v4"}}] else . end)
+              | (if (map(select(.tag=="direct-v4pref")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v4pref", settings:{domainStrategy:"UseIPv4v6"}}] else . end)
+              | (if (map(select(.tag=="direct-v6only")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v6only", settings:{domainStrategy:"UseIPv6"}}] else . end)
+              | (if (map(select(.tag=="direct-v4only")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v4only", settings:{domainStrategy:"UseIPv4"}}] else . end)
+              | (if (map(select(.tag=="direct-v4")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v4", settings:{domainStrategy:"UseIPv4"}}] else . end)
             ),
           routing: {
             domainStrategy: $ds,
-            rules: (
-              (($root.route.rules // []) | map(mk_rule))
-              + (
-                  ($root.inbounds // [])
-                  | map(.tag // empty) | map(select(length>0)) | unique
-                  | map((.) as $t | (_mode_for($t)) as $m
-                        | if $m=="v6only" then {type:"field", inboundTag:[$t], ip:["0.0.0.0/0"], outboundTag:"block"}
-                          elif $m=="v4only" then {type:"field", inboundTag:[$t], ip:["::/0"], outboundTag:"block"}
-                          else empty end)
-                  | map(select(. != null))
-                )
-              + (
-                  ($root.inbounds // [])
-                  | map(.tag // empty) | map(select(length>0)) | unique
-                  | map({type:"field", inboundTag:[.], outboundTag:_direct_tag(_mode_for(.))})
-                )
+            rules: ( (($root.route.rules // []) | map(mk_rule))
+              + ( ($root.inbounds // []) | map(.tag // empty) | map(select(length>0)) | unique | map((.) as $t | (_mode_for($t)) as $m | if $m=="v6only" then {type:"field", inboundTag:[$t], ip:["0.0.0.0/0"], outboundTag:"block"} elif $m=="v4only" then {type:"field", inboundTag:[$t], ip:["::/0"], outboundTag:"block"} else empty end) | map(select(. != null)) )
+              + ( ($root.inbounds // []) | map(.tag // empty) | map(select(length>0)) | unique | map({type:"field", inboundTag:[.], outboundTag:_direct_tag(_mode_for(.))}) )
             )
           }
         }
-        # --- v6pref：强制v4域名规则（全局 v6pref 或 单节点 v6pref 生效）---
         | if (($fvd|type=="array") and (($fvd|length) > 0)) then
-            .routing.rules = (
-              (if ($pref=="v6pref" or $pref=="v6")
-                then [ {type:"field", domain:$fvd, outboundTag:"direct-v4"} ]
-                else []
-               end)
-              + (
-                ($meta | to_entries
-                  | map(select(.value.ip_mode=="v6pref"))
-                  | map({type:"field", inboundTag:[.key], domain:$fvd, outboundTag:"direct-v4"})
-                )
-              )
+            .routing.rules = ( (if ($pref=="v6pref" or $pref=="v6") then [ {type:"field", domain:$fvd, outboundTag:"direct-v4"} ] else [] end)
+              + ( ($meta | to_entries | map(select(.value.ip_mode=="v6pref")) | map({type:"field", inboundTag:[.key], domain:$fvd, outboundTag:"direct-v4"}) ) )
               + (.routing.rules // [])
             )
-          else .
-          end
+          else . end
       )
   ' "$model_cfg" > "$out_cfg"
 }
+
+
 _check_model_config() {
   local model_cfg="$1"
   local tmp_out
@@ -1556,9 +1404,6 @@ install_watchdog_cron() {
 install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
-  # ========================================================
-  # 1. 生成 xray-sync (忽略大小写全功能版 + 智能分流修复版)
-  # ========================================================
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1570,7 +1415,6 @@ META_CFG="${XRAY_BASE_DIR}/nodes_meta.json"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
 LOG_PATH="/var/log/xray.log"
 
-# --- 统一变量获取 ---
 G_PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
 [[ -z "$G_PREF" || "$G_PREF" == "follow_global" || "$G_PREF" == "off" ]] && G_PREF="v4pref"
 
@@ -1582,12 +1426,10 @@ case "${G_PREF}" in
   *)         DS="UseIPv4v6" ;;
 esac
 
-# 核心修复：对所有 tag 和 inboundTag 增加 ascii_upcase 处理
 jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "0.0.0.0");
   def _port: ((.listen_port // .port // 0) | tonumber);
   
-  # --- 落地出口格式转换 (强制大写 Tag) ---
   def mk_outbound:
     if .type == "direct" then
       { protocol: "freedom", tag: (.tag // "DIRECT" | ascii_upcase), settings: { domainStrategy: $ds } }
@@ -1597,7 +1439,11 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
     elif .type == "shadowsocks" then
       { protocol: "shadowsocks", tag: (.tag | ascii_upcase), settings: { servers: [{ address: .server, port: (.server_port|tonumber), method: (.method // "aes-256-gcm"), password: .password }] } }
     elif .type == "vless" then
-      { protocol: "vless", tag: (.tag | ascii_upcase), settings: { vnext: [{ address: .server, port: (.server_port|tonumber), users: [{ id: (.uuid // .id), encryption: "none", flow: (.flow // "") }] }] }, streamSettings: (.streamSettings // {}) }
+      if (.client_seed != null and .client_seed != "") then
+        { protocol: "vless", tag: (.tag | ascii_upcase), settings: { vnext: [{ address: .server, port: (.server_port|tonumber), users: [{ id: (.uuid // .id), encryption: .client_seed, flow: (.flow // "") }] }] }, streamSettings: { network: "tcp", security: "none" } }
+      else
+        { protocol: "vless", tag: (.tag | ascii_upcase), settings: { vnext: [{ address: .server, port: (.server_port|tonumber), users: [{ id: (.uuid // .id), encryption: "none", flow: (.flow // "") }] }] }, streamSettings: (.streamSettings // {}) }
+      end
     elif .type == "vmess" then
       { protocol: "vmess", tag: (.tag | ascii_upcase), settings: { vnext: [{ address: .server, port: (.server_port|tonumber), users: [{ id: (.uuid // .id), security: "auto" }] }] }, streamSettings: (.streamSettings // {}) }
     else
@@ -1605,45 +1451,29 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
     end;
 
   def _mode_tag(m):
-    if m == "v6pref" then "DIRECT-V6PREF"
-    elif m == "v4pref" then "DIRECT-V4PREF"
-    elif m == "v6only" then "DIRECT-V6ONLY"
-    elif m == "v4only" then "DIRECT-V4ONLY"
-    else "DIRECT" end;
+    if m == "v6pref" then "DIRECT-V6PREF" elif m == "v4pref" then "DIRECT-V4PREF" elif m == "v6only" then "DIRECT-V6ONLY" elif m == "v4only" then "DIRECT-V4ONLY" else "DIRECT" end;
 
-  # --- 路由规则转换 (强制 inboundTag 大写) ---
   def mk_rule:
     (if (.inbound | type) == "array" then .inbound else [(.inbound // empty)] end | map(ascii_upcase)) as $inb
-    | {
-        type: "field",
-        outboundTag: (.outbound // "DIRECT" | ascii_upcase),
-        inboundTag: $inb
-      }
+    | { type: "field", outboundTag: (.outbound // "DIRECT" | ascii_upcase), inboundTag: $inb }
       + (if (.domain? != null) then { domain: (if (.domain|type)=="array" then .domain else [.domain] end) } else {} end)
       + (if (.ip? != null) then { ip: (if (.ip|type)=="array" then .ip else [.ip] end) } else {} end);
 
   def mk_inbound:
     if .type == "socks" then
-      { tag: (.tag // "SOCKS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "socks",
-        settings: { auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
-        accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true },
-        sniffing: { enabled: true, destOverride: ["http","tls"] } }
+      { tag: (.tag // "SOCKS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "socks", settings: { auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end), accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
     elif .type == "vless" then
-      { tag: (.tag // "VLESS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "vless",
-        settings: { clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})), decryption: "none" },
-        streamSettings: { network: "tcp", security: "reality",
-        realitySettings: { show: false, dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring) + ":" + (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)),
-        xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
-        privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // []) } },
-        sniffing: { enabled: true, destOverride: ["http","tls"] } }
+      if (.server_seed != null and .server_seed != "") then
+        { tag: (.tag // "VLESS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "vless", settings: { clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})), decryption: .server_seed }, streamSettings: { network: "tcp", security: "none" }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
+      else
+        { tag: (.tag // "VLESS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "vless", settings: { clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})), decryption: "none" }, streamSettings: { network: "tcp", security: "reality", realitySettings: { show: false, dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring) + ":" + (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)), xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")], privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // []) } }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
+      end
     elif .type == "shadowsocks" then
-      { tag: (.tag // "SS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "shadowsocks",
-        settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" },
-        sniffing: { enabled: true, destOverride: ["http","tls"] } }
+      { tag: (.tag // "SS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "shadowsocks", settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
     else empty end;
 
   . as $root | ($meta[0] // {}) as $m_data |
-  ([ $root.inbounds[]? | select(.type=="vless") | .tls.server_name // .tls.reality.handshake.server // empty ] | unique) as $reality_domains |
+  ([ $root.inbounds[]? | select(.type=="vless" and .server_seed==null) | .tls.server_name // .tls.reality.handshake.server // empty ] | unique) as $reality_domains |
 
   {
     log: { loglevel: "warning", access: $log, error: $log },
@@ -1651,16 +1481,8 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
     inbounds: ( ($root.inbounds // []) | map(mk_inbound) ),
     outbounds: ( 
       ( [ $root.outbounds[]? | select(.tag != "direct") | mk_outbound ] ) +
-      [
-        { protocol: "freedom", tag: "DIRECT", settings: { domainStrategy: $ds } },
-        { protocol: "freedom", tag: "DIRECT-V4", settings: { domainStrategy: "UseIPv4" } },
-        { protocol: "freedom", tag: "DIRECT-V6", settings: { domainStrategy: "UseIPv6" } },
-        { protocol: "freedom", tag: "DIRECT-V6PREF", settings: { domainStrategy: "UseIPv6v4" } },
-        { protocol: "freedom", tag: "DIRECT-V4PREF", settings: { domainStrategy: "UseIPv4v6" } }
-      ] + 
-      ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({
-          protocol: "freedom", tag: ("BIND-" + .key | ascii_upcase), settings: { domainStrategy: "AsIs" }, sendThrough: .value.fixed_ip
-        }))
+      [ { protocol: "freedom", tag: "DIRECT", settings: { domainStrategy: $ds } }, { protocol: "freedom", tag: "DIRECT-V4", settings: { domainStrategy: "UseIPv4" } }, { protocol: "freedom", tag: "DIRECT-V6", settings: { domainStrategy: "UseIPv6" } }, { protocol: "freedom", tag: "DIRECT-V6PREF", settings: { domainStrategy: "UseIPv6v4" } }, { protocol: "freedom", tag: "DIRECT-V4PREF", settings: { domainStrategy: "UseIPv4v6" } } ] + 
+      ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({ protocol: "freedom", tag: ("BIND-" + .key | ascii_upcase), settings: { domainStrategy: "AsIs" }, sendThrough: .value.fixed_ip }))
     ),
     routing: {
       domainStrategy: $ds,
@@ -1668,24 +1490,15 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
         ( [ $root.route.rules[]? | select(.outbound != null and (.outbound | ascii_upcase | startswith("DIRECT") | not)) | mk_rule ] ) +
         ( [ $root.route.rules[]? | select(.kind != null) | mk_rule ] ) +
         ( if ($reality_domains | length > 0) then [{ type: "field", domain: ($reality_domains | map("domain:" + .)), outboundTag: "DIRECT-V4" }] else [] end ) +
-        
-        # 核心修复段：智能分流 (避免单栈锁定导致另一端断网)
         ( $m_data | to_entries | map(select(.value.fixed_ip != null)) | map(
             if (.value.ip_version == "v6" and (.value.ip_mode == "v6pref")) then
-                (
-                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: ("BIND-" + .key | ascii_upcase) },
-                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: "DIRECT-V4" }
-                )
+                ( { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: ("BIND-" + .key | ascii_upcase) }, { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: "DIRECT-V4" } )
             elif (.value.ip_version == "v4" and (.value.ip_mode == "v4pref")) then
-                (
-                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: ("BIND-" + .key | ascii_upcase) },
-                  { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: "DIRECT-V6" }
-                )
+                ( { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: ("BIND-" + .key | ascii_upcase) }, { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: "DIRECT-V6" } )
             else
                 { type: "field", inboundTag: [.key | ascii_upcase], outboundTag: ("BIND-" + .key | ascii_upcase) }
             end
         ) | flatten ) +
-        
         ( $m_data | to_entries | map(select(.value.ip_mode != null)) | map({ type: "field", inboundTag: [.key | ascii_upcase], outboundTag: (_mode_tag(.value.ip_mode)) }) ) +
         [ { type: "field", network: "tcp,udp", outboundTag: "DIRECT" } ]
       )
@@ -1695,7 +1508,6 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
 SYNC
   chmod +x /usr/local/bin/xray-sync
 
-  # 守护程序生成 (针对 Alpine 增加 /run 目录兼容性)
   cat > /usr/local/bin/xray-singleton <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1984,8 +1796,6 @@ fix_errors() {
   # Hysteria 修复逻辑保留原脚本
 }
 
-# ============= 4. 业务逻辑 (Add/Del Node) =============
-
 add_node() {
   ensure_runtime_deps
   ensure_dirs
@@ -2002,11 +1812,12 @@ add_node() {
     say "4) CF Tunnel 隧道"
     say "5) Shadowsocks (SS)"
     say "6) TUIC v5 ${C_YELLOW}(内核加速增强版)${C_RESET}"
+    say "7) VLESS-ENC ${C_YELLOW}(原生加密 Seed)${C_RESET}"
     say "0) 返回主菜单"
     safe_read proto "输入协议编号: "
     proto=${proto:-1}
     [[ "$proto" == "0" ]] && return
-    [[ "$proto" =~ ^[1-6]$ ]] && break
+    [[ "$proto" =~ ^[1-7]$ ]] && break
     warn "无效输入"
   done
 
@@ -2018,15 +1829,12 @@ add_node() {
   local zh_country; zh_country=$(get_country_name_zh)
   local letter; letter=$(get_node_letter_suffix "$custom_prefix" "$zh_country")
   
-  # 构造最终标签名：自定义-国家字母 (例如: lazycat-香港A)
   local tag="${custom_prefix}-${zh_country}${letter}"
   say "自动生成节点名: ${C_GREEN}${tag}${C_RESET}"
-  # --------------------
 
   if [[ "$proto" == "3" ]]; then add_hysteria2_node; return; fi
   if [[ "$proto" == "4" ]]; then argo_menu_wrapper; return; fi
   
-  # 关键修改：如果是选择 6 (TUIC)，拦截端口输入并跳转
   if [[ "$proto" == "6" ]]; then
     read -rp "请输入 TUIC 端口 (留空随机, 输入0返回): " input_port
     [[ "$input_port" == "0" ]] && return
@@ -2080,11 +1888,9 @@ add_node() {
          --arg tag "$tag" --arg port "$port" --arg method "$method" --arg pass "$pass"
 
       restart_xray
-      
       local userinfo="${method}:${pass}"
       local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
       local link="ss://${b64_creds}@${PUBLIC_HOST}:${port}#${tag}"
-      
       print_card "Shadowsocks 成功" "$tag" "端口: $port\n加密: $method\n密码: $pass" "$link"
   fi
 
@@ -2095,10 +1901,7 @@ add_node() {
        safe_read port "请输入端口号 (留空随机, 输入0返回): "
        [[ "$port" == "0" ]] && return
        [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
-       if ! check_nat_allow "$port" "tcp"; then
-           warn "端口 $port 不符合 NAT 限制"
-           continue
-       fi
+       if ! check_nat_allow "$port" "tcp"; then warn "端口 $port 不符合 NAT 限制"; continue; fi
        break
     done
 
@@ -2116,11 +1919,7 @@ add_node() {
         xray_cmd="/usr/local/bin/xray"
     fi
 
-    extract_kv() {
-      local pat="$1"
-      grep -iE "$pat" | awk -F':' '{print $2}' | tr -d '[:space:]'
-    }
-
+    extract_kv() { grep -iE "$1" | awk -F':' '{print $2}' | tr -d '[:space:]'; }
     key_pair=$($xray_cmd x25519 2>/dev/null)
     private_key=$(echo "$key_pair" | extract_kv 'private')
     public_key=$(echo "$key_pair" | extract_kv 'public|password')
@@ -2149,28 +1948,102 @@ add_node() {
       safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
       return
     fi
-
-    port_status "$port"
-    case $? in
-      0) ;;
-      1)
-        err "端口 $port 被占用：已回滚"
-        safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
-        safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-        restart_xray >/dev/null 2>&1 || true
-        return ;;
-      2)
-        err "Xray 未监听 $port：已回滚"
-        safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
-        safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-        restart_xray >/dev/null 2>&1 || true
-        return ;;
-    esac
-
     local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
     print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
   fi
+
+  # === 终极修复：VLESS-ENC 原生加密逻辑 (正则表达式强力提取) ===
+  if [[ "$proto" == "7" ]]; then
+    local port uuid server_seed client_seed
+    while true; do
+       safe_read port "请输入端口号 (留空随机, 输入0返回): "
+       [[ "$port" == "0" ]] && return
+       [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
+       if ! check_nat_allow "$port" "tcp"; then warn "端口 $port 不符合 NAT 限制"; continue; fi
+       break
+    done
+
+    uuid=$(uuidgen)
+    local xray_cmd=$(_xray_bin)
+    [[ ! -x "$xray_cmd" ]] && xray_cmd=$(command -v xray)
+
+    if [[ -z "$xray_cmd" ]]; then
+        err "未发现 Xray 核心，正在尝试安装..."
+        install_xray_if_needed
+        xray_cmd="/usr/local/bin/xray"
+    fi
+
+    say "正在生成 VLESS-ENC 原生密钥对 (Seed)..."
+
+    # 使用无敌正则表达式解析函数
+    get_vless_seed() {
+        # 合并 stdout 和 stderr，避免丢失输出
+        local raw
+        raw=$($1 vlessenc 2>&1)
+        
+        local s_seed c_seed
+        # 优先提取 mlkem768
+        s_seed=$(echo "$raw" | grep -i 'decryption' | grep -ioE 'mlkem768[a-zA-Z0-9_.-]+' | head -n 1)
+        # 注意: grep -v -i 'decryption' 用来过滤掉 Decryption 包含 encryption 字符的问题
+        c_seed=$(echo "$raw" | grep -i 'encryption' | grep -v -i 'decryption' | grep -ioE 'mlkem768[a-zA-Z0-9_.-]+' | head -n 1)
+        
+        # 退而求其次提取 x25519
+        if [[ -z "$s_seed" || -z "$c_seed" ]]; then
+            s_seed=$(echo "$raw" | grep -i 'decryption' | grep -ioE 'x25519[a-zA-Z0-9_.-]+' | head -n 1)
+            c_seed=$(echo "$raw" | grep -i 'encryption' | grep -v -i 'decryption' | grep -ioE 'x25519[a-zA-Z0-9_.-]+' | head -n 1)
+        fi
+        
+        if [[ -n "$s_seed" && -n "$c_seed" ]]; then
+            echo "$s_seed $c_seed"
+        else
+            echo ""
+        fi
+    }
+
+    local seeds
+    seeds=$(get_vless_seed "$xray_cmd")
+
+    # 兼容性回退与强制更新机制
+    if [[ -z "$seeds" ]]; then
+        warn "当前 Xray 内核不支持 vlessenc 或版本过旧，正在强制拉取最新内核..."
+        install_xray_if_needed --force
+        xray_cmd="/usr/local/bin/xray"
+        
+        seeds=$(get_vless_seed "$xray_cmd")
+
+        if [[ -z "$seeds" ]]; then
+             err "致命错误：核心更新后仍无法生成密钥对，请检查网络。"
+             # 打印部分调试信息方便排错
+             $xray_cmd vlessenc 2>&1 | head -n 5
+             return 1
+        fi
+    fi
+
+    # 从字符串中拆分开
+    server_seed=$(echo "$seeds" | awk '{print $1}')
+    client_seed=$(echo "$seeds" | awk '{print $2}')
+
+    # 写入 Config 和 Meta
+    safe_json_edit "$CONFIG" \
+       '.inbounds += [{"type": "vless","tag": $tag,"listen": "0.0.0.0","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "" }],"server_seed": $s_seed, "client_seed": $c_seed}]' \
+       --arg port "$port" --arg uuid "$uuid" --arg s_seed "$server_seed" --arg c_seed "$client_seed" --arg tag "$tag"
+
+    safe_json_edit "$META" '. + {($tag): {type:"vless", port:$port, server_seed:$s_seed, client_seed:$c_seed}}' \
+       --arg tag "$tag" --arg port "$port" --arg s_seed "$server_seed" --arg c_seed "$client_seed"
+
+    if ! restart_xray; then
+      err "Xray 重启失败：已回滚"
+      safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
+      safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
+      return
+    fi
+    
+    # 构建链接时使用专属的 client_seed (即 encryption)
+    local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=${client_seed}&type=tcp&security=none#${tag}"
+    print_card "VLESS-ENC 成功" "$tag" "端口: $port\n客户端密钥: ${client_seed:0:15}..." "$link"
+  fi
 }
+
 
 # --- Hysteria 2 Logic (Keep Original) ---
 add_hysteria2_node() {
@@ -2470,7 +2343,6 @@ EOF
 }
 
 view_nodes_menu() {
-  # 1. 基础环境与显示优化准备
   local V4_ADDR=$(get_public_ipv4_ensure)
   local V6_ADDR=$(get_public_ipv6_ensure)
   local global_pref="v4"
@@ -2478,7 +2350,6 @@ view_nodes_menu() {
   local meta_json="{}"
   [[ -f "$META" ]] && meta_json=$(cat "$META")
 
-  # 存储用于详情跳转的索引数据
   NODE_TAGS=()
   NODE_TYPES=()
   NODE_PORTS=()
@@ -2486,14 +2357,12 @@ view_nodes_menu() {
   NODE_V_DISP=()
   local idx=1
 
-  # 汇总并去重所有标签 (从运行配置和元数据文件中聚合)
   local all_tags
   all_tags=$( (jq -r '.inbounds[].tag // empty' "$CONFIG" 2>/dev/null; jq -r 'keys[]' "$META" 2>/dev/null) | sort -u)
 
   echo -e "\n${C_CYAN}=== 节点列表预览 (严格单行对齐) ===${C_RESET}"
   echo -e "➜ ${C_GRAY}正在聚合节点出口状态...${C_RESET}"
 
-  # 打印表头，确保视觉对齐
   echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
   printf " ${C_YELLOW}%-4s | %-20s | %-15s | %-8s | %-15s${C_RESET}\n" "序号" "节点标签" "协议/状态" "端口" "出口地址"
   echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
@@ -2501,14 +2370,12 @@ view_nodes_menu() {
   while read -r tag; do
       [[ -z "$tag" || "$tag" == "null" ]] && continue
       
-      # 2. 获取节点基础信息 (修复端口显示 0 问题)
       local type=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .type // empty' "$CONFIG" 2>/dev/null)
       [[ -z "$type" ]] && type=$(jq -r --arg t "$tag" '.[$t].type // "UNKNOWN"' "$META" 2>/dev/null)
       
       local port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | (.port // .listen_port // empty)' "$CONFIG" 2>/dev/null)
       [[ -z "$port" || "$port" == "null" ]] && port=$(jq -r --arg t "$tag" '.[$t].port // "0"' "$META" 2>/dev/null)
 
-      # 3. 判定 IP 版本与出口显示
       local fixed_ip=$(echo "$meta_json" | jq -r --arg t "$tag" '.[$t].fixed_ip // empty')
       local node_v=$(echo "$meta_json" | jq -r --arg t "$tag" '.[$t].ip_version // empty')
       local use_v=${node_v:-$global_pref} 
@@ -2517,12 +2384,16 @@ view_nodes_menu() {
       [[ "$use_v" == "v6" && -n "$V6_ADDR" ]] && CURRENT_IP="$V6_ADDR"
       [[ -n "$fixed_ip" && "$fixed_ip" != "null" && "$fixed_ip" != "" ]] && CURRENT_IP="$fixed_ip"
 
-      # 4. 规范化协议名称与 Argo 状态识别
-      local check_type="${type,,}" # 转为小写判断
+      local check_type="${type,,}"
       local display_type="${type^^}"
       
       if [[ "$check_type" == "vless" ]]; then
-          display_type="VLESS-REALITY"
+          local is_enc=$(echo "$meta_json" | jq -r --arg t "$tag" '.[$t].server_seed // empty')
+          if [[ -n "$is_enc" && "$is_enc" != "null" ]]; then
+              display_type="VLESS-ENC"
+          else
+              display_type="VLESS-REALITY"
+          fi
       elif [[ "$check_type" == "argo" ]]; then
           if [[ -n "$fixed_ip" && "$fixed_ip" != "null" && "$fixed_ip" != "" ]]; then
               display_type="ARGO-FIXED"
@@ -2531,7 +2402,6 @@ view_nodes_menu() {
           fi
       fi
 
-      # 存储数据
       NODE_TAGS+=("$tag")
       NODE_TYPES+=("$type")
       NODE_PORTS+=("$port")
@@ -2539,12 +2409,9 @@ view_nodes_menu() {
       NODE_V_DISP+=("$use_v")
 
       local geo=$(get_ip_country "$CURRENT_IP")
-      
-      # 5. 严格垂直对齐打印
       local line_color="$C_YELLOW"
       [[ "$check_type" != "vless" && "$check_type" != "socks" && "$check_type" != "shadowsocks" ]] && line_color="$C_PURPLE"
       
-      # 限制标签显示长度并执行单行打印
       local short_tag="${tag:0:20}"
       printf " ${C_GREEN}[%2d]${C_RESET} | ${line_color}%-20s${C_RESET} | %-15s | %-8s | %-15s\n" \
               "$idx" "$short_tag" "$display_type" "$port" "$use_v [$geo]"
@@ -2555,7 +2422,6 @@ view_nodes_menu() {
   echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
   echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单"
 
-  # 6. 二级详情查看逻辑 (完整版)
   read -rp " 请选择要查看详情的节点序号: " v_choice
   [[ -z "$v_choice" || "$v_choice" == "0" ]] && return
 
@@ -2567,18 +2433,14 @@ view_nodes_menu() {
   
   [[ -z "$target_tag" ]] && { echo -e "${C_RED}错误：无效序号${C_RESET}"; sleep 1; return; }
 
-  # 展示详情卡片
   local final_link=""
   
-  # === 修复开始：添加 Shadowsocks 支持 ===
   if [[ "${t_type,,}" == "shadowsocks" ]]; then
       local method=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .method // "aes-256-gcm"' "$CONFIG" 2>/dev/null)
       local pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .password // ""' "$CONFIG" 2>/dev/null)
-      
       local userinfo="${method}:${pass}"
       local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
       final_link="ss://${b64_creds}@${t_ip}:${t_port}#${target_tag}"
-      
       print_card "Shadowsocks 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n加密: ${method}\n密码: ${pass}" "$final_link"
 
   elif [[ "${t_type,,}" == "socks" ]]; then
@@ -2589,20 +2451,23 @@ view_nodes_menu() {
 
   elif [[ "${t_type,,}" == "vless" ]]; then
       local uuid=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG" 2>/dev/null)
-      local pbk=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')
-      local sid=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')
-      local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')
-      final_link="vless://${uuid}@${t_ip}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
-      print_card "VLESS-REALITY 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\nSNI: ${sni}\nPublic Key: ${pbk}\nShort ID: ${sid}" "$final_link"
+      local c_seed=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].client_seed // empty')
+      
+      if [[ -n "$c_seed" && "$c_seed" != "null" ]]; then
+          final_link="vless://${uuid}@${t_ip}:${t_port}?encryption=${c_seed}&type=tcp&security=none#${target_tag}"
+          print_card "VLESS-ENC 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\n客户端密钥: ${c_seed:0:15}..." "$final_link"
+      else
+          local pbk=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')
+          local sid=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')
+          local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')
+          final_link="vless://${uuid}@${t_ip}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
+          print_card "VLESS-REALITY 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\nSNI: ${sni}\nPublic Key: ${pbk}\nShort ID: ${sid}" "$final_link"
+      fi
 
   elif [[ "${t_type,,}" == "hysteria2" ]]; then
       local auth=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth // empty')
       local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.bing.com"')
-      
-      # 关键修改：移除 obfs 相关的链接参数
       final_link="hysteria2://${auth}@${t_ip}:${t_port}?sni=${sni}&insecure=1#${target_tag}"
-      
-      # 优化显示：去掉混淆行的输出
       print_card "Hysteria2 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n认证: ${auth}\nSNI: ${sni}" "$final_link"
 
   elif [[ "${t_type,,}" == "argo" ]]; then
@@ -2615,7 +2480,7 @@ view_nodes_menu() {
   fi
 
   read -rp "按回车返回节点列表..." _
-  view_nodes_menu # 递归返回列表
+  view_nodes_menu
 }
 
 delete_node() {
@@ -2757,7 +2622,6 @@ import_link_outbound() {
     say "正在启动专业级解析与内核预校验..."
     
     if [[ "$link" == ss://* ]]; then
-        # Shadowsocks 解析逻辑
         local main_part="${link#ss://}"
         local userinfo_b64="${main_part%%@*}"
         local server_info="${main_part#*@}"
@@ -2774,7 +2638,6 @@ import_link_outbound() {
             '{type: "shadowsocks", tag: $t, server: $s, server_port: ($p|tonumber), method: $m, password: $pw}')
         type="ss"
     elif [[ "$link" == vless://* ]]; then
-        # VLESS 完整解析逻辑
         local uuid=$(echo "$link" | cut -d'@' -f1 | sed 's/vless:\/\///')
         local server_port_raw=$(echo "$link" | cut -d'@' -f2 | cut -d'?' -f1)
         server="${server_port_raw%%:*}"
@@ -2782,7 +2645,8 @@ import_link_outbound() {
         port=$(echo "$port" | tr -cd '0-9')
         local qs=""
         [[ "$link" == *"?"* ]] && qs="${link#*\?}" && qs="${qs%%#*}"
-        local flow="" sni="" pbk="" sid="" fp="" net="tcp" htype="none"
+        
+        local flow="" sni="" pbk="" sid="" fp="" net="tcp" htype="none" enc=""
         if [[ -n "$qs" ]]; then
             IFS='&' read -r -a _pairs <<< "$qs"
             for kv in "${_pairs[@]}"; do
@@ -2796,16 +2660,22 @@ import_link_outbound() {
                     fp) fp="$v" ;;
                     type) net="$v" ;;
                     headerType) htype="$v" ;;
+                    encryption) enc="$v" ;;
                 esac
             done
         fi
+        
+        local client_seed=""
+        if [[ -n "$enc" && "$enc" != "none" ]]; then
+            client_seed="$enc"
+        fi
+
         new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg u "$uuid" \
             --arg flow "$flow" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" \
-            --arg net "$net" --arg htype "$htype" \
-            '{type: "vless", tag: $t, server: $s, server_port: ($p|tonumber), uuid: $u, flow: $flow, transport: { type: $net, header_type: $htype }, tls: { server_name: $sni, reality: { public_key: $pbk, short_id: (if $sid != "" then [$sid] else [] end) }, utls: { fingerprint: $fp } }}')
+            --arg net "$net" --arg htype "$htype" --arg c_seed "$client_seed" \
+            '{type: "vless", tag: $t, server: $s, server_port: ($p|tonumber), uuid: $u, flow: $flow, client_seed: $c_seed, transport: { type: $net, header_type: $htype }, tls: { server_name: $sni, reality: { public_key: $pbk, short_id: (if $sid != "" then [$sid] else [] end) }, utls: { fingerprint: $fp } }}')
         type="vless"
     elif [[ "$link" == vmess://* ]]; then
-        # VMess 解析逻辑
         local b64_data="${link#vmess://}"
         local decoded=$(echo "$b64_data" | base64 -d 2>/dev/null)
         [[ -z "$decoded" ]] && { err "VMess Base64 解码失败"; return 1; }
@@ -2822,7 +2692,6 @@ import_link_outbound() {
         type="vmess"
     fi
 
-    # 先测后加：仅探测服务器端口是否连通
     test_outbound_connection "$type" "$server" "$port" "" ""
     [[ $? -ne 0 ]] && { warn "落地探测不通，已取消导入"; return 1; }
 
@@ -2833,7 +2702,6 @@ import_link_outbound() {
     if _check_model_config "$sandbox" >/dev/null 2>&1; then
         mv "$sandbox" "$CONFIG"
         ok "导入成功！(请前往‘设置节点落地关联’以生效)"
-        # 移除 restart_xray
     else
         err "✖ 内核校验失败"
         rm -f "$sandbox"

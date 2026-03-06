@@ -60,11 +60,15 @@ _ip_mode_desc() {
   esac
 }
 
-# 2. 读取全局配置文件
 _get_global_mode() {
-  local pref
-  # 读取 /etc/xray/ip_pref 文件的内容
-  pref="$(head -n 1 /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || true)"
+  local pref="follow_global"
+
+  if [[ -r /etc/xray/ip_pref ]]; then
+    IFS= read -r pref < /etc/xray/ip_pref || pref="follow_global"
+    pref="${pref//$'\r'/}"
+    pref="${pref// /}"
+  fi
+
   [[ -z "$pref" || "$pref" == "(未设置)" ]] && pref="follow_global"
   echo "$pref"
 }
@@ -82,43 +86,57 @@ log_msg() {
 }
 
 
-# 节点侧：如果是 SOCKS 入站，做一次最小可用性探测（避免“切到 only 后连节点都不通”）
 _probe_socks_inbound() {
   local tag="$1" mode="$2"
   local cfg="${XRAY_CONFIG:-/etc/xray/xray_config.json}"
 
-  # 仅在配置存在时探测
+  # 配置不存在则跳过，不阻断流程
   [[ -s "$cfg" ]] || return 0
 
   local port auth user pass
-  port="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .port // empty' "$cfg" 2>/dev/null | head -n1)"
-  auth="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .settings.auth // "noauth"' "$cfg" 2>/dev/null | head -n1)"
-  user="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .settings.accounts[0].user // empty' "$cfg" 2>/dev/null | head -n1)"
-  pass="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag==$t) | .settings.accounts[0].pass // empty' "$cfg" 2>/dev/null | head -n1)"
+  local line
 
-  [[ -n "${port:-}" ]] || return 0
+  # 一次 jq 取回四个字段，避免重复解析 JSON
+  line="$(
+    jq -r --arg t "$tag" '
+      first(.inbounds[]? | select(.tag == $t)) |
+      [
+        (.port // ""),
+        (.settings.auth // "noauth"),
+        (.settings.accounts[0].user // ""),
+        (.settings.accounts[0].pass // "")
+      ] | @tsv
+    ' "$cfg" 2>/dev/null
+  )"
 
-  # 先确认端口在监听（tcp4/tcp6 任一都算）
+  [[ -n "$line" && "$line" != "null" ]] || return 0
+  IFS=$'\t' read -r port auth user pass <<< "$line"
+
+  [[ -n "$port" ]] || return 0
+
+  # 先确认端口监听
   if command -v ss >/dev/null 2>&1; then
-    ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:\.]${port}\b" || return 2
+    # 比 ss | awk | grep 更省，尽量直接匹配原始输出
+    ss -lnt "( sport = :$port )" 2>/dev/null | grep -q "[[:digit:]]" || return 2
   fi
 
-  # only 模式最容易翻车：做一次真正代理请求
   local url="https://api.ipify.org"
   case "$mode" in
-    v6* ) url="https://api64.ipify.org" ;;
+    v6*) url="https://api64.ipify.org" ;;
   esac
 
-  local px=""
-  if [[ "$auth" == "password" && -n "${user:-}" && -n "${pass:-}" ]]; then
+  local px
+  if [[ "$auth" == "password" && -n "$user" && -n "$pass" ]]; then
     px="socks5h://${user}:${pass}@127.0.0.1:${port}"
   else
     px="socks5h://127.0.0.1:${port}"
   fi
 
-  # 只要能拿到一个像样的 IP（4 或 6），就算通过
   local out
-  out="$(curl -sS --connect-timeout 3 --max-time 6 -x "$px" "$url" 2>/dev/null | tr -d '\r\n')"
+  out="$(curl -sS --connect-timeout 3 --max-time 6 -x "$px" "$url" 2>/dev/null)"
+  out="${out//$'\r'/}"
+  out="${out//$'\n'/}"
+
   [[ -n "$out" ]] || return 3
   return 0
 }
@@ -204,47 +222,74 @@ print_card() {
 }
 
 update_ip_async() {
-    # 增加简单的运行锁，防止重复启动探测进程
     local lock="/tmp/ip_probe.lock"
     if [[ -f "$lock" ]]; then
-        local pid=$(cat "$lock" 2>/dev/null)
-        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then return 0; fi
+        local pid
+        IFS= read -r pid < "$lock" 2>/dev/null || pid=""
+        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+            return 0
+        fi
     fi
-    echo $$ > "$lock"
 
     (
-        # 1. 系统原生 IP 探测
-        local ip4; ip4=$(curl -s -4 --connect-timeout 2 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\r\n')
-        [[ -n "$ip4" ]] && echo -n "$ip4" > "$IP_CACHE_FILE"
-        
-        local ip6; ip6=$(curl -s -6 --connect-timeout 2 --max-time 5 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
-        [[ -n "$ip6" ]] && echo -n "$ip6" > "${IP_CACHE_FILE}_v6"
+        local ip4 ip6 pref lock_ip xray_pub
 
-        # 2. Xray 出口探测
-        local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
-        local lock_ip=""
-        [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
-        [[ "$pref" == "v4" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
+        ip4="$(curl -s -4 --connect-timeout 2 --max-time 5 https://api.ipify.org 2>/dev/null)"
+        ip4="${ip4//$'\r'/}"
+        ip4="${ip4//$'\n'/}"
+        [[ -n "$ip4" ]] && printf '%s' "$ip4" > "$IP_CACHE_FILE"
 
-        if [[ -n "$lock_ip" ]]; then
-            local xray_pub=""
-            # 探测逻辑：优先尝试绑定 IP 探测
-            if [[ "$pref" == "v6" ]]; then
-                xray_pub=$(curl -s -6 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null | tr -d '\r\n')
-            else
-                xray_pub=$(curl -s -4 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null | tr -d '\r\n')
+        ip6="$(curl -s -6 --connect-timeout 2 --max-time 5 https://api64.ipify.org 2>/dev/null)"
+        ip6="${ip6//$'\r'/}"
+        ip6="${ip6//$'\n'/}"
+        [[ -n "$ip6" ]] && printf '%s' "$ip6" > "${IP_CACHE_FILE}_v6"
+
+        pref="v4"
+        lock_ip=""
+
+        if [[ -r /etc/xray/ip_pref ]]; then
+            IFS= read -r pref < /etc/xray/ip_pref || pref="v4"
+            pref="${pref//$'\r'/}"
+            pref="${pref// /}"
+        fi
+
+        if [[ "$pref" == "v6" ]]; then
+            if [[ -r /etc/xray/global_egress_ip_v6 ]]; then
+                IFS= read -r lock_ip < /etc/xray/global_egress_ip_v6 || lock_ip=""
+                lock_ip="${lock_ip//$'\r'/}"
+                lock_ip="${lock_ip// /}"
             fi
-
-            if [[ -n "$xray_pub" ]]; then
-                echo -n "$xray_pub" > "${IP_CACHE_FILE}_xray"
-                echo -n "OK" > "${IP_CACHE_FILE}_xray_status"
-            else
-                echo -n "FAILED" > "${IP_CACHE_FILE}_xray_status"
-                echo -n "N/A" > "${IP_CACHE_FILE}_xray"
+        elif [[ "$pref" == "v4" ]]; then
+            if [[ -r /etc/xray/global_egress_ip_v4 ]]; then
+                IFS= read -r lock_ip < /etc/xray/global_egress_ip_v4 || lock_ip=""
+                lock_ip="${lock_ip//$'\r'/}"
+                lock_ip="${lock_ip// /}"
             fi
         fi
+
+        if [[ -n "$lock_ip" ]]; then
+            if [[ "$pref" == "v6" ]]; then
+                xray_pub="$(curl -s -6 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null)"
+            else
+                xray_pub="$(curl -s -4 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null)"
+            fi
+
+            xray_pub="${xray_pub//$'\r'/}"
+            xray_pub="${xray_pub//$'\n'/}"
+
+            if [[ -n "$xray_pub" ]]; then
+                printf '%s' "$xray_pub" > "${IP_CACHE_FILE}_xray"
+                printf '%s' "OK" > "${IP_CACHE_FILE}_xray_status"
+            else
+                printf '%s' "FAILED" > "${IP_CACHE_FILE}_xray_status"
+                printf '%s' "N/A" > "${IP_CACHE_FILE}_xray"
+            fi
+        fi
+
         rm -f "$lock"
     ) &
+
+    echo $! > "$lock"
 }
 
 # 获取当前服务器的“入口”公网 IP (适配 NAT 环境)
@@ -545,66 +590,81 @@ get_all_ips_with_geo() {
 
 
 
-# 系统状态 Dashboard (支持显示网卡名称)
 get_sys_status() {
-    local cpu_load=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-    local mem_total=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null)
-    local mem_free=$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null)
-    local mem_used=$((mem_total - mem_free))
-    local mem_rate=0
-    [[ $mem_total -gt 0 ]] && mem_rate=$((mem_used * 100 / mem_total))
+    # 1. 采集基础数据并脱水
+    local node_count=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0)
+    node_count=$(echo "$node_count" | tr -d '\n\r')
+    local core_ver=$($(_xray_bin) version 2>/dev/null | head -n1 | awk '{print $2}')
+    core_ver=$(echo "$core_ver" | tr -d '\n\r')
+    local sys_uptime=$(uptime -p 2>/dev/null | sed "s/up //; s/ days/天/; s/ day/天/; s/ hours/小时/; s/ hour/小时/; s/ minutes/分钟/; s/ minute/分钟/; s/,//g" | tr -d '\n\r')
     
-    # 获取原生 IP 缓存
-    local sys_ip4="未检测到"; [[ -f "$IP_CACHE_FILE" ]] && sys_ip4=$(cat "$IP_CACHE_FILE")
-    local sys_ip6="未检测到"; [[ -f "${IP_CACHE_FILE}_v6" ]] && sys_ip6=$(cat "${IP_CACHE_FILE}_v6")
+    # 2. 系统 IP 获取及“无”处理
+    local sys_ip4=$(cat "$IP_CACHE_FILE" 2>/dev/null | tr -d '\n\r')
+    [[ -z "$sys_ip4" ]] && sys_ip4="无"
+    local sys_ip6=$(cat "${IP_CACHE_FILE}_v6" 2>/dev/null | tr -d '\n\r')
+    [[ -z "$sys_ip6" ]] && sys_ip6="无"
 
-    # Xray 出口状态逻辑
-    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || echo "v4")
-    local lock_ip=""; [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null) || lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null)
-    
-    local xray_egress="跟随系统 (默认)"
-    if [[ -n "$lock_ip" ]]; then
-        # 核心修改：根据锁定 IP 反查网卡名称
-        local iface_name; iface_name=$(ip -o addr show | grep "$lock_ip" | awk '{print $2}' | head -n1)
-        [[ -z "$iface_name" ]] && iface_name="未知"
+    # 3. 识别本地 SSH 来源及城市位置
+    local cur_session_ip=$(echo $SSH_CLIENT | awk '{print $1}')
+    local local_loc="${C_GRAY}未知位置${C_RESET}"
+    local v4_ext_target="114.114.114.114"; local v6_ext_target="2400:3200::1"
 
-        local real_pub="获取中..."
-        [[ -f "${IP_CACHE_FILE}_xray" ]] && real_pub=$(cat "${IP_CACHE_FILE}_xray")
-        
-        local status="CHECKING"
-        [[ -f "${IP_CACHE_FILE}_xray_status" ]] && status=$(cat "${IP_CACHE_FILE}_xray_status")
-
-        # 纠正版本错位显示
-        if [[ "$pref" == "v4" && "$real_pub" == *:* ]]; then real_pub="获取中..."; fi
-        if [[ "$pref" == "v6" && "$real_pub" == *.* ]]; then real_pub="获取中..."; fi
-
-        local cc="??"
-        [[ "$real_pub" != "获取中..." && "$real_pub" != "N/A" ]] && cc=$(get_ip_country "$real_pub")
-
-        local status_disp="${C_YELLOW}[检测中]${C_RESET}"
-        if [[ "$status" == "OK" ]]; then
-            status_disp="${C_GREEN}[正常]${C_RESET}"
-        elif [[ "$status" == "FAILED" ]]; then
-            status_disp="${C_RED}[失效]${C_RESET}"
-            real_pub="N/A"
-        fi
-
-        # 最终显示行：显示网卡名 (iface_name)
-        xray_egress="${C_GREEN}${real_pub}${C_RESET} ${C_PURPLE}[${cc}]${C_RESET} ${C_GRAY}(src:${iface_name})${C_RESET} ${status_disp}"
+    if [[ -n "$cur_session_ip" ]]; then
+        local loc_data=$(curl -s --connect-timeout 2 "http://ip-api.com/json/$cur_session_ip?fields=country,city,countryCode&lang=zh-CN")
+        local country=$(echo "$loc_data" | jq -r '.country // empty')
+        local city=$(echo "$loc_data" | jq -r '.city // empty')
+        local code=$(echo "$loc_data" | jq -r '.countryCode // "US"')
+        [[ -n "$country" ]] && local_loc="${C_PURPLE}${country}${C_RESET}"
+        [[ -n "$city" ]] && local_loc="${local_loc} · ${C_PURPLE}${city}${C_RESET}"
+        if [[ "$code" != "CN" ]]; then v4_ext_target="1.1.1.1"; v6_ext_target="2606:4700:4700::1111"; fi
     fi
 
-    local color_cpu="$C_GREEN"
-    if awk -v l="$cpu_load" 'BEGIN{exit (l>2.0)?0:1}' >/dev/null 2>&1; then color_cpu="$C_YELLOW"; fi
-    local color_mem="$C_GREEN"; [[ $mem_rate -ge 80 ]] && color_mem="$C_YELLOW"
+    # 4. 延迟检测逻辑 (统一黄色)
+    local v4_delay="" v6_delay=""
+    local all_ips=$(who | grep -oE "\(([0-9a-fA-F.:]+)\)" | tr -d "()" | sort -u)
+    local combined_ips=$(echo "$cur_session_ip $all_ips" | tr ' ' '\n' | sort -u)
 
+    for ip in $combined_ips; do
+        [[ -z "$ip" || "$ip" == " " ]] && continue
+        local rtt=$(ss -itn dst "$ip" 2>/dev/null | grep -oE "rtt:[0-9.]+" | cut -d: -f2 | head -n1)
+        if [[ -n "$rtt" ]]; then
+            if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then v4_delay="${C_YELLOW}${rtt}ms(本地)${C_RESET}"
+            elif [[ "$ip" == *:* ]]; then v6_delay="${C_YELLOW}${rtt}ms(本地)${C_RESET}"; fi
+        fi
+    done
+
+    if [[ -z "$v4_delay" && "$sys_ip4" != "无" ]]; then
+        local p4=$(ping -c 1 -W 1 "$v4_ext_target" 2>/dev/null | grep -oE "time=[0-9.]+" | cut -d= -f2)
+        v4_delay=$( [[ -n "$p4" ]] && echo -e "${C_YELLOW}${p4}ms(市)${C_RESET}" || echo -e "${C_RED}超时${C_RESET}" )
+    fi
+    if [[ -z "$v6_delay" && "$sys_ip6" != "无" ]]; then
+        local p6=$(ping6 -c 1 -W 1 "$v6_ext_target" 2>/dev/null | grep -oE "time=[0-9.]+" | cut -d= -f2)
+        v6_delay=$( [[ -n "$p6" ]] && echo -e "${C_YELLOW}${p6}ms(市)${C_RESET}" || echo -e "${C_RED}超时${C_RESET}" )
+    fi
+    v4_delay=${v4_delay:-"${C_GRAY}无${C_RESET}"}; v6_delay=${v6_delay:-"${C_GRAY}无${C_RESET}"}
+
+    # 5. 出口逻辑渲染
+    local pref=$(cat /etc/xray/ip_pref 2>/dev/null | tr -d "\r\n " || echo "v4")
+    local lock_ip=""; [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\n\r') || lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\n\r')
+    local xray_egress="跟随系统 (默认)"
+    if [[ -n "$lock_ip" ]]; then
+        local real_pub=$(cat "${IP_CACHE_FILE}_xray" 2>/dev/null | tr -d '\n\r' || echo "获取中...")
+        local cc="??"; [[ "$real_pub" != "获取中..." && "$real_pub" != "N/A" ]] && cc=$(get_ip_country "$real_pub")
+        xray_egress="${C_GREEN}${real_pub}${C_RESET} ${C_PURPLE}[${cc}]${C_RESET}"
+    fi
+
+    # 6. 打印对齐 UI
     echo -e "${C_BLUE}┌──[ 系统监控 ]────────────────────────────────────────────────┐${C_RESET}"
-    echo -e "${C_BLUE}│${C_RESET} CPU: ${color_cpu}${cpu_load}${C_RESET} | 内存: ${color_mem}${mem_used}MB/${mem_total}MB (${mem_rate}%)${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} 状态: ${C_GREEN}[运行中]${C_RESET} | 节点: ${C_YELLOW}${node_count}${C_RESET} | 核心: ${C_CYAN}${core_ver:-未知}${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} 本机: ${local_loc} | 运行: ${C_YELLOW}${sys_uptime:-0分钟}${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} 延迟: V4: ${v4_delay} | V6: ${v6_delay}"
     echo -e "${C_BLUE}│${C_RESET} 系统 IPv4: ${C_GRAY}${sys_ip4}${C_RESET}"
     echo -e "${C_BLUE}│${C_RESET} 系统 IPv6: ${C_GRAY}${sys_ip6}${C_RESET}"
     echo -e "${C_BLUE}├──────────────────────────────────────────────────────────────┤${C_RESET}"
     echo -e "${C_BLUE}│${C_RESET} Xray 出口: ${xray_egress}"
     echo -e "${C_BLUE}└──────────────────────────────────────────────────────────────┘${C_RESET}"
 }
+
 
 # ============= 2. 基础依赖与 Xray 管理 (保留原逻辑) =============
 
@@ -3046,14 +3106,6 @@ nat_mode_menu() {
 
 show_menu_banner() {
     # 删除了开头的 clear
-    echo -e "${C_PURPLE}"
-    echo "   _____ _                 __               "
-    echo "  / ___/(_)___  ____ _    / /_  ____  _  __"
-    echo "  \__ \/ / __ \/ __ \`/   / __ \/ __ \| |/_/"
-    echo " ___/ / / / / / /_/ /   / /_/ / /_/ />  <  "
-    echo "/____/_/_/ /_/\__, /   /_.___/\____/_/|_|  v${VERSION}"
-    echo "             /____/                        "
-    echo -e "${C_RESET}"
     get_sys_status
 }
 # ============= 新增：状态维护子菜单 (UI优化+纯卸载逻辑) =============

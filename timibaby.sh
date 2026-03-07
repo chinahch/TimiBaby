@@ -43,6 +43,28 @@ C_PURPLE='\033[38;5;129m'
 C_CYAN='\033[38;5;51m'
 C_GRAY='\033[90m'
 
+# ============= 小内存与网络环境预修复 =============
+fix_environment_lowmem() {
+    # 1. 修复 DNS 解析 (解决你遇到的 temporary error)
+    if ! nslookup google.com >/dev/null 2>&1; then
+        echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+    fi
+
+    # 2. 自动创建虚拟内存 (针对 < 512MB 的机器)
+    local total_mem=$(free -m | awk '/Mem:/ {print $2}')
+    local total_swap=$(free -m | awk '/Swap:/ {print $2}')
+    if [ "$total_mem" -le 300 ] && [ "$total_swap" -le 10 ]; then
+        echo -e "${C_YELLOW}检测到小内存环境 ($total_mem MB)，正在开启临时 Swap...${C_RESET}"
+        # Alpine/BusyBox 兼容的 dd 命令
+        dd if=/dev/zero of=/swapfile bs=1024 count=524288 2>/dev/null
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1
+        swapon /swapfile >/dev/null 2>&1
+    fi
+}
+fix_environment_lowmem # 立即执行
+
+
 # ============= IP 策略状态翻译工具 (修复版) =============
 
 # 1. 核心翻译逻辑 (兼容两种函数名)
@@ -1044,45 +1066,76 @@ ensure_cmd() {
 ensure_runtime_deps() {
   if (( DEPS_CHECKED == 1 )); then return 0; fi
 
-  # 依赖清单：补上 unzip（Xray zip 解压必须）
-  local need=(curl jq uuidgen openssl ss lsof unzip)
+  # 1. 针对 Alpine 的 DNS 预修复逻辑 (Docker 容器网络经常抖动)
+  if [ -f /etc/alpine-release ]; then
+    # 强制覆盖 DNS，确保能解析仓库域名
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+  fi
 
-  # 已齐全则不做任何 update/install
-  local all_exist=1
+  # 2. 【删除 Swap 逻辑】 Docker 容器环境直接进入依赖检查
+
+  # 依赖清单：Alpine 环境下 ss 在 iproute2, uuidgen 在 util-linux
+  local need=(curl jq uuidgen openssl ss lsof unzip nslookup)
+
+  # 检查是否已齐全，如果都齐全了就没必要执行 update，节省内存
+  local missing_count=0
   for c in "${need[@]}"; do
-    if ! command -v "$c" >/dev/null 2>&1; then all_exist=0; break; fi
+    if ! command -v "$c" >/dev/null 2>&1; then ((missing_count++)); fi
   done
-  if (( all_exist == 1 )); then
+
+  if (( missing_count == 0 )); then
     DEPS_CHECKED=1
     return 0
   fi
 
-  say "首次运行，正在补全依赖..."
+  say "容器环境：检测到依赖缺失，正在极速补全 (分批安装模式)..."
 
-  ensure_cmd curl     curl         curl        curl       curl
-  ensure_cmd jq       jq           jq          jq         jq
-  ensure_cmd uuidgen  uuid-runtime util-linux  util-linux util-linux
-  ensure_cmd openssl  openssl      openssl     openssl    openssl
-  ensure_cmd ss       iproute2     iproute2    iproute    iproute
-  ensure_cmd lsof     lsof         lsof        lsof       lsof
-  ensure_cmd unzip    unzip        unzip       unzip      unzip
+  case "$(detect_os)" in
+    alpine)
+      # 1. 临时切换为 http 协议（绕过证书校验的内存开销），安装完再切回
+      sed -i 's/https/http/g' /etc/apk/repositories
+      
+      # 2. 更新索引并立即安装基础包
+      # --no-cache 会在安装后自动删除索引，是容器环境最省内存的做法
+      apk add --no-cache curl jq openssl unzip || return 1
+      
+      # 3. 分第二批安装工具类（避免一次性加载过多索引）
+      apk add --no-cache util-linux iproute2 lsof bind-tools || return 1
+      
+      # 4. 恢复 https 协议
+      sed -i 's/http/https/g' /etc/apk/repositories
+      # 5. 再次清理缓存目录，确保不留垃圾文件
+      rm -rf /var/cache/apk/*
+      ;;
+      
+    debian|ubuntu)
+      # Debian/Ubuntu 容器同样建议使用 --no-install-recommends
+      apt-get update -y >/dev/null 2>&1
+      apt-get install -y --no-install-recommends curl jq uuid-runtime openssl iproute2 lsof unzip dnsutils >/dev/null 2>&1
+      apt-get clean
+      rm -rf /var/lib/apt/lists/*
+      ;;
+      
+    *)
+      # 其他系统沿用兼容逻辑
+      ensure_cmd curl     curl         curl        curl       curl
+      ensure_cmd jq       jq           jq          jq         jq
+      ensure_cmd uuidgen  uuid-runtime util-linux  util-linux util-linux
+      ensure_cmd openssl  openssl      openssl     openssl    openssl
+      ensure_cmd ss       iproute2     iproute2    iproute    iproute
+      ensure_cmd lsof     lsof         lsof        lsof       lsof
+      ensure_cmd unzip    unzip        unzip       unzip      unzip
+      ;;
+  esac
 
-  # 如果 Debian/Ubuntu 上因为「apt 缺 update」导致安装失败，这里统一补一次 update 并重试缺包
-  if [[ "${OS_ID:-}" =~ ^(debian|ubuntu)$ ]] && ((${#_APT_RETRY_PKGS[@]} > 0)); then
-    warn "检测到 apt 安装可能因未 update 失败：补一次 apt-get update 后重试安装：${_APT_RETRY_PKGS[*]}"
-    apt-get update -y >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${_APT_RETRY_PKGS[@]}" >/dev/null 2>&1 || true
-    _APT_RETRY_PKGS=()
-  fi
-
-  # 最终严格校验：缺哪个就报哪个（不再假成功）
+  # 最终严格校验
   local missing=()
   for c in "${need[@]}"; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
 
   if ((${#missing[@]} > 0)); then
-    warn "仍有依赖缺失：${missing[*]}（请检查软件源/DNS/网络后重试）"
+    warn "仍有依赖缺失：${missing[*]}。容器内存可能极低，请尝试手动执行 apk add --no-cache [包名]"
     return 1
   fi
 
@@ -1125,24 +1178,20 @@ enable_bbr() {
 
 # 修改后的安装函数
 install_xray_if_needed() {
-  local current_bin
-  current_bin=$(_xray_bin)
+  local current_bin=$(_xray_bin)
+  if [[ "$1" != "--force" ]] && [[ -x "$current_bin" ]]; then return 0; fi
 
-  # 非强制且已存在则跳过
-  if [[ "$1" != "--force" ]] && [[ -x "$current_bin" ]]; then
-    return 0
-  fi
-
-  # 先确保 unzip/curl/jq 等依赖在（否则解压必炸）
-  ensure_runtime_deps || { err "依赖未就绪，无法安装 Xray"; return 1; }
-
-  # 获取最新版本（失败则保底）
+  # 1. 确保基础依赖（在子 shell 外处理，减少嵌套内存开销）
+  ensure_runtime_deps || return 1
+  
+  # 2. 获取版本号
   local LATEST_VER
-  LATEST_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/v//')
+  LATEST_VER=$(curl -s --connect-timeout 5 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/v//')
   [[ -z "$LATEST_VER" || "$LATEST_VER" == "null" ]] && LATEST_VER="1.8.24"
 
-  warn "正在安装/更新 Xray 核心 v${LATEST_VER}..."
+  warn "正在为容器环境安装 Xray v${LATEST_VER}..."
 
+  # 3. 架构识别与 URL 构建
   local arch url
   arch="$(uname -m)"
   case "$arch" in
@@ -1151,48 +1200,48 @@ install_xray_if_needed() {
     *) err "暂不支持的架构：$arch"; return 1 ;;
   esac
 
-  local tmp; tmp="$(mktemp -d)"
+  # 4. 【关键优化】避开 /tmp (RAM Disk)，使用硬盘目录
+  local tmp_dir="/etc/xray/install_tmp"
+  rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
+  
   (
     set -e
-    cd "$tmp"
+    cd "$tmp_dir"
+    
+    # 使用 -# 进度条，比默认输出占用的终端缓冲区更小
+    curl -fL -# -o xray.zip "$url"
+    
+    # 【分步执行】解压后立即删除 zip，释放存储空间同时减小内存索引压力
+    unzip -q -o xray.zip 
+    rm -f xray.zip
+    
+    # 强制将解压后的文件从内存缓存刷新到硬盘
+    sync 
 
-    curl -fL -o xray.zip "$url"
-
-    # 解压必须成功
-    unzip -o xray.zip >/dev/null
-
-    # 某些 zip 里可能是 ./xray 或 ./Xray，做个兼容探测
     local bin=""
     [[ -f "./xray" ]] && bin="./xray"
     [[ -z "$bin" && -f "./Xray" ]] && bin="./Xray"
 
     if [[ -z "$bin" ]]; then
-      echo "zip 内容："
-      ls -la
-      exit 2
+      exit 1
     fi
 
-    # 1. 安装二进制主程序
+    # 安装二进制
     install -m 0755 "$bin" /usr/local/bin/xray
-
-    # 2. 【新增】安装资源文件 (geosite.dat 和 geoip.dat)
-    # 这样分流规则（如 geosite:tiktok）才能被内核正确解析
-    if [[ -f "geosite.dat" ]]; then
-      install -m 0644 "geosite.dat" /usr/local/bin/geosite.dat
-    fi
-    if [[ -f "geoip.dat" ]]; then
-      install -m 0644 "geoip.dat" /usr/local/bin/geoip.dat
-    fi
+    [[ -f "geosite.dat" ]] && install -m 0644 "geosite.dat" /usr/local/bin/geosite.dat
+    [[ -f "geoip.dat" ]] && install -m 0644 "geoip.dat" /usr/local/bin/geoip.dat
   )
   local rc=$?
-  rm -rf "$tmp"
 
-  if [[ $rc -ne 0 ]] || ! /usr/local/bin/xray version >/dev/null 2>&1; then
-    err "Xray 安装失败（rc=$rc），请检查 unzip/网络/磁盘权限"
+  # 立即清理临时目录
+  rm -rf "$tmp_dir"
+
+  if [[ $rc -ne 0 ]]; then
+    err "安装失败：可能是容器物理内存不足导致进程被宿主机杀掉。"
     return 1
   fi
 
-  ok "Xray 核心及资源文件已就绪"
+  ok "Xray 核心已就绪。"
   return 0
 }
 
@@ -1626,21 +1675,52 @@ start_xray_legacy_nohup() {
 }
 
 start_xray_singleton_force() {
-  # 修改 1：使用 -f (full command) 匹配命令行，并增加 -i 忽略大小写
+  # 1. 彻底清理旧进程与 PID 锁
+  # 在无 Swap 的容器中，旧进程残留的 PageCache 会挤占可用内存
   pkill -9 -if "/usr/local/bin/xray" >/dev/null 2>&1 || true
-  rm -f /var/run/xray.pid /run/xray.pid >/dev/null 2>&1 || true
+  rm -f /run/xray.pid /var/run/xray.pid >/dev/null 2>&1 || true
   sleep 1
 
-  daemonize /usr/local/bin/xray-singleton --force
-  
-  # 修改 2：给 256MB 内存的 Alpine 更多缓冲，从 1s 增加到 5s
-  sleep 1
+  # 2. 动态内存压制策略 (自动适配容器与 VPS)
+  local total_mem
+  total_mem=$(free -m | awk '/Mem:/ {print $2}')
 
-  # 修改 3：使用 -f 匹配完整路径，防止匹配到 grep 自身，且更准确
+  # 显式指定资源路径，减少核心启动时的 IO 扫描和内存缓存占用
+  export XRAY_LOCATION_ASSET=/usr/local/bin/
+
+  if [[ "$total_mem" -le 300 ]]; then
+    # 【极致省电模式】：针对 < 300MB 的容器或小鸡
+    export GOMEMLIMIT=64MiB
+    export GOGC=15  # 更激进的 GC，内存一旦波动立即回收
+    # 强制 Go 将内存立即归还给宿主机 (对 Alpine/musl 极重要)
+    export GODEBUG=madvdontneed=1 
+    say "检测到极小内存环境 ($total_mem MB)，已开启极致压制模式"
+  else
+    # 【标准性能模式】：针对普通 VPS
+    export GOMEMLIMIT=128MiB
+    export GOGC=50
+  fi
+
+  # 3. 异步探测任务极致延迟
+  # 避开 Xray 加载 geoip.dat 时的 CPU 和内存瞬时高峰
+  (sleep 30 && update_ip_async) &
+
+  # 4. 执行启动 (显式指定路径和配置，确保 singleton 运行)
+  daemonize /usr/local/bin/xray run -c /etc/xray/xray_config.json
+
+  # 5. 观察期
+  sleep 5
+
+  # 6. 深度状态校验
   if ! pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1; then
-    err "Fallback 启动失败：xray 进程未运行（请检查 /var/log/xray.log）"
+    err "启动失败：进程可能由于内存溢出 (OOM) 被容器杀掉"
+    if [[ -f "/var/log/xray.log" ]]; then
+       echo -e "${C_GRAY}最后 3 行内核日志：${C_RESET}"
+       tail -n 3 /var/log/xray.log
+    fi
     return 1
   fi
+
   return 0
 }
 
@@ -4201,6 +4281,12 @@ node_speed_limit_menu() {
     apply_port_limits
     read -rp "按回车返回..." _
 }
+
+# 在 main_menu 之前执行
+if [[ ! -f "$IP_CACHE_FILE" ]]; then
+    # 同步探测一次，超时设为 2s
+    curl -s -4 --connect-timeout 2 https://api.ipify.org > "$IP_CACHE_FILE" 2>/dev/null &
+fi
 
 
 

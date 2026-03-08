@@ -62,6 +62,22 @@ fix_environment_lowmem() {
         swapon /swapfile >/dev/null 2>&1
     fi
 }
+
+# 自动化增强：多重时间同步逻辑
+auto_sync_time() {
+    say "正在执行智能时间同步..."
+    # 尝试标准 NTP
+    ntpdate -u pool.ntp.org >/dev/null 2>&1
+    
+    # 保底方案：通过 HTTP Header 获取时间 (不受系统架构限制)
+    remote_date=$(curl -sI https://www.google.com | grep -i '^date:' | cut -d' ' -f2-7)
+    if [[ -n "$remote_date" ]]; then
+        date -s "$remote_date" >/dev/null 2>&1
+        ok "时间同步成功 (HTTP 来源)"
+    fi
+}
+
+
 fix_environment_lowmem # 立即执行
 
 
@@ -375,10 +391,28 @@ get_public_ipv6_ensure() {
 }
 
 # 1. 获取纯中文国家名称
+# 1. 获取纯中文国家名称 (升级为 ipinfo.io 核心)
 get_country_name_zh() {
-  local ip; ip=$(get_public_ipv4_ensure)
-  local country; country=$(curl -s -4 --connect-timeout 2 --max-time 3 "http://ip-api.com/json/${ip}?fields=country&lang=zh-CN" | jq -r '.country // "未知"')
-  echo -n "$country"
+  local code
+  # 直接从 ipinfo.io 获取 ISO 国家代码 (US, HK, JP 等)，这是目前最稳的方案
+  code=$(curl -s --connect-timeout 2 --max-time 3 https://ipinfo.io/country | tr -d '[:space:]')
+  
+  # 映射常用地区到中文，用于自动生成节点标签
+  case "$code" in
+    US) echo -n "美国" ;;
+    HK) echo -n "香港" ;;
+    JP) echo -n "日本" ;;
+    SG) echo -n "新加坡" ;;
+    TW) echo -n "台湾" ;;
+    KR) echo -n "韩国" ;;
+    CN) echo -n "中国" ;;
+    GB) echo -n "英国" ;;
+    DE) echo -n "德国" ;;
+    *)  
+      # 兜底逻辑：如果是冷门地区，回退到 ip-api 的多语言接口
+      curl -s -4 --connect-timeout 2 "http://ip-api.com/json/?fields=country&lang=zh-CN" | jq -r '.country // "未知"'
+      ;;
+  esac
 }
 
 # 2. 自动获取 A-Z 排序后缀 (自动补位：如果 A 没被占用就用 A)
@@ -1271,7 +1305,8 @@ check_core_update() {
 
 get_country_code() {
   local CODE
-  CODE=$(curl -s --max-time 3 https://ipinfo.io | jq -r '.country // empty')
+  # 统一使用 ipinfo.io
+  CODE=$(curl -s --max-time 3 https://ipinfo.io/country | tr -d '[:space:]')
   [[ "$CODE" =~ ^[A-Z]{2}$ ]] && printf "%s\n" "$CODE" || printf "ZZ\n"
 }
 
@@ -1513,6 +1548,11 @@ install_watchdog_cron() {
 install_singleton_wrapper() {
   local xray_bin="/usr/local/bin/xray"
 
+  # 1. 确保目录结构存在，并建立路径软链接
+  mkdir -p /etc/xray /usr/local/etc/xray
+  ln -sf /etc/xray/xray_config.json /usr/local/etc/xray/config.json
+
+  # 2. 生成 xray-sync (配置转换引擎)
   cat > /usr/local/bin/xray-sync <<'SYNC'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1524,6 +1564,7 @@ META_CFG="${XRAY_BASE_DIR}/nodes_meta.json"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
 LOG_PATH="/var/log/xray.log"
 
+# 获取全局 IP 偏好
 G_PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
 [[ -z "$G_PREF" || "$G_PREF" == "follow_global" || "$G_PREF" == "off" ]] && G_PREF="v4pref"
 
@@ -1535,6 +1576,7 @@ case "${G_PREF}" in
   *)         DS="UseIPv4v6" ;;
 esac
 
+# 使用 jq 构建完整配置，强制闭合逻辑漏洞
 jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "0.0.0.0");
   def _port: ((.listen_port // .port // 0) | tonumber);
@@ -1586,16 +1628,37 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
 
   {
     log: { loglevel: "warning", access: $log, error: $log },
+    # 启用统计和管理 API
+    stats: {},
+    api: { tag: "API", services: ["HandlerService", "LoggerService", "StatsService"] },
+    policy: {
+      levels: { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
+      system: { "statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true }
+    },
     dns: { servers: ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"], queryStrategy: $ds },
-    inbounds: ( ($root.inbounds // []) | map(mk_inbound) ),
+    inbounds: ( 
+      (($root.inbounds // []) | map(mk_inbound)) + 
+      [{ tag: "API", port: 47302, listen: "127.0.0.1", protocol: "dokodemo-door", settings: { address: "127.0.0.1" } }] 
+    ),
     outbounds: ( 
       ( [ $root.outbounds[]? | select(.tag != "direct") | mk_outbound ] ) +
-      [ { protocol: "freedom", tag: "DIRECT", settings: { domainStrategy: $ds } }, { protocol: "freedom", tag: "DIRECT-V4", settings: { domainStrategy: "UseIPv4" } }, { protocol: "freedom", tag: "DIRECT-V6", settings: { domainStrategy: "UseIPv6" } }, { protocol: "freedom", tag: "DIRECT-V6PREF", settings: { domainStrategy: "UseIPv6v4" } }, { protocol: "freedom", tag: "DIRECT-V4PREF", settings: { domainStrategy: "UseIPv4v6" } } ] + 
+      # 补全基础标签：强制包含 API, DIRECT, BLOCK 等，防止 status=23 错误
+      [ 
+        { protocol: "freedom", tag: "DIRECT", settings: { domainStrategy: $ds } }, 
+        { protocol: "freedom", tag: "API", settings: {} },
+        { protocol: "blackhole", tag: "BLOCK", settings: {} },
+        { protocol: "freedom", tag: "DIRECT-V4", settings: { domainStrategy: "UseIPv4" } }, 
+        { protocol: "freedom", tag: "DIRECT-V6", settings: { domainStrategy: "UseIPv6" } }, 
+        { protocol: "freedom", tag: "DIRECT-V6PREF", settings: { domainStrategy: "UseIPv6v4" } }, 
+        { protocol: "freedom", tag: "DIRECT-V4PREF", settings: { domainStrategy: "UseIPv4v6" } } 
+      ] + 
       ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({ protocol: "freedom", tag: ("BIND-" + .key | ascii_upcase), settings: { domainStrategy: "AsIs" }, sendThrough: .value.fixed_ip }))
     ),
     routing: {
       domainStrategy: $ds,
       rules: (
+        # API 规则置顶
+        [{ type: "field", inboundTag: ["API"], outboundTag: "API" }] +
         ( [ $root.route.rules[]? | select(.outbound != null and (.outbound | ascii_upcase | startswith("DIRECT") | not)) | mk_rule ] ) +
         ( [ $root.route.rules[]? | select(.kind != null) | mk_rule ] ) +
         ( if ($reality_domains | length > 0) then [{ type: "field", domain: ($reality_domains | map("domain:" + .)), outboundTag: "DIRECT-V4" }] else [] end ) +
@@ -1617,6 +1680,7 @@ jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
 SYNC
   chmod +x /usr/local/bin/xray-sync
 
+  # 3. 生成 xray-singleton (单例管理脚本)
   cat > /usr/local/bin/xray-singleton <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1625,9 +1689,18 @@ PIDFILE="/run/xray.pid"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
 BIN="/usr/local/bin/xray"
 LOG="/var/log/xray.log"
+
+# 1. 尝试同步配置
 /usr/local/bin/xray-sync >/dev/null 2>&1 || true
-if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then exit 1; fi
-pkill -x xray >/dev/null 2>&1 || true
+
+# 2. 配置自检，失败则报错退出
+if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then
+    echo "Xray config test failed! Check /etc/xray/config.json" >&2
+    exit 1
+fi
+
+# 3. 杀死旧进程并启动新进程
+pkill -f "/usr/local/bin/xray run -c" >/dev/null 2>&1 || true
 setsid "$BIN" run -c "$OUT_CFG" >> "$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 WRAP
@@ -1675,25 +1748,41 @@ start_xray_legacy_nohup() {
 }
 
 start_xray_singleton_force() {
-  # 1. 彻底清理旧进程与 PID 锁
-  # 在无 Swap 的容器中，旧进程残留的 PageCache 会挤占可用内存
-  pkill -9 -if "/usr/local/bin/xray" >/dev/null 2>&1 || true
+  # 1. 核心环境预修复：路径对齐与配置同步
+  # 彻底解决你遇到的 "open config.json: no such file" 问题
+  mkdir -p /usr/local/etc/xray /etc/xray
+  ln -sf /etc/xray/xray_config.json /usr/local/etc/xray/config.json
+
+  # 强制同步一次配置，确保 API 标签和闭合逻辑已注入，防止 status 23 错误
+  if command -v xray-sync >/dev/null 2>&1; then
+      /usr/local/bin/xray-sync >/dev/null 2>&1 || true
+  fi
+
+  # 2. 彻底清理旧进程与 PID 锁
+  # 使用 -9 强制杀死，防止僵尸进程占用 11732 或 47302 端口
+  pkill -9 -f "/usr/local/bin/xray" >/dev/null 2>&1 || true
   rm -f /run/xray.pid /var/run/xray.pid >/dev/null 2>&1 || true
   sleep 1
 
-  # 2. 动态内存压制策略 (自动适配容器与 VPS)
+  # 3. 启动前语法自检 (关键防线)
+  # 如果配置测试不通过，直接报错，不盲目启动
+  if ! /usr/local/bin/xray run -test -c /etc/xray/xray_config.json >/dev/null 2>&1; then
+      err "Xray 启动失败：配置文件校验未通过，请检查 /etc/xray/config.json"
+      return 1
+  fi
+
+  # 4. 动态内存压制策略 (自动适配容器与 VPS)
   local total_mem
   total_mem=$(free -m | awk '/Mem:/ {print $2}')
-
-  # 显式指定资源路径，减少核心启动时的 IO 扫描和内存缓存占用
+  
+  # 显式指定资源路径，减少核心启动时的 IO 扫描
   export XRAY_LOCATION_ASSET=/usr/local/bin/
 
   if [[ "$total_mem" -le 300 ]]; then
-    # 【极致省电模式】：针对 < 300MB 的容器或小鸡
+    # 【极致省电模式】：针对小内存容器
     export GOMEMLIMIT=64MiB
-    export GOGC=15  # 更激进的 GC，内存一旦波动立即回收
-    # 强制 Go 将内存立即归还给宿主机 (对 Alpine/musl 极重要)
-    export GODEBUG=madvdontneed=1 
+    export GOGC=15  # 激进回收
+    export GODEBUG=madvdontneed=1 # 立即归还内存给宿主机
     say "检测到极小内存环境 ($total_mem MB)，已开启极致压制模式"
   else
     # 【标准性能模式】：针对普通 VPS
@@ -1701,26 +1790,26 @@ start_xray_singleton_force() {
     export GOGC=50
   fi
 
-  # 3. 异步探测任务极致延迟
-  # 避开 Xray 加载 geoip.dat 时的 CPU 和内存瞬时高峰
+  # 5. 异步探测任务延迟执行
+  # 避开启动时的 CPU 峰值，确保节点能优先跑起来
   (sleep 30 && update_ip_async) &
 
-  # 4. 执行启动 (显式指定路径和配置，确保 singleton 运行)
+  # 6. 执行启动
+  # 使用绝对路径和明确的配置文件，确保单例运行
   daemonize /usr/local/bin/xray run -c /etc/xray/xray_config.json
 
-  # 5. 观察期
-  sleep 5
-
-  # 6. 深度状态校验
+  # 7. 观察期与深度状态校验
+  sleep 3
   if ! pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1; then
-    err "启动失败：进程可能由于内存溢出 (OOM) 被容器杀掉"
+    err "启动失败：进程可能由于内存溢出 (OOM) 或端口占用被杀掉"
     if [[ -f "/var/log/xray.log" ]]; then
-       echo -e "${C_GRAY}最后 3 行内核日志：${C_RESET}"
+       echo -e "${C_GRAY}日志最后 3 行内容：${C_RESET}"
        tail -n 3 /var/log/xray.log
     fi
     return 1
   fi
 
+  ok "Xray 核心服务已强制拉起成功。"
   return 0
 }
 
@@ -1957,255 +2046,189 @@ fix_errors() {
   # Hysteria 修复逻辑保留原脚本
 }
 
+# ============= 节点添加核心逻辑 (前缀记忆增强版) =============
 add_node() {
-  ensure_runtime_deps
-  ensure_dirs
-  install_singleton_wrapper >/dev/null 2>&1 || true
-  if command -v systemctl >/dev/null 2>&1 && is_real_systemd; then
-    systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service' || install_systemd_service >/dev/null 2>&1 || true
-  fi
+    # 1. 环境预检与时间同步
+    ensure_runtime_deps
+    auto_sync_time 
 
-  while true; do
-    echo -e "\n${C_CYAN}>>> 添加节点${C_RESET}"
-    say "1) SOCKS5"
-    say "2) VLESS-REALITY"
-    say "3) Hysteria2"
-    say "4) CF Tunnel 隧道"
-    say "5) Shadowsocks (SS)"
-    say "6) TUIC v5 ${C_YELLOW}(内核加速增强版)${C_RESET}"
-    say "7) VLESS-ENC ${C_YELLOW}(原生加密 Seed)${C_RESET}"
-    say "0) 返回主菜单"
-    safe_read proto "输入协议编号: "
-    proto=${proto:-1}
-    [[ "$proto" == "0" ]] && return
-    [[ "$proto" =~ ^[1-7]$ ]] && break
-    warn "无效输入"
-  done
-
-  # --- 自定义命名逻辑 ---
-  echo -e "\n${C_YELLOW}➜ 节点命名设置${C_RESET}"
-  read -rp " 请输入自定义前缀 (例如 lazycat): " custom_prefix
-  custom_prefix=${custom_prefix:-"node"}
-  
-  local zh_country; zh_country=$(get_country_name_zh)
-  local letter; letter=$(get_node_letter_suffix "$custom_prefix" "$zh_country")
-  
-  local tag="${custom_prefix}-${zh_country}${letter}"
-  say "自动生成节点名: ${C_GREEN}${tag}${C_RESET}"
-
-  if [[ "$proto" == "3" ]]; then add_hysteria2_node; return; fi
-  if [[ "$proto" == "4" ]]; then argo_menu_wrapper; return; fi
-  
-  if [[ "$proto" == "6" ]]; then
-    read -rp "请输入 TUIC 端口 (留空随机, 输入0返回): " input_port
-    [[ "$input_port" == "0" ]] && return
-    [[ -z "$input_port" ]] && input_port=$(shuf -i 10000-65535 -n 1)
-    call_233boy_builder "$tag" "$input_port"
-    return
-  fi
-
-  GLOBAL_IPV4=$(get_public_ipv4_ensure)
-  local PUBLIC_HOST
-  PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
-  [[ -z "$PUBLIC_HOST" ]] && PUBLIC_HOST="$(get_public_ipv4_ensure)"
-
-  # === SOCKS5 逻辑 ===
-  if [[ "$proto" == "1" ]]; then
-      read -rp "端口 (留空随机, 输入0返回): " port
-      [[ "$port" == "0" ]] && return
-      [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
-      read -rp "用户名 (默认 user, 输入0返回): " user
-      [[ "$user" == "0" ]] && return
-      user=${user:-user}
-      read -rp "密码 (默认 pass123, 输入0返回): " pass
-      [[ "$pass" == "0" ]] && return
-      pass=${pass:-pass123}
-
-      safe_json_edit "$CONFIG" \
-        '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
-        --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag"
-      
-      restart_xray "main_only"
-      
-      local creds=$(printf "%s:%s" "$user" "$pass" | base64 -w0)
-      print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${PUBLIC_HOST}:${port}#${tag}"
-  fi
-
-  # === Shadowsocks 逻辑 ===
-  if [[ "$proto" == "5" ]]; then
-      read -rp "端口 (留空随机, 输入0返回): " port
-      [[ "$port" == "0" ]] && return
-      [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
-      
-      local method="aes-256-gcm"
-      local def_pass; def_pass=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
-      read -rp "密码 (默认随机, 输入0返回): " pass
-      [[ "$pass" == "0" ]] && return
-      pass=${pass:-$def_pass}
-
-      safe_json_edit "$CONFIG" \
-        '.inbounds += [{"type":"shadowsocks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"method":$method,"password":$pass}]' \
-        --arg port "$port" --arg method "$method" --arg pass "$pass" --arg tag "$tag"
-      
-      safe_json_edit "$META" '. + {($tag): {type:"shadowsocks", port:$port, method:$method, password:$pass}}' \
-         --arg tag "$tag" --arg port "$port" --arg method "$method" --arg pass "$pass"
-
-      restart_xray "main_only"
-      
-      local userinfo="${method}:${pass}"
-      local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
-      local link="ss://${b64_creds}@${PUBLIC_HOST}:${port}#${tag}"
-      print_card "Shadowsocks 成功" "$tag" "端口: $port\n加密: $method\n密码: $pass" "$link"
-  fi
-
-  # === VLESS-REALITY 逻辑 ===
-  if [[ "$proto" == "2" ]]; then
-    local port uuid server_name key_pair private_key public_key short_id
     while true; do
-       safe_read port "请输入端口号 (留空随机, 输入0返回): "
-       [[ "$port" == "0" ]] && return
-       [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
-       if ! check_nat_allow "$port" "tcp"; then warn "端口 $port 不符合 NAT 限制"; continue; fi
-       break
+        echo -e "\n${C_CYAN}>>> 添加节点 (智能自动化版)${C_RESET}"
+        say "1) SOCKS5"
+        say "2) VLESS-REALITY"
+        say "3) Hysteria2"
+        say "4) CF Tunnel 隧道"
+        say "5) Shadowsocks (SS)"
+        say "6) TUIC v5 ${C_YELLOW}(内核加速)${C_RESET}"
+        say "7) VLESS-ENC ${C_YELLOW}(原生加密)${C_RESET}"
+        say "0) 返回主菜单"
+        safe_read proto "输入协议编号 [1-7]: "
+        proto=${proto:-2} 
+        [[ "$proto" == "0" ]] && return
+        [[ "$proto" =~ ^[1-7]$ ]] && break
+        warn "无效输入，请重新选择。"
     done
 
-    read -rp "伪装域名 (默认 www.microsoft.com, 输入0返回): " input_sni
-    [[ "$input_sni" == "0" ]] && return
-    server_name="${input_sni:-www.microsoft.com}"
+    # --- 2. 自动化命名逻辑 (持久化记忆版) ---
+    # 从文件读取上次保存的前缀，如果没有则默认为 node
+    local PREF_CACHE="/etc/xray/prefix.txt"
+    local last_pref; last_pref=$(cat "$PREF_CACHE" 2>/dev/null || echo "node")
+
+    # 如果在本次脚本运行中已经设置过 SESSION_PREFIX，则不再询问
+    if [[ -z "${SESSION_PREFIX:-}" ]]; then
+        echo -e "\n${C_YELLOW}➜ 节点命名设置${C_RESET}"
+        read -rp " 请输入自定义前缀 (当前默认: $last_pref): " input_prefix
+        SESSION_PREFIX=${input_prefix:-$last_pref}
+        # 保存到本地文件，下次运行脚本也能记住
+        echo "$SESSION_PREFIX" > "$PREF_CACHE"
+    fi
     
-    uuid=$(uuidgen)
-    local xray_cmd=$(_xray_bin)
-    [[ ! -x "$xray_cmd" ]] && xray_cmd=$(command -v xray)
+    local custom_prefix="$SESSION_PREFIX"
+    local zh_country; zh_country=$(get_country_name_zh)
+    local letter; letter=$(get_node_letter_suffix "$custom_prefix" "$zh_country")
+    local tag="${custom_prefix}-${zh_country}${letter}"
     
-    if [[ -z "$xray_cmd" ]]; then
-        err "未发现 Xray 核心，正在尝试安装..."
-        install_xray_if_needed
-        xray_cmd="/usr/local/bin/xray"
+    say "自动生成节点名: ${C_GREEN}${tag}${C_RESET}"
+
+    # --- 3. 快捷跳转协议 (Hy2 / Argo / TUIC) ---
+    if [[ "$proto" == "3" ]]; then add_hysteria2_node; return; fi
+    if [[ "$proto" == "4" ]]; then argo_menu_wrapper; return; fi
+    if [[ "$proto" == "6" ]]; then
+        read -rp "请输入 TUIC 端口 (回车随机): " input_port
+        [[ -z "$input_port" ]] && input_port=$(shuf -i 20000-60000 -n 1)
+        call_233boy_builder "$tag" "$input_port"
+        return
     fi
 
-    extract_kv() { grep -iE "$1" | awk -F':' '{print $2}' | tr -d '[:space:]'; }
-    key_pair=$($xray_cmd x25519 2>/dev/null)
-    private_key=$(echo "$key_pair" | extract_kv 'private')
-    public_key=$(echo "$key_pair" | extract_kv 'public|password')
+    # --- 4. 获取公网入口 IP ---
+    local PUBLIC_HOST
+    PUBLIC_HOST="$(head -n 1 /etc/xray/public_host 2>/dev/null | tr -d '\r\n ')"
+    [[ -z "$PUBLIC_HOST" ]] && PUBLIC_HOST=$(get_public_ipv4_ensure)
 
-    if [[ -z "$public_key" && -n "$private_key" ]]; then
-      public_key=$($xray_cmd x25519 -i "$private_key" 2>/dev/null | extract_kv 'public|password')
-    fi
+    # --- 5) SOCKS5 逻辑 ---
+    if [[ "$proto" == "1" ]]; then
+        local port; port=$(get_random_allowed_port "tcp")
+        read -rp "端口 (默认 $port, 输入0返回): " input_p
+        [[ "$input_p" == "0" ]] && return
+        port=${input_p:-$port}
+        read -rp "用户名 (默认 user): " user; user=${user:-user}
+        read -rp "密码 (默认 pass123): " pass; pass=${pass:-pass123}
 
-    if [[ -z "$private_key" || -z "$public_key" ]]; then
-        err "致命错误：无法通过 Xray 核心生成有效的 x25519 密钥对"
-        return 1
-    fi
-
-    short_id=$(openssl rand -hex 4)
-
-    safe_json_edit "$CONFIG" \
-       '.inbounds += [{"type": "vless","tag": $tag,"listen": "0.0.0.0","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],"tls": {"enabled": true,"server_name": $server,"reality": {"enabled": true,"handshake": { "server": $server, "server_port": 443 },"private_key": $prikey,"short_id": [ $sid ]}}}]' \
-       --arg port "$port" --arg uuid "$uuid" --arg prikey "$private_key" --arg sid "$short_id" --arg server "$server_name" --arg tag "$tag"
-
-    safe_json_edit "$META" '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:"chrome"}}' \
-       --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port"
-
-    if ! restart_xray "main_only"; then
-      err "Xray 重启失败：已回滚"
-      safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
-      safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-      return
-    fi
-    local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
-    print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
-  fi
-
-  # === 终极修复：VLESS-ENC 原生加密逻辑 (正则表达式强力提取) ===
-  if [[ "$proto" == "7" ]]; then
-    local port uuid server_seed client_seed
-    while true; do
-       safe_read port "请输入端口号 (留空随机, 输入0返回): "
-       [[ "$port" == "0" ]] && return
-       [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
-       if ! check_nat_allow "$port" "tcp"; then warn "端口 $port 不符合 NAT 限制"; continue; fi
-       break
-    done
-
-    uuid=$(uuidgen)
-    local xray_cmd=$(_xray_bin)
-    [[ ! -x "$xray_cmd" ]] && xray_cmd=$(command -v xray)
-
-    if [[ -z "$xray_cmd" ]]; then
-        err "未发现 Xray 核心，正在尝试安装..."
-        install_xray_if_needed
-        xray_cmd="/usr/local/bin/xray"
-    fi
-
-    say "正在生成 VLESS-ENC 原生密钥对 (Seed)..."
-
-    # 使用无敌正则表达式解析函数
-    get_vless_seed() {
-        # 合并 stdout 和 stderr，避免丢失输出
-        local raw
-        raw=$($1 vlessenc 2>&1)
+        safe_json_edit "$CONFIG" \
+          '.inbounds += [{"type":"socks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"users":[{"username":$user,"password":$pass}]}]' \
+          --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag"
         
-        local s_seed c_seed
-        # 优先提取 mlkem768
-        s_seed=$(echo "$raw" | grep -i 'decryption' | grep -ioE 'mlkem768[a-zA-Z0-9_.-]+' | head -n 1)
-        # 注意: grep -v -i 'decryption' 用来过滤掉 Decryption 包含 encryption 字符的问题
-        c_seed=$(echo "$raw" | grep -i 'encryption' | grep -v -i 'decryption' | grep -ioE 'mlkem768[a-zA-Z0-9_.-]+' | head -n 1)
-        
-        # 退而求其次提取 x25519
-        if [[ -z "$s_seed" || -z "$c_seed" ]]; then
-            s_seed=$(echo "$raw" | grep -i 'decryption' | grep -ioE 'x25519[a-zA-Z0-9_.-]+' | head -n 1)
-            c_seed=$(echo "$raw" | grep -i 'encryption' | grep -v -i 'decryption' | grep -ioE 'x25519[a-zA-Z0-9_.-]+' | head -n 1)
-        fi
-        
-        if [[ -n "$s_seed" && -n "$c_seed" ]]; then
-            echo "$s_seed $c_seed"
-        else
-            echo ""
-        fi
-    }
+        restart_xray "main_only"
+        local creds=$(printf "%s:%s" "$user" "$pass" | base64 -w0)
+        print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${PUBLIC_HOST}:${port}#${tag}"
+    fi
 
-    local seeds
-    seeds=$(get_vless_seed "$xray_cmd")
-
-    # 兼容性回退与强制更新机制
-    if [[ -z "$seeds" ]]; then
-        warn "当前 Xray 内核不支持 vlessenc 或版本过旧，正在强制拉取最新内核..."
-        install_xray_if_needed --force
-        xray_cmd="/usr/local/bin/xray"
+    # --- 5) Shadowsocks 逻辑 ---
+    if [[ "$proto" == "5" ]]; then
+        local port; port=$(get_random_allowed_port "tcp")
+        read -rp "端口 (默认 $port, 输入0返回): " input_p
+        [[ "$input_p" == "0" ]] && return
+        port=${input_p:-$port}
         
-        seeds=$(get_vless_seed "$xray_cmd")
+        local method="aes-256-gcm"
+        local def_pass; def_pass=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+        read -rp "密码 (默认随机): " pass; pass=${pass:-$def_pass}
 
+        safe_json_edit "$CONFIG" \
+          '.inbounds += [{"type":"shadowsocks","tag":$tag,"listen":"::","listen_port":($port|tonumber),"method":$method,"password":$pass}]' \
+          --arg port "$port" --arg method "$method" --arg pass "$pass" --arg tag "$tag"
+        
+        safe_json_edit "$META" '. + {($tag): {type:"shadowsocks", port:$port, method:$method, password:$pass}}' \
+           --arg tag "$tag" --arg port "$port" --arg method "$method" --arg pass "$pass"
+
+        restart_xray "main_only"
+        local userinfo="${method}:${pass}"
+        local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
+        print_card "Shadowsocks 成功" "$tag" "端口: $port" "ss://${b64_creds}@${PUBLIC_HOST}:${port}#${tag}"
+    fi
+
+    # --- 2) VLESS-REALITY 逻辑 ---
+    if [[ "$proto" == "2" ]]; then
+        local port uuid server_name key_pair private_key public_key short_id
+        while true; do
+           safe_read port "请输入端口号 (留空随机, 输入0返回): "
+           [[ "$port" == "0" ]] && return
+           [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
+           check_nat_allow "$port" "tcp" && break || warn "端口 $port 不符合 NAT 限制"
+        done
+
+        local def_sni="www.microsoft.com"
+        [[ "$zh_country" == "美国" ]] && def_sni="www.microsoft.com"
+        [[ "$zh_country" == "香港" ]] && def_sni="www.hkex.com.hk"
+        [[ "$zh_country" == "日本" ]] && def_sni="www.nintendo.co.jp"
+
+        read -rp "伪装域名 (默认 $def_sni, 输入0返回): " input_sni
+        [[ "$input_sni" == "0" ]] && return
+        server_name="${input_sni:-$def_sni}"
+        
+        uuid=$(uuidgen)
+        local xray_cmd=$(_xray_bin)
+        extract_kv() { grep -iE "$1" | awk -F':' '{print $2}' | tr -d '[:space:]'; }
+        key_pair=$($xray_cmd x25519 2>/dev/null)
+        private_key=$(echo "$key_pair" | extract_kv 'private')
+        public_key=$(echo "$key_pair" | extract_kv 'public|password')
+        [[ -z "$public_key" ]] && public_key=$($xray_cmd x25519 -i "$private_key" 2>/dev/null | extract_kv 'public|password')
+        short_id=$(openssl rand -hex 4)
+
+        safe_json_edit "$CONFIG" \
+           '.inbounds += [{"type": "vless","tag": $tag,"listen": "0.0.0.0","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],"tls": {"enabled": true,"server_name": $server,"reality": {"enabled": true,"handshake": { "server": $server, "server_port": 443 },"private_key": $prikey,"short_id": [ $sid ]}}}]' \
+           --arg port "$port" --arg uuid "$uuid" --arg prikey "$private_key" --arg sid "$short_id" --arg server "$server_name" --arg tag "$tag"
+
+        safe_json_edit "$META" '. + {($tag): {pbk:$pbk, sid:$sid, sni:$sni, port:$port, fp:"chrome"}}' \
+           --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port"
+
+        restart_xray "main_only"
+        local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
+        print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
+    fi
+
+    # --- 7) VLESS-ENC 逻辑 ---
+    if [[ "$proto" == "7" ]]; then
+        local port uuid server_seed client_seed
+        while true; do
+           safe_read port "请输入端口号 (留空随机, 输入0返回): "
+           [[ "$port" == "0" ]] && return
+           [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
+           check_nat_allow "$port" "tcp" && break || warn "端口 $port 不符合 NAT 限制"
+        done
+
+        uuid=$(uuidgen)
+        local xray_cmd=$(_xray_bin)
+        say "正在生成 VLESS-ENC 原生密钥对..."
+
+        get_vless_seed_internal() {
+            local raw; raw=$($1 vlessenc 2>&1)
+            local s_seed c_seed
+            s_seed=$(echo "$raw" | grep -i 'decryption' | grep -ioE '(mlkem768|x25519)[a-zA-Z0-9_.-]+' | head -n 1)
+            c_seed=$(echo "$raw" | grep -i 'encryption' | grep -v -i 'decryption' | grep -ioE '(mlkem768|x25519)[a-zA-Z0-9_.-]+' | head -n 1)
+            [[ -n "$s_seed" && -n "$c_seed" ]] && echo "$s_seed $c_seed" || echo ""
+        }
+
+        local seeds; seeds=$(get_vless_seed_internal "$xray_cmd")
         if [[ -z "$seeds" ]]; then
-             err "致命错误：核心更新后仍无法生成密钥对，请检查网络。"
-             # 打印部分调试信息方便排错
-             $xray_cmd vlessenc 2>&1 | head -n 5
-             return 1
+            install_xray_if_needed --force
+            xray_cmd="/usr/local/bin/xray"
+            seeds=$(get_vless_seed_internal "$xray_cmd")
         fi
+        server_seed=$(echo "$seeds" | awk '{print $1}')
+        client_seed=$(echo "$seeds" | awk '{print $2}')
+
+        safe_json_edit "$CONFIG" \
+           '.inbounds += [{"type": "vless","tag": $tag,"listen": "0.0.0.0","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "" }],"server_seed": $s_seed, "client_seed": $c_seed}]' \
+           --arg port "$port" --arg uuid "$uuid" --arg s_seed "$server_seed" --arg c_seed "$client_seed" --arg tag "$tag"
+
+        safe_json_edit "$META" '. + {($tag): {type:"vless", port:$port, server_seed:$s_seed, client_seed:$c_seed}}' \
+           --arg tag "$tag" --arg port "$port" --arg s_seed "$server_seed" --arg c_seed "$client_seed"
+
+        restart_xray "main_only"
+        local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=${client_seed}&type=tcp&security=none#${tag}"
+        print_card "VLESS-ENC 成功" "$tag" "端口: $port" "$link"
     fi
-
-    # 从字符串中拆分开
-    server_seed=$(echo "$seeds" | awk '{print $1}')
-    client_seed=$(echo "$seeds" | awk '{print $2}')
-
-    # 写入 Config 和 Meta
-    safe_json_edit "$CONFIG" \
-       '.inbounds += [{"type": "vless","tag": $tag,"listen": "0.0.0.0","listen_port": ($port | tonumber),"users": [{ "uuid": $uuid, "flow": "" }],"server_seed": $s_seed, "client_seed": $c_seed}]' \
-       --arg port "$port" --arg uuid "$uuid" --arg s_seed "$server_seed" --arg c_seed "$client_seed" --arg tag "$tag"
-
-    safe_json_edit "$META" '. + {($tag): {type:"vless", port:$port, server_seed:$s_seed, client_seed:$c_seed}}' \
-       --arg tag "$tag" --arg port "$port" --arg s_seed "$server_seed" --arg c_seed "$client_seed"
-
-    if ! restart_xray "main_only"; then
-      err "Xray 重启失败：已回滚"
-      safe_json_edit "$CONFIG" '(.inbounds |= map(select(.tag != $tag)))' --arg tag "$tag" >/dev/null 2>&1 || true
-      safe_json_edit "$META" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-      return
-    fi
-    
-    # 构建链接时使用专属的 client_seed (即 encryption)
-    local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=${client_seed}&type=tcp&security=none#${tag}"
-    print_card "VLESS-ENC 成功" "$tag" "端口: $port\n客户端密钥: ${client_seed:0:15}..." "$link"
-  fi
 }
 
 
@@ -4282,12 +4305,43 @@ node_speed_limit_menu() {
     read -rp "按回车返回..." _
 }
 
-# 在 main_menu 之前执行
-if [[ ! -f "$IP_CACHE_FILE" ]]; then
-    # 同步探测一次，超时设为 2s
-    curl -s -4 --connect-timeout 2 https://api.ipify.org > "$IP_CACHE_FILE" 2>/dev/null &
+# ============= 启动前最后的自动化加固 =============
+
+# ============= 启动前最后的自动化加固 =============
+say "正在同步系统时间..."
+if command -v ntpdate >/dev/null 2>&1; then
+    ntpdate -u pool.ntp.org >/dev/null 2>&1
+else
+    # 核心修复：删掉前面的 local 关键字
+    remote_date=$(curl -sI https://www.google.com | grep -i '^date:' | cut -d' ' -f2-7)
+    [[ -n "$remote_date" ]] && date -s "$remote_date" >/dev/null 2>&1
 fi
 
+# 2. 强制路径对齐 (彻底解决 "open config.json: no such file" 报错)
+# 确保 systemd 指向的路径永远有效
+mkdir -p /usr/local/etc/xray /etc/xray
+ln -sf /etc/xray/xray_config.json /usr/local/etc/xray/config.json
+
+# 3. 异步 IP 探测 (V4/V6 双栈探测增强)
+if [[ ! -f "$IP_CACHE_FILE" ]]; then
+    (
+        curl -s -4 --connect-timeout 2 https://api.ipify.org > "$IP_CACHE_FILE" 2>/dev/null
+        curl -s -6 --connect-timeout 2 https://api64.ipify.org > "${IP_CACHE_FILE}_v6" 2>/dev/null
+    ) &
+fi
+
+# 4. 自动挂载守护进程 (无人值守模式)
+# 增加 crontab 命令存在性检查，防止在极简版系统报错
+if command -v crontab >/dev/null 2>&1; then
+    if ! crontab -l 2>/dev/null | grep -q "xray-singleton"; then
+        say "正在开启无人值守守护模式..."
+        install_watchdog_cron
+    fi
+fi
+
+# 5. 执行一次强制同步，确保 api 标签等闭环逻辑已写入
+# 这一步是预防你之前遇到的 outbound 缺失导致的 status=23 错误
+/usr/local/bin/xray-sync >/dev/null 2>&1 || true
 
 
 main_menu() {
@@ -4330,29 +4384,22 @@ main_menu() {
     esac
   done
 }
-# ============= 6. 极速启动逻辑 (脚本执行入口) =============
+
 
 setup_shortcuts() {
   local SCRIPT_PATH
-  # 1. 获取脚本的绝对路径
   SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null)"
-  
-  # 2. 如果获取失败（极少数情况），则使用当前执行命令时的路径
   [[ -z "$SCRIPT_PATH" ]] && SCRIPT_PATH="$PWD/$(basename "$0")"
 
   if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
 
-  # 3. 改进逻辑：先删除旧的（无论对错），再写入最新的
-  # 这样无论你脚本叫什么、放哪里，每次运行都会自动校准别名
+  # 自动同步别名
   sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
   echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
   echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
-  
-  # 只有在第一次设置或路径变动时才提示，避免每次运行都刷屏
-  # ok "快捷指令 'my' 已同步至最新路径: $SCRIPT_PATH"
 }
 
-# --- 2. 启动执行流程 ---
+# 启动执行流程
 setup_shortcuts
 
 # 环境基础检查
@@ -4364,8 +4411,12 @@ if [[ ! -x "/usr/local/bin/xray" ]] || [[ ! -f "$CONFIG" ]]; then
     install_xray_if_needed
 fi
 
-# 直接进入主菜单，不再进行 check_core_update，避免启动卡顿
+# 触发一次同步，确保配置文件路径和逻辑闭环生效
+/usr/local/bin/xray-sync >/dev/null 2>&1 || true
+
 update_ip_async
 load_nat_data
 auto_optimize_cpu
+
+# 最终进入主菜单
 main_menu

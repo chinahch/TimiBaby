@@ -63,20 +63,22 @@ fix_environment_lowmem() {
     fi
 }
 
-# 自动化增强：多重时间同步逻辑
-auto_sync_time() {
-    say "正在执行智能时间同步..."
-    # 尝试标准 NTP
-    ntpdate -u pool.ntp.org >/dev/null 2>&1
-    
-    # 保底方案：通过 HTTP Header 获取时间 (不受系统架构限制)
-    remote_date=$(curl -sI https://www.google.com | grep -i '^date:' | cut -d' ' -f2-7)
-    if [[ -n "$remote_date" ]]; then
-        date -s "$remote_date" >/dev/null 2>&1
-        ok "时间同步成功 (HTTP 来源)"
-    fi
-}
+# 在脚本顶部定义变量
+SYNC_DONE=0
 
+auto_sync_time() {
+    # 如果本次运行已同步过，直接跳过
+    [[ "$SYNC_DONE" == "1" ]] && return
+    
+    say "正在同步系统时间..."
+    if command -v ntpdate >/dev/null 2>&1; then
+        ntpdate -u pool.ntp.org >/dev/null 2>&1
+    else
+        local remote_date=$(curl -sI https://www.google.com | grep -i '^date:' | cut -d' ' -f2-7)
+        [[ -n "$remote_date" ]] && date -s "$remote_date" >/dev/null 2>&1
+    fi
+    SYNC_DONE=1
+}
 
 fix_environment_lowmem # 立即执行
 
@@ -121,6 +123,16 @@ warn() { echo -e "${C_YELLOW}⚡ $*${C_RESET}" >&2; }
 log_msg() {
   local level="$1" msg="$2"
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg" >> "$LOG_FILE"
+}
+
+# 智能格式化链接中的主机地址 (V6 加方括号)
+format_host_for_link() {
+    local host="$1"
+    if [[ "$host" =~ : ]]; then
+        echo "[$host]"
+    else
+        echo "$host"
+    fi
 }
 
 
@@ -2183,7 +2195,8 @@ add_node() {
            --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port"
 
         restart_xray "main_only"
-        local link="vless://${uuid}@${PUBLIC_HOST}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
+        local host_link_disp=$(format_host_for_link "$PUBLIC_HOST")
+        local link="vless://${uuid}@${host_link_disp}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
         print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
     fi
 
@@ -2653,17 +2666,24 @@ view_nodes_menu() {
       print_card "SOCKS5 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n用户: ${user}\n密码: ${pass}" "$final_link"
 
   elif [[ "${t_type,,}" == "vless" ]]; then
+      # 核心修复：必须先从文件读取 meta 数据
+      local meta_json=$(cat "$META" 2>/dev/null || echo "{}")
       local uuid=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG" 2>/dev/null)
       local c_seed=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].client_seed // empty')
       
+      # 格式化主机地址 (IPv6 自动加方括号)
+      local host_disp=$(format_host_for_link "$t_ip")
+
       if [[ -n "$c_seed" && "$c_seed" != "null" && "$c_seed" != "" ]]; then
-          final_link="vless://${uuid}@${t_ip}:${t_port}?encryption=${c_seed}&type=tcp&security=none#${target_tag}"
+          final_link="vless://${uuid}@${host_disp}:${t_port}?encryption=${c_seed}&type=tcp&security=none#${target_tag}"
           print_card "VLESS-ENC 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\n客户端密钥: ${c_seed:0:15}..." "$final_link"
       else
           local pbk=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')
           local sid=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')
           local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')
-          final_link="vless://${uuid}@${t_ip}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
+          
+          # 构造带方括号的 V6 链接
+          final_link="vless://${uuid}@${host_disp}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
           print_card "VLESS-REALITY 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\nSNI: ${sni}\nPublic Key: ${pbk}\nShort ID: ${sid}" "$final_link"
       fi
 

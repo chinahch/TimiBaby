@@ -101,17 +101,85 @@ _ip_mode_desc() {
 }
 
 _get_global_mode() {
-  local pref="follow_global"
+  local pref="off"
 
   if [[ -r /etc/xray/ip_pref ]]; then
-    IFS= read -r pref < /etc/xray/ip_pref || pref="follow_global"
-    pref="${pref//$'\r'/}"
-    pref="${pref// /}"
+    IFS= read -r pref < /etc/xray/ip_pref || pref="off"
   fi
 
-  [[ -z "$pref" || "$pref" == "(未设置)" ]] && pref="follow_global"
+  pref="$(_sanitize_ip_pref "$pref")"
   echo "$pref"
 }
+
+_sanitize_ip_pref() {
+  local pref="${1:-}"
+  pref="${pref//$'\r'/}"
+  pref="${pref// /}"
+  case "$pref" in
+    ""|"(未设置)"|"follow_global"|"follow") echo "off" ;;
+    *) echo "$pref" ;;
+  esac
+}
+
+_pref_is_v6_family() {
+  case "$(_sanitize_ip_pref "${1:-}")" in
+    v6pref|v6only|v6) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_pref_is_v4_family() {
+  case "$(_sanitize_ip_pref "${1:-}")" in
+    v4pref|v4only|v4) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_pref_domain_strategy() {
+  case "$(_sanitize_ip_pref "${1:-}")" in
+    v6pref|v6) echo "UseIPv6v4" ;;
+    v4pref|v4) echo "UseIPv4v6" ;;
+    v6only)    echo "UseIPv6" ;;
+    v4only)    echo "UseIPv4" ;;
+    off)       echo "AsIs" ;;
+    *)         echo "AsIs" ;;
+  esac
+}
+
+_read_global_lock_ip_by_family() {
+  local family="$1"
+  local file=""
+  case "$family" in
+    v4) file="/etc/xray/global_egress_ip_v4" ;;
+    v6) file="/etc/xray/global_egress_ip_v6" ;;
+    *) echo ""; return 0 ;;
+  esac
+
+  if [[ -r "$file" ]]; then
+    tr -d '\r\n ' < "$file" 2>/dev/null || true
+  else
+    echo ""
+  fi
+}
+
+_read_global_lock_ip_for_pref() {
+  local pref="$(_sanitize_ip_pref "${1:-$(_get_global_mode)}")"
+  if _pref_is_v6_family "$pref"; then
+    _read_global_lock_ip_by_family v6
+  elif _pref_is_v4_family "$pref"; then
+    _read_global_lock_ip_by_family v4
+  else
+    echo ""
+  fi
+}
+
+_get_global_egress_pref_and_lock() {
+  local pref="$(_get_global_mode)"
+  local ds="$(_pref_domain_strategy "$pref")"
+  local lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
+  printf '%s\t%s\t%s\n' "$pref" "$ds" "$lock_ip"
+}
+
 
 
 # ============= 1. 核心工具函数 (UI优化) =============
@@ -294,46 +362,30 @@ update_ip_async() {
         ip6="${ip6//$'\n'/}"
         [[ -n "$ip6" ]] && printf '%s' "$ip6" > "${IP_CACHE_FILE}_v6"
 
-        pref="v4"
-        lock_ip=""
+        pref="$(_get_global_mode)"
+        lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
 
-        if [[ -r /etc/xray/ip_pref ]]; then
-            IFS= read -r pref < /etc/xray/ip_pref || pref="v4"
-            pref="${pref//$'\r'/}"
-            pref="${pref// /}"
+        if [[ -z "$lock_ip" ]]; then
+            rm -f "${IP_CACHE_FILE}_xray" "${IP_CACHE_FILE}_xray_status" 2>/dev/null || true
+            rm -f "$lock"
+            exit 0
         fi
 
-        if [[ "$pref" == "v6" ]]; then
-            if [[ -r /etc/xray/global_egress_ip_v6 ]]; then
-                IFS= read -r lock_ip < /etc/xray/global_egress_ip_v6 || lock_ip=""
-                lock_ip="${lock_ip//$'\r'/}"
-                lock_ip="${lock_ip// /}"
-            fi
-        elif [[ "$pref" == "v4" ]]; then
-            if [[ -r /etc/xray/global_egress_ip_v4 ]]; then
-                IFS= read -r lock_ip < /etc/xray/global_egress_ip_v4 || lock_ip=""
-                lock_ip="${lock_ip//$'\r'/}"
-                lock_ip="${lock_ip// /}"
-            fi
+        if _pref_is_v6_family "$pref"; then
+            xray_pub="$(curl -s -6 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null)"
+        else
+            xray_pub="$(curl -s -4 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null)"
         fi
 
-        if [[ -n "$lock_ip" ]]; then
-            if [[ "$pref" == "v6" ]]; then
-                xray_pub="$(curl -s -6 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null)"
-            else
-                xray_pub="$(curl -s -4 --interface "$lock_ip" --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null)"
-            fi
+        xray_pub="${xray_pub//$'\r'/}"
+        xray_pub="${xray_pub//$'\n'/}"
 
-            xray_pub="${xray_pub//$'\r'/}"
-            xray_pub="${xray_pub//$'\n'/}"
-
-            if [[ -n "$xray_pub" ]]; then
-                printf '%s' "$xray_pub" > "${IP_CACHE_FILE}_xray"
-                printf '%s' "OK" > "${IP_CACHE_FILE}_xray_status"
-            else
-                printf '%s' "FAILED" > "${IP_CACHE_FILE}_xray_status"
-                printf '%s' "N/A" > "${IP_CACHE_FILE}_xray"
-            fi
+        if [[ -n "$xray_pub" ]]; then
+            printf '%s' "$xray_pub" > "${IP_CACHE_FILE}_xray"
+            printf '%s' "OK" > "${IP_CACHE_FILE}_xray_status"
+        else
+            printf '%s' "FAILED" > "${IP_CACHE_FILE}_xray_status"
+            printf '%s' "N/A" > "${IP_CACHE_FILE}_xray"
         fi
 
         rm -f "$lock"
@@ -341,6 +393,7 @@ update_ip_async() {
 
     echo $! > "$lock"
 }
+
 
 # 获取当前服务器的“入口”公网 IP (适配 NAT 环境)
 get_public_ipv4_ensure() {
@@ -712,13 +765,17 @@ get_sys_status() {
     v4_delay=${v4_delay:-"${C_GRAY}无${C_RESET}"}; v6_delay=${v6_delay:-"${C_GRAY}无${C_RESET}"}
 
     # 5. 出口逻辑渲染
-    local pref=$(cat /etc/xray/ip_pref 2>/dev/null | tr -d "\r\n " || echo "v4")
-    local lock_ip=""; [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\n\r') || lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\n\r')
+    local pref="$(_get_global_mode)"
+    local lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
     local xray_egress="跟随系统 (默认)"
-    if [[ -n "$lock_ip" ]]; then
-        local real_pub=$(cat "${IP_CACHE_FILE}_xray" 2>/dev/null | tr -d '\n\r' || echo "获取中...")
+    if [[ "$pref" != "off" && -n "$lock_ip" ]]; then
+        local real_pub
+        real_pub=$(cat "${IP_CACHE_FILE}_xray" 2>/dev/null | tr -d '\n\r')
+        [[ -z "$real_pub" ]] && real_pub="获取中..."
         local cc="??"; [[ "$real_pub" != "获取中..." && "$real_pub" != "N/A" ]] && cc=$(get_ip_country "$real_pub")
         xray_egress="${C_GREEN}${real_pub}${C_RESET} ${C_PURPLE}[${cc}]${C_RESET}"
+    elif [[ "$pref" != "off" ]]; then
+        xray_egress="${C_GRAY}$(_ip_mode_desc "$pref")${C_RESET} ${C_PURPLE}(未锁定本机出口IP)${C_RESET}"
     fi
 
     # 6. 打印对齐 UI
@@ -732,7 +789,6 @@ get_sys_status() {
     echo -e "${C_BLUE}│${C_RESET} Xray 出口: ${xray_egress}"
     echo -e "${C_BLUE}└──────────────────────────────────────────────────────────────┘${C_RESET}"
 }
-
 
 # ============= 2. 基础依赖与 Xray 管理 (保留原逻辑) =============
 
@@ -775,184 +831,10 @@ _translate_model_to_xray() {
   local log_path="${LOG_FILE:-/var/log/xray.log}"
 
   mkdir -p "$(dirname "$out_cfg")" "$(dirname "$log_path")" >/dev/null 2>&1 || true
+  install_singleton_wrapper >/dev/null 2>&1 || true
 
-  # === 全局 IP 偏好 -> freedom.domainStrategy ===
-  local pref ds
-  pref="$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || true)"
-  case "$pref" in
-    off)       ds="AsIs"      ;; 
-    v6pref|v6) ds="UseIPv6v4" ;; 
-    v4pref|v4) ds="UseIPv4v6" ;; 
-    v6only)    ds="UseIPv6" ;; 
-    v4only)    ds="UseIPv4" ;; 
-    *)         ds="AsIs"      ;; 
-  esac
-
-  local meta_json="{}"
-  if [[ -s "$META" ]]; then
-    meta_json="$(cat "$META" 2>/dev/null || echo '{}')"
-  fi
-
-  local fvd_json="[]"
-  local need_fvd=0
-  if [[ "$pref" == "v6pref" || "$pref" == "v6" ]]; then
-    need_fvd=1
-  else
-    if [[ -s "$META" ]] && jq -e 'to_entries | any(.value.ip_mode=="v6pref")' "$META" >/dev/null 2>&1; then
-      need_fvd=1
-    fi
-  fi
-
-  if [[ "$need_fvd" == "1" ]]; then
-    mkdir -p /etc/xray >/dev/null 2>&1 || true
-    if [[ ! -s /etc/xray/force_v4_domains.txt ]]; then
-      cat >/etc/xray/force_v4_domains.txt <<'EOF'
-discord.com
-x.com
-openai.com
-EOF
-    fi
-    fvd_json="$(
-      awk '
-        {gsub("\r","");}
-        NF && $0 !~ /^[[:space:]]*#/ {print "domain:"$0}
-      ' /etc/xray/force_v4_domains.txt \
-      | jq -Rsc 'split("\n") | map(select(length>0))'
-    )"
-  fi
-
-  jq --arg log "$log_path" \
-     --arg ds "$ds" \
-     --arg pref "$pref" \
-     --argjson fvd "$fvd_json" \
-     --argjson meta "$meta_json" '
-    def _listen: (.listen // "0.0.0.0");
-    def _port: ((.listen_port // .port // 0) | tonumber);
-
-    # ---------------- Inbounds ----------------
-    def mk_inbound:
-      if .type == "socks" then
-        {
-          tag: (.tag // "socks-in"), listen: _listen, port: _port, protocol: "socks",
-          settings: {
-            auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end),
-            accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true
-          },
-          sniffing: { enabled: true, destOverride: ["http", "tls"] }
-        }
-      elif .type == "vless" then
-        if (.server_seed != null and .server_seed != "") then
-          {
-            tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
-            settings: {
-              clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})),
-              decryption: .server_seed
-            },
-            streamSettings: { network: "tcp", security: "none" },
-            sniffing: { enabled: true, destOverride: ["http", "tls"] }
-          }
-        else
-          {
-            tag: (.tag // "vless-in"), listen: _listen, port: _port, protocol: "vless",
-            settings: {
-              clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})),
-              decryption: "none"
-            },
-            streamSettings: {
-              network: "tcp", security: "reality",
-              realitySettings: {
-                show: false,
-                dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring) + ":" + (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)),
-                xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
-                privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // [])
-              }
-            },
-            sniffing: { enabled: true, destOverride: ["http", "tls"] }
-          }
-        end
-      else empty end;
-
-    # ---------------- Outbounds ----------------
-    def mk_outbound:
-      if .type == "direct" then
-        ({ protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
-         + (if ((.sendThrough // .send_through // "") | length) > 0 then { sendThrough: (.sendThrough // .send_through) } else {} end))
-      elif .type == "socks" then
-        { protocol: "socks", tag: (.tag // "socks-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: (if ((.username // "") != "" and (.password // "") != "") then [{user: .username, pass: .password}] else [] end) }] } }
-      elif .type == "shadowsocks" then
-        { protocol: "shadowsocks", tag: (.tag // "ss-out"), settings: { servers: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), method: (.method // "aes-256-gcm"), password: (.password // "") }] } }
-      elif .type == "vless" then
-        if (.client_seed != null and .client_seed != "") then
-          {
-            protocol: "vless", tag: (.tag // "vless-out"),
-            settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), encryption: .client_seed, flow: (.flow // empty) }] }] },
-            streamSettings: { network: (.transport.type // .network // "tcp"), security: "none" }
-          }
-        else
-          {
-            protocol: "vless", tag: (.tag // "vless-out"),
-            settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), encryption: "none", flow: (.flow // empty) }] }] },
-            streamSettings: {
-              network: (.transport.type // .network // "tcp"),
-              security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
-              realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then { show: false, fingerprint: (.tls.utls.fingerprint // .fp // "chrome"), serverName: (.tls.server_name // .sni // "www.microsoft.com"), publicKey: (.tls.reality.public_key // .pbk // ""), shortId: (if ((.tls.reality.short_id // []) | length) > 0 then (.tls.reality.short_id[0] | tostring) else (.sid // "") end), spiderX: "/" } else empty end),
-              tcpSettings: (if ((.transport.type // .network // "tcp") == "tcp") then { header: { type: (.transport.header_type // .headerType // "none") } } else empty end)
-            }
-          }
-        end
-      elif .type == "vmess" then
-        { protocol: "vmess", tag: (.tag // "vmess-out"), settings: { vnext: [{ address: (.server // ""), port: ((.server_port // 0) | tonumber), users: [{ id: (.uuid // .id // ""), security: "auto", alterId: 0 }] }] }, streamSettings: { network: (.transport.type // .network // "tcp"), security: (if (.tls.enabled == true or .tls != null) then "tls" else "none" end), tlsSettings: (if (.tls.enabled == true or .tls != null) then { serverName: (.tls.server_name // .sni // ""), allowInsecure: true } else empty end), wsSettings: (if (.transport.type == "ws") then { path: (.transport.ws_settings.path // ""), headers: { Host: (.transport.ws_settings.headers.Host // "") } } else empty end) } }
-      else
-        { protocol: "freedom", tag: (.tag // "direct"), settings: { domainStrategy: $ds } }
-      end;
-
-    def _mode_for(t): ($meta[t].ip_mode // empty);
-    def _direct_tag(m): if m=="v6pref" then "direct-v6pref" elif m=="v4pref" then "direct-v4pref" elif m=="v6only" then "direct-v6only" elif m=="v4only" then "direct-v4only" else "direct" end;
-    def _map_outbound(ob; inb): if ob!="direct" then ob elif (inb|length)==1 then _direct_tag(_mode_for(inb[0])) else ob end;
-
-    # ---------------- Routing rules ----------------
-    def mk_rule:
-      ( (if (.inbound | type) == "array" then .inbound else [(.inbound // empty)] end) as $inb
-        | ( { type: "field", outboundTag: _map_outbound((.outbound // "direct"); $inb), inboundTag: $inb }
-          + (if (.domain? != null) then { domain: (if (.domain|type)=="array" then .domain else [(.domain|tostring)] end) } else {} end)
-          + (if (.ip? != null) then { ip: (if (.ip|type)=="array" then .ip else [(.ip|tostring)] end) } else {} end)
-          + (if (.port? != null) then { port: (if (.port|type)=="array" then .port else [(.port|tostring)] end) } else {} end)
-          + (if (.protocol? != null) then { protocol: (if (.protocol|type)=="array" then .protocol else [(.protocol|tostring)] end) } else {} end)
-        )
-      );
-
-    . as $root
-    | (
-        {
-          log: { loglevel: "warning", access: $log, error: $log },
-          inbounds: ((($root.inbounds // []) | map(mk_inbound)) // []),
-          outbounds: ( (($root.outbounds // []) | map(mk_outbound))
-              | (if (map(select(.tag=="direct")) | length) == 0 then . + [{protocol:"freedom", tag:"direct", settings:{domainStrategy:$ds}}] else . end)
-              | (if (map(select(.tag=="block")) | length) == 0 then . + [{protocol:"blackhole", tag:"block", settings:{}}] else . end)
-              | (if (map(select(.tag=="direct-v6pref")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v6pref", settings:{domainStrategy:"UseIPv6v4"}}] else . end)
-              | (if (map(select(.tag=="direct-v4pref")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v4pref", settings:{domainStrategy:"UseIPv4v6"}}] else . end)
-              | (if (map(select(.tag=="direct-v6only")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v6only", settings:{domainStrategy:"UseIPv6"}}] else . end)
-              | (if (map(select(.tag=="direct-v4only")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v4only", settings:{domainStrategy:"UseIPv4"}}] else . end)
-              | (if (map(select(.tag=="direct-v4")) | length) == 0 then . + [{protocol:"freedom", tag:"direct-v4", settings:{domainStrategy:"UseIPv4"}}] else . end)
-            ),
-          routing: {
-            domainStrategy: $ds,
-            rules: ( (($root.route.rules // []) | map(mk_rule))
-              + ( ($root.inbounds // []) | map(.tag // empty) | map(select(length>0)) | unique | map((.) as $t | (_mode_for($t)) as $m | if $m=="v6only" then {type:"field", inboundTag:[$t], ip:["0.0.0.0/0"], outboundTag:"block"} elif $m=="v4only" then {type:"field", inboundTag:[$t], ip:["::/0"], outboundTag:"block"} else empty end) | map(select(. != null)) )
-              + ( ($root.inbounds // []) | map(.tag // empty) | map(select(length>0)) | unique | map({type:"field", inboundTag:[.], outboundTag:_direct_tag(_mode_for(.))}) )
-            )
-          }
-        }
-        | if (($fvd|type=="array") and (($fvd|length) > 0)) then
-            .routing.rules = ( (if ($pref=="v6pref" or $pref=="v6") then [ {type:"field", domain:$fvd, outboundTag:"direct-v4"} ] else [] end)
-              + ( ($meta | to_entries | map(select(.value.ip_mode=="v6pref")) | map({type:"field", inboundTag:[.key], domain:$fvd, outboundTag:"direct-v4"}) ) )
-              + (.routing.rules // [])
-            )
-          else . end
-      )
-  ' "$model_cfg" > "$out_cfg"
+  MODEL_CFG="$model_cfg"   META_CFG="$META"   OUT_CFG="$out_cfg"   LOG_PATH="$log_path"   XRAY_BASE_DIR="${XRAY_BASE_DIR:-/etc/xray}"   /usr/local/bin/xray-sync
 }
-
 
 _check_model_config() {
   local model_cfg="$1"
@@ -1570,124 +1452,282 @@ install_singleton_wrapper() {
 set -euo pipefail
 umask 022
 
-XRAY_BASE_DIR="/etc/xray"
-MODEL_CFG="${XRAY_BASE_DIR}/config.json"
-META_CFG="${XRAY_BASE_DIR}/nodes_meta.json"
-OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
-LOG_PATH="/var/log/xray.log"
+XRAY_BASE_DIR="${XRAY_BASE_DIR:-/etc/xray}"
+MODEL_CFG="${MODEL_CFG:-${XRAY_BASE_DIR}/config.json}"
+META_CFG="${META_CFG:-${XRAY_BASE_DIR}/nodes_meta.json}"
+OUT_CFG="${OUT_CFG:-${XRAY_BASE_DIR}/xray_config.json}"
+LOG_PATH="${LOG_PATH:-/var/log/xray.log}"
+IP_PREF_FILE="${IP_PREF_FILE:-${XRAY_BASE_DIR}/ip_pref}"
+LOCK_V4_FILE="${LOCK_V4_FILE:-${XRAY_BASE_DIR}/global_egress_ip_v4}"
+LOCK_V6_FILE="${LOCK_V6_FILE:-${XRAY_BASE_DIR}/global_egress_ip_v6}"
+FORCE_V4_FILE="${FORCE_V4_FILE:-${XRAY_BASE_DIR}/force_v4_domains.txt}"
 
-# 获取全局 IP 偏好
-G_PREF="$(cat "${XRAY_BASE_DIR}/ip_pref" 2>/dev/null | tr -d '\r\n ' || true)"
-[[ -z "$G_PREF" || "$G_PREF" == "follow_global" || "$G_PREF" == "off" ]] && G_PREF="v4pref"
+mkdir -p "$XRAY_BASE_DIR" "$(dirname "$OUT_CFG")" "$(dirname "$LOG_PATH")"
+[[ -s "$MODEL_CFG" ]] || printf '%s\n' '{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}' > "$MODEL_CFG"
+[[ -s "$META_CFG" ]] || printf '%s\n' '{}' > "$META_CFG"
 
+sanitize_pref() {
+  local p="${1:-}"
+  p="${p//$'\r'/}"
+  p="${p// /}"
+  case "$p" in
+    ""|"(未设置)"|"follow_global"|"follow") echo "off" ;;
+    *) echo "$p" ;;
+  esac
+}
+
+G_PREF="$(sanitize_pref "$(cat "$IP_PREF_FILE" 2>/dev/null || true)")"
 case "${G_PREF}" in
   v6pref|v6) DS="UseIPv6v4" ;;
   v4pref|v4) DS="UseIPv4v6" ;;
-  v6only)    DS="ForceIPv6" ;;
-  v4only)    DS="ForceIPv4" ;;
-  *)         DS="UseIPv4v6" ;;
+  v6only)    DS="UseIPv6" ;;
+  v4only)    DS="UseIPv4" ;;
+  off)       DS="AsIs" ;;
+  *)         DS="AsIs" ;;
 esac
 
-# 使用 jq 构建完整配置，强制闭合逻辑漏洞
-jq --arg log "$LOG_PATH" --arg ds "$DS" --slurpfile meta "$META_CFG" '
+read_lock_file() {
+  local file="$1"
+  if [[ -r "$file" ]]; then
+    tr -d '
+ ' < "$file" 2>/dev/null || true
+  else
+    echo ""
+  fi
+}
+
+G_LOCK_V4="$(read_lock_file "$LOCK_V4_FILE")"
+G_LOCK_V6="$(read_lock_file "$LOCK_V6_FILE")"
+
+NEED_FVD=0
+if [[ "$G_PREF" == "v6pref" || "$G_PREF" == "v6" ]]; then
+  NEED_FVD=1
+elif jq -e 'to_entries | any(.value.ip_mode=="v6pref")' "$META_CFG" >/dev/null 2>&1; then
+  NEED_FVD=1
+fi
+
+FVD_JSON="[]"
+if [[ "$NEED_FVD" == "1" ]]; then
+  if [[ ! -s "$FORCE_V4_FILE" ]]; then
+    cat > "$FORCE_V4_FILE" <<'EOF2'
+discord.com
+x.com
+openai.com
+EOF2
+  fi
+  FVD_JSON="$(
+    awk '
+      {gsub("\r","");}
+      NF && $0 !~ /^[[:space:]]*#/ {print "domain:"$0}
+    ' "$FORCE_V4_FILE" | jq -Rsc 'split("\n") | map(select(length>0))'
+  )"
+fi
+
+jq --arg log "$LOG_PATH" \
+   --arg ds "$DS" \
+   --arg pref "$G_PREF" \
+   --arg gv4 "$G_LOCK_V4" \
+   --arg gv6 "$G_LOCK_V6" \
+   --argjson fvd "$FVD_JSON" \
+   --slurpfile meta "$META_CFG" '
   def _listen: (.listen // "0.0.0.0");
   def _port: ((.listen_port // .port // 0) | tonumber);
-  
+  def _bind(ip): if (ip|type)=="string" and (ip|length)>0 then {sendThrough: ip} else {} end;
+  def _freedom(tag; strategy; bindip): { protocol:"freedom", tag: tag, settings:{ domainStrategy: strategy } } + _bind(bindip);
+
+  def _mode_for_raw(t; m): (m[t].ip_mode // "");
+  def _mode_tag(m):
+    if m == "v6pref" then "DIRECT-V6PREF"
+    elif m == "v4pref" then "DIRECT-V4PREF"
+    elif m == "v6only" then "DIRECT-V6ONLY"
+    elif m == "v4only" then "DIRECT-V4ONLY"
+    else "DIRECT" end;
+  def _map_outbound(ob; inb_raw; m):
+    (ob // "DIRECT" | ascii_upcase) as $obu
+    | if $obu != "DIRECT" then $obu
+      elif (inb_raw|length) == 1 then _mode_tag(_mode_for_raw(inb_raw[0]; m))
+      else "DIRECT"
+      end;
+
   def mk_outbound:
     if .type == "direct" then
-      { protocol: "freedom", tag: (.tag // "DIRECT" | ascii_upcase), settings: { domainStrategy: $ds } }
-      + (if ((.sendThrough // .send_through // "") | length) > 0 then { sendThrough: (.sendThrough // .send_through) } else {} end)
+      _freedom((.tag // "DIRECT" | ascii_upcase); $ds; (.sendThrough // .send_through // ""))
     elif .type == "socks" then
-      { protocol: "socks", tag: (.tag | ascii_upcase), settings: { servers: [{ address: .server, port: (.server_port|tonumber), users: (if .username != null and .username != "" then [{user:.username, pass:.password}] else [] end) }] } }
+      { protocol:"socks", tag:(.tag | ascii_upcase),
+        settings:{ servers:[{ address:.server, port:(.server_port|tonumber),
+          users:(if (.username // "") != "" and (.password // "") != "" then [{user:.username, pass:.password}] else [] end)
+        }] } }
+    elif .type == "http" then
+      { protocol:"http", tag:(.tag | ascii_upcase),
+        settings:{ servers:[{ address:.server, port:(.server_port|tonumber),
+          users:(if (.username // "") != "" and (.password // "") != "" then [{user:.username, pass:.password}] else [] end)
+        }] } }
     elif .type == "shadowsocks" then
-      { protocol: "shadowsocks", tag: (.tag | ascii_upcase), settings: { servers: [{ address: .server, port: (.server_port|tonumber), method: (.method // "aes-256-gcm"), password: .password }] } }
+      { protocol:"shadowsocks", tag:(.tag | ascii_upcase),
+        settings:{ servers:[{ address:.server, port:(.server_port|tonumber), method:(.method // "aes-256-gcm"), password:.password }] } }
     elif .type == "vless" then
       if (.client_seed != null and .client_seed != "") then
-        { protocol: "vless", tag: (.tag | ascii_upcase), settings: { vnext: [{ address: .server, port: (.server_port|tonumber), users: [{ id: (.uuid // .id), encryption: .client_seed, flow: (.flow // "") }] }] }, streamSettings: { network: "tcp", security: "none" } }
+        { protocol:"vless", tag:(.tag | ascii_upcase),
+          settings:{ vnext:[{ address:.server, port:(.server_port|tonumber), users:[{ id:(.uuid // .id), encryption:.client_seed, flow:(.flow // "") }] }] },
+          streamSettings:{ network:"tcp", security:"none" } }
       else
-        { protocol: "vless", tag: (.tag | ascii_upcase), settings: { vnext: [{ address: .server, port: (.server_port|tonumber), users: [{ id: (.uuid // .id), encryption: "none", flow: (.flow // "") }] }] }, streamSettings: (.streamSettings // {}) }
+        { protocol:"vless", tag:(.tag | ascii_upcase),
+          settings:{ vnext:[{ address:.server, port:(.server_port|tonumber), users:[{ id:(.uuid // .id), encryption:"none", flow:(.flow // "") }] }] },
+          streamSettings: (.streamSettings // {
+            network: (.transport.type // .network // "tcp"),
+            security: (if ((.tls.reality.public_key // .pbk // "") != "") then "reality" else "none" end),
+            realitySettings: (if ((.tls.reality.public_key // .pbk // "") != "") then {
+              show: false,
+              fingerprint: (.tls.utls.fingerprint // .fp // "chrome"),
+              serverName: (.tls.server_name // .sni // "www.microsoft.com"),
+              publicKey: (.tls.reality.public_key // .pbk // ""),
+              shortId: (if ((.tls.reality.short_id // []) | length) > 0 then (.tls.reality.short_id[0] | tostring) else (.sid // "") end),
+              spiderX: "/"
+            } else empty end),
+            tcpSettings: (if ((.transport.type // .network // "tcp") == "tcp") then { header: { type: (.transport.header_type // .headerType // "none") } } else empty end)
+          })
+        }
       end
     elif .type == "vmess" then
-      { protocol: "vmess", tag: (.tag | ascii_upcase), settings: { vnext: [{ address: .server, port: (.server_port|tonumber), users: [{ id: (.uuid // .id), security: "auto" }] }] }, streamSettings: (.streamSettings // {}) }
+      { protocol:"vmess", tag:(.tag | ascii_upcase),
+        settings:{ vnext:[{ address:.server, port:(.server_port|tonumber), users:[{ id:(.uuid // .id), security:"auto", alterId:0 }] }] },
+        streamSettings: (.streamSettings // {
+          network: (.transport.type // .network // "tcp"),
+          security: (if (.tls.enabled == true or .tls != null) then "tls" else "none" end),
+          tlsSettings: (if (.tls.enabled == true or .tls != null) then { serverName: (.tls.server_name // .sni // ""), allowInsecure: true } else empty end),
+          wsSettings: (if (.transport.type == "ws") then { path: (.transport.ws_settings.path // ""), headers: { Host: (.transport.ws_settings.headers.Host // "") } } else empty end)
+        }) }
     else
-      { protocol: "freedom", tag: (.tag // "DIRECT" | ascii_upcase), settings: { domainStrategy: $ds } }
+      _freedom((.tag // "DIRECT" | ascii_upcase); $ds; "")
     end;
-
-  def _mode_tag(m):
-    if m == "v6pref" then "DIRECT-V6PREF" elif m == "v4pref" then "DIRECT-V4PREF" elif m == "v6only" then "DIRECT-V6ONLY" elif m == "v4only" then "DIRECT-V4ONLY" else "DIRECT" end;
-
-  def mk_rule:
-    (if (.inbound | type) == "array" then .inbound else [(.inbound // empty)] end | map(ascii_upcase)) as $inb
-    | { type: "field", outboundTag: (.outbound // "DIRECT" | ascii_upcase), inboundTag: $inb }
-      + (if (.domain? != null) then { domain: (if (.domain|type)=="array" then .domain else [.domain] end) } else {} end)
-      + (if (.ip? != null) then { ip: (if (.ip|type)=="array" then .ip else [.ip] end) } else {} end);
 
   def mk_inbound:
     if .type == "socks" then
-      { tag: (.tag // "SOCKS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "socks", settings: { auth: (if ((.users // []) | length) > 0 then "password" else "noauth" end), accounts: ((.users // []) | map({user: .username, pass: .password})), udp: true }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
+      { tag:(.tag // "SOCKS-IN" | ascii_upcase), listen:_listen, port:_port, protocol:"socks",
+        settings:{ auth:(if ((.users // [])|length) > 0 then "password" else "noauth" end), accounts:((.users // []) | map({user:.username, pass:.password})), udp:true },
+        sniffing:{ enabled:true, destOverride:["http","tls"] } }
     elif .type == "vless" then
       if (.server_seed != null and .server_seed != "") then
-        { tag: (.tag // "VLESS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "vless", settings: { clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})), decryption: .server_seed }, streamSettings: { network: "tcp", security: "none" }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
+        { tag:(.tag // "VLESS-IN" | ascii_upcase), listen:_listen, port:_port, protocol:"vless",
+          settings:{ clients:((.users // []) | map({id:(.uuid // .id // ""), flow:(.flow // empty)})), decryption:.server_seed },
+          streamSettings:{ network:"tcp", security:"none" },
+          sniffing:{ enabled:true, destOverride:["http","tls"] } }
       else
-        { tag: (.tag // "VLESS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "vless", settings: { clients: ((.users // []) | map({id: (.uuid // .id // ""), flow: (.flow // empty)})), decryption: "none" }, streamSettings: { network: "tcp", security: "reality", realitySettings: { show: false, dest: (((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com") | tostring) + ":" + (((.tls.reality.handshake.server_port // 443) | tonumber) | tostring)), xver: 0, serverNames: [(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")], privateKey: (.tls.reality.private_key // ""), shortIds: (.tls.reality.short_id // []) } }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
+        { tag:(.tag // "VLESS-IN" | ascii_upcase), listen:_listen, port:_port, protocol:"vless",
+          settings:{ clients:((.users // []) | map({id:(.uuid // .id // ""), flow:(.flow // empty)})), decryption:"none" },
+          streamSettings:{ network:"tcp", security:"reality",
+            realitySettings:{ show:false, dest:(((.tls.reality.handshake.server // .tls.server_name // "www.microsoft.com")|tostring) + ":" + (((.tls.reality.handshake.server_port // 443)|tonumber)|tostring)),
+              xver:0, serverNames:[(.tls.server_name // .tls.reality.handshake.server // "www.microsoft.com")],
+              privateKey:(.tls.reality.private_key // ""), shortIds:(.tls.reality.short_id // []) } },
+          sniffing:{ enabled:true, destOverride:["http","tls"] } }
       end
     elif .type == "shadowsocks" then
-      { tag: (.tag // "SS-IN" | ascii_upcase), listen: _listen, port: _port, protocol: "shadowsocks", settings: { method: (.method // "aes-256-gcm"), password: (.password // ""), network: "tcp,udp" }, sniffing: { enabled: true, destOverride: ["http","tls"] } }
+      { tag:(.tag // "SS-IN" | ascii_upcase), listen:_listen, port:_port, protocol:"shadowsocks",
+        settings:{ method:(.method // "aes-256-gcm"), password:(.password // ""), network:"tcp,udp" },
+        sniffing:{ enabled:true, destOverride:["http","tls"] } }
+    elif .type == "http" then
+      { tag:(.tag // "HTTP-IN" | ascii_upcase), listen:_listen, port:_port, protocol:"http",
+        settings:{ accounts:((.users // []) | map({user:.username, pass:.password})) },
+        sniffing:{ enabled:true, destOverride:["http","tls"] } }
     else empty end;
 
-  . as $root | ($meta[0] // {}) as $m_data |
-  ([ $root.inbounds[]? | select(.type=="vless" and .server_seed==null) | .tls.server_name // .tls.reality.handshake.server // empty ] | unique) as $reality_domains |
+  def mk_rule(m):
+    (if (.inbound | type) == "array" then (.inbound | map(tostring)) else [(.inbound // empty | tostring)] end) as $inb_raw
+    | ($inb_raw | map(ascii_upcase)) as $inb
+    | ({ type:"field", outboundTag:_map_outbound((.outbound // "DIRECT"); $inb_raw; m), inboundTag:$inb }
+       + (if (.domain? != null) then { domain:(if (.domain|type)=="array" then .domain else [.domain] end) } else {} end)
+       + (if (.ip? != null) then { ip:(if (.ip|type)=="array" then .ip else [.ip] end) } else {} end)
+       + (if (.port? != null) then { port:(if (.port|type)=="array" then .port else [.port] end) } else {} end)
+       + (if (.protocol? != null) then { protocol:(if (.protocol|type)=="array" then .protocol else [.protocol] end) } else {} end)
+      );
 
-  {
-    log: { loglevel: "warning", access: $log, error: $log },
-    # 启用统计和管理 API
-    stats: {},
-    api: { tag: "API", services: ["HandlerService", "LoggerService", "StatsService"] },
-    policy: {
-      levels: { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
-      system: { "statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true }
-    },
-    dns: { servers: ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"], queryStrategy: $ds },
-    inbounds: ( 
-      (($root.inbounds // []) | map(mk_inbound)) + 
-      [{ tag: "API", port: 47302, listen: "127.0.0.1", protocol: "dokodemo-door", settings: { address: "127.0.0.1" } }] 
-    ),
-    outbounds: ( 
-      ( [ $root.outbounds[]? | select(.tag != "direct") | mk_outbound ] ) +
-      # 补全基础标签：强制包含 API, DIRECT, BLOCK 等，防止 status=23 错误
-      [ 
-        { protocol: "freedom", tag: "DIRECT", settings: { domainStrategy: $ds } }, 
-        { protocol: "freedom", tag: "API", settings: {} },
-        { protocol: "blackhole", tag: "BLOCK", settings: {} },
-        { protocol: "freedom", tag: "DIRECT-V4", settings: { domainStrategy: "UseIPv4" } }, 
-        { protocol: "freedom", tag: "DIRECT-V6", settings: { domainStrategy: "UseIPv6" } }, 
-        { protocol: "freedom", tag: "DIRECT-V6PREF", settings: { domainStrategy: "UseIPv6v4" } }, 
-        { protocol: "freedom", tag: "DIRECT-V4PREF", settings: { domainStrategy: "UseIPv4v6" } } 
-      ] + 
-      ($m_data | to_entries | map(select(.value.fixed_ip != null)) | map({ protocol: "freedom", tag: ("BIND-" + .key | ascii_upcase), settings: { domainStrategy: "AsIs" }, sendThrough: .value.fixed_ip }))
-    ),
-    routing: {
-      domainStrategy: $ds,
-      rules: (
-        # API 规则置顶
-        [{ type: "field", inboundTag: ["API"], outboundTag: "API" }] +
-        ( [ $root.route.rules[]? | select(.outbound != null and (.outbound | ascii_upcase | startswith("DIRECT") | not)) | mk_rule ] ) +
-        ( [ $root.route.rules[]? | select(.kind != null) | mk_rule ] ) +
-        ( if ($reality_domains | length > 0) then [{ type: "field", domain: ($reality_domains | map("domain:" + .)), outboundTag: "DIRECT-V4" }] else [] end ) +
-        ( $m_data | to_entries | map(select(.value.fixed_ip != null)) | map(
-            if (.value.ip_version == "v6" and (.value.ip_mode == "v6pref")) then
-                ( { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: ("BIND-" + .key | ascii_upcase) }, { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: "DIRECT-V4" } )
-            elif (.value.ip_version == "v4" and (.value.ip_mode == "v4pref")) then
-                ( { type: "field", inboundTag: [.key | ascii_upcase], ip: ["0.0.0.0/0"], outboundTag: ("BIND-" + .key | ascii_upcase) }, { type: "field", inboundTag: [.key | ascii_upcase], ip: ["::/0"], outboundTag: "DIRECT-V6" } )
-            else
-                { type: "field", inboundTag: [.key | ascii_upcase], outboundTag: ("BIND-" + .key | ascii_upcase) }
-            end
-        ) | flatten ) +
-        ( $m_data | to_entries | map(select(.value.ip_mode != null)) | map({ type: "field", inboundTag: [.key | ascii_upcase], outboundTag: (_mode_tag(.value.ip_mode)) }) ) +
-        [ { type: "field", network: "tcp,udp", outboundTag: "DIRECT" } ]
-      )
+  . as $root
+  | ($meta[0] // {}) as $m_data
+  | ([ $root.inbounds[]? | select(.type=="vless" and .server_seed==null) | (.tls.server_name // .tls.reality.handshake.server // empty) ] | unique) as $reality_domains
+  | (if (($fvd|type) == "array") then $fvd else [] end) as $force_v4
+  | {
+      log: { loglevel:"warning", access:$log, error:$log },
+      stats: {},
+      api: { tag:"API", services:["HandlerService","LoggerService","StatsService"] },
+      policy: {
+        levels: { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
+        system: { "statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true }
+      },
+      dns: { servers:["1.1.1.1","8.8.8.8","2606:4700:4700::1111","2001:4860:4860::8888"], queryStrategy:$ds },
+      inbounds: ((($root.inbounds // []) | map(mk_inbound)) + [{ tag:"API", port:47302, listen:"127.0.0.1", protocol:"dokodemo-door", settings:{ address:"127.0.0.1" } }]),
+      outbounds: (
+        ((($root.outbounds // []) | map(mk_outbound))
+          + [
+              _freedom("DIRECT"; $ds; ""),
+              { protocol:"freedom", tag:"API", settings:{} },
+              { protocol:"blackhole", tag:"BLOCK", settings:{} },
+              _freedom("DIRECT-V4"; "UseIPv4"; $gv4),
+              _freedom("DIRECT-V6"; "UseIPv6"; $gv6),
+              _freedom("DIRECT-V6PREF"; "UseIPv6v4"; ""),
+              _freedom("DIRECT-V4PREF"; "UseIPv4v6"; ""),
+              _freedom("DIRECT-V6ONLY"; "UseIPv6"; ""),
+              _freedom("DIRECT-V4ONLY"; "UseIPv4"; "")
+            ]
+          + (if ($gv4|length) > 0 then [ _freedom("GLOBAL-V4-BIND"; "UseIPv4"; $gv4) ] else [] end)
+          + (if ($gv6|length) > 0 then [ _freedom("GLOBAL-V6-BIND"; "UseIPv6"; $gv6) ] else [] end)
+          + ($m_data | to_entries | map(select((.value.fixed_ip // "") != "")) | map(
+                _freedom(("BIND-" + (.key | ascii_upcase)); (if .value.ip_version == "v6" then "UseIPv6" else "UseIPv4" end); .value.fixed_ip)
+             ))
+        ) | unique_by(.tag)
+      ),
+      routing: {
+        domainStrategy: $ds,
+        rules: (
+          [ { type:"field", inboundTag:["API"], outboundTag:"API" } ]
+          + (if (($force_v4|length) > 0 and ($pref == "v6pref" or $pref == "v6")) then [ { type:"field", domain:$force_v4, outboundTag:"DIRECT-V4" } ] else [] end)
+          + (if (($force_v4|length) > 0) then ($m_data | to_entries | map(select(.value.ip_mode == "v6pref")) | map({ type:"field", inboundTag:[.key | ascii_upcase], domain:$force_v4, outboundTag:"DIRECT-V4" })) else [] end)
+          + (($root.route.rules // []) | map(mk_rule($m_data)))
+          + (if (($reality_domains|length) > 0) then [ { type:"field", domain:($reality_domains | map("domain:" + .)), outboundTag:"DIRECT-V4" } ] else [] end)
+          + ($m_data | to_entries | map(select((.value.fixed_ip // "") != "")) | map(
+              if .value.ip_version == "v6" and .value.ip_mode == "v6pref" then
+                [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["::/0"], outboundTag:("BIND-" + (.key | ascii_upcase)) },
+                  { type:"field", inboundTag:[.key | ascii_upcase], ip:["0.0.0.0/0"], outboundTag:"DIRECT-V4" } ]
+              elif .value.ip_version == "v6" and .value.ip_mode == "v6only" then
+                [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["::/0"], outboundTag:("BIND-" + (.key | ascii_upcase)) },
+                  { type:"field", inboundTag:[.key | ascii_upcase], ip:["0.0.0.0/0"], outboundTag:"BLOCK" } ]
+              elif .value.ip_version == "v4" and .value.ip_mode == "v4pref" then
+                [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["0.0.0.0/0"], outboundTag:("BIND-" + (.key | ascii_upcase)) },
+                  { type:"field", inboundTag:[.key | ascii_upcase], ip:["::/0"], outboundTag:"DIRECT-V6" } ]
+              elif .value.ip_version == "v4" and .value.ip_mode == "v4only" then
+                [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["0.0.0.0/0"], outboundTag:("BIND-" + (.key | ascii_upcase)) },
+                  { type:"field", inboundTag:[.key | ascii_upcase], ip:["::/0"], outboundTag:"BLOCK" } ]
+              else
+                [ { type:"field", inboundTag:[.key | ascii_upcase], outboundTag:("BIND-" + (.key | ascii_upcase)) } ]
+              end
+            ) | flatten)
+          + ($m_data | to_entries | map(select(.value.ip_mode != null and .value.ip_mode != "" and .value.ip_mode != "follow_global" and .value.ip_mode != "follow")) | map(
+              if .value.ip_mode == "v6only" then
+                [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["0.0.0.0/0"], outboundTag:"BLOCK" },
+                  { type:"field", inboundTag:[.key | ascii_upcase], outboundTag:"DIRECT-V6ONLY" } ]
+              elif .value.ip_mode == "v4only" then
+                [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["::/0"], outboundTag:"BLOCK" },
+                  { type:"field", inboundTag:[.key | ascii_upcase], outboundTag:"DIRECT-V4ONLY" } ]
+              else
+                [ { type:"field", inboundTag:[.key | ascii_upcase], outboundTag:_mode_tag(.value.ip_mode) } ]
+              end
+            ) | flatten)
+          + (if ($pref == "v6pref" or $pref == "v6") and ($gv6|length) > 0 then
+                [ { type:"field", ip:["::/0"], outboundTag:"GLOBAL-V6-BIND" },
+                  { type:"field", ip:["0.0.0.0/0"], outboundTag:"DIRECT-V4" } ]
+             elif ($pref == "v6only") and ($gv6|length) > 0 then
+                [ { type:"field", ip:["::/0"], outboundTag:"GLOBAL-V6-BIND" },
+                  { type:"field", ip:["0.0.0.0/0"], outboundTag:"BLOCK" } ]
+             elif ($pref == "v4pref" or $pref == "v4") and ($gv4|length) > 0 then
+                [ { type:"field", ip:["0.0.0.0/0"], outboundTag:"GLOBAL-V4-BIND" },
+                  { type:"field", ip:["::/0"], outboundTag:"DIRECT-V6" } ]
+             elif ($pref == "v4only") and ($gv4|length) > 0 then
+                [ { type:"field", ip:["0.0.0.0/0"], outboundTag:"GLOBAL-V4-BIND" },
+                  { type:"field", ip:["::/0"], outboundTag:"BLOCK" } ]
+             else [] end)
+          + [ { type:"field", network:"tcp,udp", outboundTag:"DIRECT" } ]
+        )
+      }
     }
-  }
 ' "$MODEL_CFG" > "$OUT_CFG"
 SYNC
   chmod +x /usr/local/bin/xray-sync
@@ -1718,7 +1758,6 @@ echo $! > "$PIDFILE"
 WRAP
   chmod +x /usr/local/bin/xray-singleton
 }
-
 
 
 install_autostart_fallback() {
@@ -1836,16 +1875,8 @@ auto_optimize_cpu() {
 
 sync_and_restart_argo() {
     # 1. 获取当前最新的全局出口偏好
-    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
-    local lock_ip=""
-    local ds="AsIs"
-    if [[ "$pref" == "v6" ]]; then
-        lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
-        ds="UseIPv6"
-    else
-        lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
-        ds="UseIPv4"
-    fi
+    local pref ds lock_ip
+    IFS=$'\t' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
 
     # 构造新的 Outbound JSON
     local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
@@ -1872,7 +1903,6 @@ sync_and_restart_argo() {
         fi
     done
 }
-
 
 restart_xray() {
   local mode="${1:-all}"
@@ -2387,16 +2417,8 @@ argo_menu_wrapper() {
     say "正在重新同步固定隧道出口并重启 (临时隧道保持不动)..."
     
     # 1. 获取当前最新的全局出口偏好
-    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
-    local lock_ip=""
-    local ds="AsIs"
-    if [[ "$pref" == "v6" ]]; then
-        lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
-        ds="UseIPv6"
-    else
-        lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
-        ds="UseIPv4"
-    fi
+    local pref ds lock_ip
+    IFS=$'\t' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
 
     local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
     [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
@@ -2450,14 +2472,8 @@ argo_menu_wrapper() {
 
         local uuid=$(uuidgen); local path="/vm-${port}"; local tag="Argo-${port}"
         mkdir -p "/etc/xray/argo_users"
-        
-        local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
-        local lock_ip=""; local ds="AsIs"
-        if [[ "$pref" == "v6" ]]; then
-            lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n '); ds="UseIPv6"
-        else
-            lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n '); ds="UseIPv4"
-        fi
+        local pref ds lock_ip
+        IFS=$'	' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
         local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
         [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
 
@@ -2488,13 +2504,8 @@ EOF
         cp "$ARGO_DIR/cloudflared" "$ARGO_DIR/temp_node/cloudflared_temp"
         
         local port=$((RANDOM % 10000 + 40000)); local uuid=$(uuidgen); local path="/$uuid"
-        local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
-        local lock_ip=""; local ds="AsIs"
-        if [[ "$pref" == "v6" ]]; then
-            lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n '); ds="UseIPv6"
-        else
-            lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n '); ds="UseIPv4"
-        fi
+        local pref ds lock_ip
+        IFS=$'	' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
         local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
         [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
 
@@ -3469,62 +3480,69 @@ _global_ip_version_menu() {
     case "$ip_choice" in
       1|2|3|4)
         mkdir -p /etc/xray >/dev/null 2>&1 || true
-        # 预防性解锁关键文件，防止由于之前的 chattr +i 导致写入失败
         chattr -i /etc/xray/ip_pref /etc/xray/global_egress_ip_v6 /etc/xray/global_egress_ip_v4 2>/dev/null || true
 
-        local pref="" mode_name=""
+        local pref="" mode_name="" target_v="" target_count=0 lock_file=""
+        local -a TARGET_IP_LIST=()
+
         case "$ip_choice" in
-          1) pref="v4pref"; mode_name="优选 IPv4" ;;
-          2) pref="v6pref"; mode_name="优选 IPv6" ;;
-          3) pref="v4only"; mode_name="真全局 IPv4 only" ;;
-          4) pref="v6only"; mode_name="真全局 IPv6 only" ;;
+          1) pref="v4pref"; mode_name="优选 IPv4"; target_v="v4"; TARGET_IP_LIST=("${V4_LIST[@]}"); target_count=$v4_count ;;
+          2) pref="v6pref"; mode_name="优选 IPv6"; target_v="v6"; TARGET_IP_LIST=("${V6_LIST[@]}"); target_count=$v6_count ;;
+          3) pref="v4only"; mode_name="真全局 IPv4 only"; target_v="v4"; TARGET_IP_LIST=("${V4_LIST[@]}"); target_count=$v4_count ;;
+          4) pref="v6only"; mode_name="真全局 IPv6 only"; target_v="v6"; TARGET_IP_LIST=("${V6_LIST[@]}"); target_count=$v6_count ;;
         esac
 
-        # 针对 v6only 的断网保护
         if [[ "$pref" == "v6only" && $v6_count -eq 0 ]]; then
           warn "错误：未检测到可用的 IPv6 出口，无法切换至 v6only 模式。"
           continue
         fi
+        if [[ "$pref" == "v4only" && $v4_count -eq 0 ]]; then
+          warn "错误：未检测到可用的 IPv4 出口，无法切换至 v4only 模式。"
+          continue
+        fi
 
-        # --- 多 IPv6 选择逻辑 ---
-        if [[ "$pref" == "v6pref" || "$pref" == "v6only" ]]; then
-            if [[ $v6_count -gt 1 ]]; then
-                echo -e "\n${C_CYAN}检测到多个 IPv6 出口，请选择要锁定的 IP：${C_RESET}"
-                local n=0
-                for line in "${V6_LIST[@]}"; do
-                    n=$((n+1))
-                    echo -e " ${C_GREEN}[$n]${C_RESET} $line"
-                done
-                echo -e " ${C_GREEN}[0]${C_RESET} 返回上级"
-                echo -e " ${C_GRAY}(回车=不锁定，交给系统动态路由)${C_RESET}"
-                read -rp " 请输入序号（回车=不锁定）: " ip_sel
-                
-                if [[ "${ip_sel:-}" == "0" ]]; then
-                    say "已返回上级（未改动锁定设置）"
-                    continue
-                fi
+        lock_file="/etc/xray/global_egress_ip_${target_v}"
+        local old_pref old_locked selected_fixed_ip=""
+        old_pref="$(_get_global_mode)"
+        old_locked="$(cat "$lock_file" 2>/dev/null | tr -d '\r\n ')"
 
-                if [[ "$ip_sel" =~ ^[1-9]$ ]] && [[ "$ip_sel" -le $n ]]; then
-                    local selected_ip=$(echo "${V6_LIST[$((ip_sel-1))]}" | awk '{print $1}')
-                    echo "$selected_ip" > /etc/xray/global_egress_ip_v6
-                    ok "已锁定出口 IP: $selected_ip"
-                else
-                    rm -f /etc/xray/global_egress_ip_v6
-                    say "已设置为系统动态分配"
-                fi
-            else
-                rm -f /etc/xray/global_egress_ip_v6
+        if [[ $target_count -ge 1 ]]; then
+            echo -e "\n${C_CYAN}检测到可用的 ${target_v^^} 出口，请选择要锁定的 IP：${C_RESET}"
+            local n=0
+            for line in "${TARGET_IP_LIST[@]}"; do
+                n=$((n+1))
+                echo -e " ${C_GREEN}[$n]${C_RESET} $line"
+            done
+            echo -e " ${C_GREEN}[0]${C_RESET} 返回上级"
+            echo -e " ${C_GRAY}(回车=不锁定，交给系统动态路由)${C_RESET}"
+            read -rp " 请选择序号（回车=不锁定）: " ip_sel
+
+            if [[ "${ip_sel:-}" == "0" ]]; then
+                say "已返回上级（未改动锁定设置）"
+                continue
+            fi
+
+            if [[ "$ip_sel" =~ ^[0-9]+$ ]] && (( ip_sel >= 1 && ip_sel <= n )); then
+                selected_fixed_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
             fi
         fi
 
-        # 优选模式通常不强制锁定 v4 IP
-        [[ "$pref" == "v4pref" ]] && rm -f /etc/xray/global_egress_ip_v4
+        if [[ "$pref" == "$old_pref" && "$selected_fixed_ip" == "$old_locked" ]]; then
+          ok "当前全局策略与锁定出口均未变化，跳过重启。"
+          continue
+        fi
 
-        # 写入配置并重启
         echo "$pref" > /etc/xray/ip_pref
+        if [[ -n "$selected_fixed_ip" ]]; then
+            echo "$selected_fixed_ip" > "$lock_file"
+            ok "已锁定 ${target_v^^} 出口 IP: $selected_fixed_ip"
+        else
+            rm -f "$lock_file"
+            say "已设置为系统动态分配 ${target_v^^} 出口"
+        fi
+
         ok "✔ 全局模式已成功切换为：$mode_name"
         
-        # 针对 v6pref 模式自动补全默认黑名单
         if [[ "$pref" == "v6pref" && ! -s /etc/xray/force_v4_domains.txt ]]; then
           echo -e "discord.com\nx.com\nopenai.com" > /etc/xray/force_v4_domains.txt
         fi
@@ -3533,7 +3551,6 @@ _global_ip_version_menu() {
         ;;
 
       5)
-        # 域名名单管理 (完整逻辑，不省略)
         while true; do
             mkdir -p /etc/xray >/dev/null 2>&1 || true
             [[ ! -s /etc/xray/force_v4_domains.txt ]] && echo -e "discord.com\nx.com\nopenai.com" > /etc/xray/force_v4_domains.txt
@@ -3564,7 +3581,6 @@ _global_ip_version_menu() {
                 fi
                 ;;
               3)
-                # 清理并去重
                 awk '{gsub("\r","");} NF && $0 !~ /^[[:space:]]*#/ {print}' /etc/xray/force_v4_domains.txt \
                   | sort -u > /etc/xray/force_v4_domains.txt.tmp \
                   && mv /etc/xray/force_v4_domains.txt.tmp /etc/xray/force_v4_domains.txt
@@ -3577,7 +3593,6 @@ _global_ip_version_menu() {
         ;;
 
       6)
-        # 停止策略：解除文件锁定并写入 off
         chattr -i /etc/xray/ip_pref /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 2>/dev/null || true
         echo "off" > /etc/xray/ip_pref
         rm -f /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 >/dev/null 2>&1 || true
@@ -3590,6 +3605,7 @@ _global_ip_version_menu() {
     esac
   done
 }
+
 
 # === 完美对齐+一键恢复版：网络切换主菜单 ===
 # === 完美对齐+核弹重置版：网络切换主菜单 ===
@@ -3994,7 +4010,7 @@ outbound_menu() {
     case "$ob_choice" in
       1|2) add_manual_proxy_outbound "$ob_choice" ;;
       3) add_manual_ss_outbound ;;
-      4) 
+      4)
         read -rp "请粘贴链接 (输入0返回): " link
         [[ "$link" == "0" || -z "$link" ]] && continue
         import_link_outbound "$link"
@@ -4003,13 +4019,6 @@ outbound_menu() {
       6) set_node_routing ;;
       7) list_and_del_routing_rules ;;
       8) repair_config_structure ;;
-      6)
-        mkdir -p /etc/xray >/dev/null 2>&1 || true
-        echo "off" > /etc/xray/ip_pref
-        rm -f /etc/xray/global_egress_ip_v4 /etc/xray/global_egress_ip_v6 >/dev/null 2>&1 || true
-        ok "已停止全局策略：off（不干预 IP 版本；节点策略可优先生效）"
-        restart_xray
-        ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -4367,8 +4376,8 @@ fi
 main_menu() {
   while true; do
     # 核心：如果发现 Xray 锁定了 IP 但探测结果还没出来，就尝试触发一次探测
-    local pref; pref=$(cat /etc/xray/ip_pref 2>/dev/null || echo "v4")
-    local lock_ip=""; [[ "$pref" == "v6" ]] && lock_ip=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null) || lock_ip=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null)
+    local pref="$(_get_global_mode)"
+    local lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
 
     if [[ -n "$lock_ip" && ! -f "${IP_CACHE_FILE}_xray_status" ]]; then
         update_ip_async

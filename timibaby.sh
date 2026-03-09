@@ -3452,6 +3452,14 @@ _global_ip_version_menu() {
   local __egress_probed=0
   local -a V4_LIST=() V6_LIST=()
   local v4_count=0 v6_count=0
+  
+  # 内部工具：检测 IP 是否真实在网卡上
+  _is_bindable() {
+    local tip="$1"
+    [[ -z "$tip" ]] && return 1
+    ip -o addr show | grep -qw "$tip" && return 0 || return 1
+  }
+
   _probe_egress_once() {
     (( __egress_probed == 1 )) && return 0
     mapfile -t V4_LIST < <(get_all_ips_with_geo 4)
@@ -3522,15 +3530,23 @@ _global_ip_version_menu() {
         old_locked="$(cat "$lock_file" 2>/dev/null | tr -d '\r\n ')"
 
         if [[ $target_count -ge 1 ]]; then
-            echo -e "\n${C_CYAN}检测到可用的 ${target_v^^} 出口，请选择要锁定的 IP：${C_RESET}"
+            echo -e "\n${C_CYAN}检测到可用的 ${target_v^^} 出口，请选择出口策略：${C_RESET}"
             local n=0
             for line in "${TARGET_IP_LIST[@]}"; do
                 n=$((n+1))
-                echo -e " ${C_GREEN}[$n]${C_RESET} $line"
+                local check_ip=$(echo "$line" | awk '{print $1}')
+                if _is_bindable "$check_ip"; then
+                    echo -e " ${C_GREEN}[$n]${C_RESET} $line ${C_GREEN}(可锁定)${C_RESET}"
+                else
+                    echo -e " ${C_GREEN}[$n]${C_RESET} $line ${C_YELLOW}(NAT环境-建议回车)${C_RESET}"
+                fi
             done
             echo -e " ${C_GREEN}[0]${C_RESET} 返回上级"
-            echo -e " ${C_GRAY}(回车=不锁定，交给系统动态路由)${C_RESET}"
-            read -rp " 请选择序号（回车=不锁定）: " ip_sel
+            echo -e " ${C_YELLOW}⚠️  NAT 架构提醒：${C_RESET}"
+            echo -e " ${C_YELLOW}如果序号后面显示 (NAT环境)，选择该序号会导致断网。${C_RESET}"
+            echo -e " ${C_GRAY}──────────────────────────────────────────────────────────────${C_RESET}"
+            echo -e " ${C_CYAN}➜ 直接按回车 (Enter)：保持不断网，系统动态分配 IP${C_RESET}"
+            read -rp " 请选择序号 [1-$n] 或 直接回车: " ip_sel
 
             if [[ "${ip_sel:-}" == "0" ]]; then
                 say "已返回上级（未改动锁定设置）"
@@ -3538,7 +3554,13 @@ _global_ip_version_menu() {
             fi
 
             if [[ "$ip_sel" =~ ^[0-9]+$ ]] && (( ip_sel >= 1 && ip_sel <= n )); then
-                selected_fixed_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+                local candidate_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+                if _is_bindable "$candidate_ip"; then
+                    selected_fixed_ip="$candidate_ip"
+                else
+                    warn "检测到该 IP 为 NAT 映射地址，已自动切换为【安全模式：不断网】"
+                    selected_fixed_ip=""
+                fi
             fi
         fi
 
@@ -3553,12 +3575,13 @@ _global_ip_version_menu() {
         else
             rm -f /etc/xray/global_egress_ip_v6 >/dev/null 2>&1 || true
         fi
+        
         if [[ -n "$selected_fixed_ip" ]]; then
             echo "$selected_fixed_ip" > "$lock_file"
             ok "已锁定 ${target_v^^} 出口 IP: $selected_fixed_ip"
         else
             rm -f "$lock_file"
-            say "已设置为系统动态分配 ${target_v^^} 出口"
+            say "已设置为系统动态分配 ${target_v^^} 出口（安全模式）"
         fi
 
         ok "✔ 全局模式已成功切换为：$mode_name"
@@ -3797,6 +3820,14 @@ _node_ip_mode_menu() {
   local __egress_probed=0
   local -a V4_LIST=() V6_LIST=()
   local v4_count=0 v6_count=0
+
+  # 内部工具：检测 IP 是否真实在网卡上
+  _is_bindable() {
+    local tip="$1"
+    [[ -z "$tip" ]] && return 1
+    ip -o addr show | grep -qw "$tip" && return 0 || return 1
+  }
+
   _probe_egress_once() {
     (( __egress_probed == 1 )) && return 0
     mapfile -t V4_LIST < <(get_all_ips_with_geo 4)
@@ -3858,15 +3889,23 @@ _node_ip_mode_menu() {
         local __abort_lock_choose=0
 
         if [[ $target_count -ge 1 ]]; then
-            echo -e "\n${C_CYAN}检测到该节点有 ${target_count} 个 ${target_v^^} 出口，请选择要锁定的 IP：${C_RESET}"
+            echo -e "\n${C_CYAN}检测到该节点有 ${target_count} 个 ${target_v^^} 出口，请选择出口策略：${C_RESET}"
             local n=0
             for line in "${TARGET_IP_LIST[@]}"; do
                 n=$((n+1))
-                echo -e " ${C_GREEN}[$n]${C_RESET} $line"
+                local check_ip=$(echo "$line" | awk '{print $1}')
+                if _is_bindable "$check_ip"; then
+                    echo -e " ${C_GREEN}[$n]${C_RESET} $line ${C_GREEN}(可锁定)${C_RESET}"
+                else
+                    echo -e " ${C_GREEN}[$n]${C_RESET} $line ${C_YELLOW}(NAT环境-建议回车)${C_RESET}"
+                fi
             done
             echo -e " ${C_GREEN}[0]${C_RESET} 返回上级"
-                echo -e " ${C_GRAY}(回车=不锁定，交给系统动态路由)${C_RESET}"
-            read -rp " 请选择序号（回车=不锁定）: " ip_sel
+            echo -e " ${C_YELLOW}⚠️  NAT 环境警告：${C_RESET}"
+            echo -e " ${C_YELLOW}如果序号后面显示 (NAT环境)，选择该序号会导致断网。${C_RESET}"
+            echo -e " ${C_GRAY}──────────────────────────────────────────────────────────────${C_RESET}"
+            echo -e " ${C_CYAN}➜ 直接回车 (Enter) = 安全模式（IPv4 优先且不断网）${C_RESET}"
+            read -rp " 请选择序号 [1-$n] 或 直接回车: " ip_sel
             
             if [[ "${ip_sel:-}" == "0" ]]; then
                 say "已返回上级（未改动锁定设置）"
@@ -3875,7 +3914,13 @@ _node_ip_mode_menu() {
             fi
 
             if [[ "${__abort_lock_choose:-0}" != "1" ]] && [[ "$ip_sel" =~ ^[0-9]+$ ]] && (( ip_sel >= 1 && ip_sel <= n )); then
-                selected_fixed_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+                local candidate_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+                if _is_bindable "$candidate_ip"; then
+                    selected_fixed_ip="$candidate_ip"
+                else
+                    warn "检测到该 IP 为 NAT 映射地址，已自动为您切换至【不断网安全模式】"
+                    selected_fixed_ip=""
+                fi
             fi
         fi
 
@@ -3898,7 +3943,7 @@ _node_ip_mode_menu() {
         else
             safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $mode})}' --arg tag "$target_tag" --arg mode "$pref"
             safe_json_edit "$META" 'del(.[$tag].fixed_ip) | del(.[$tag].ip_version)' --arg tag "$target_tag"
-            say "已设置为系统动态分配出口"
+            say "已设置为系统动态分配出口（不断网安全模式）"
         fi
 
         # --- 【智能分离重启逻辑】 ---

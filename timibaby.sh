@@ -1486,6 +1486,10 @@ case "${G_PREF}" in
   *)         DS="AsIs" ;;
 esac
 
+# 路由层 domainStrategy 只能使用 Xray 官方支持的值。
+# 这里强制改为 IPOnDemand，确保所有基于 IP 的 v4/v6 规则对“域名目标”也会生效。
+ROUTE_DS="IPOnDemand"
+
 read_lock_file() {
   local file="$1"
   if [[ -r "$file" ]]; then
@@ -1525,6 +1529,7 @@ fi
 
 jq --arg log "$LOG_PATH" \
    --arg ds "$DS" \
+   --arg rds "$ROUTE_DS" \
    --arg pref "$G_PREF" \
    --arg gv4 "$G_LOCK_V4" \
    --arg gv6 "$G_LOCK_V6" \
@@ -1676,13 +1681,12 @@ jq --arg log "$LOG_PATH" \
         ) | unique_by(.tag)
       ),
       routing: {
-        domainStrategy: $ds,
+        domainStrategy: $rds,
         rules: (
           [ { type:"field", inboundTag:["API"], outboundTag:"API" } ]
           + (if (($force_v4|length) > 0 and ($pref == "v6pref" or $pref == "v6")) then [ { type:"field", domain:$force_v4, outboundTag:"DIRECT-V4" } ] else [] end)
           + (if (($force_v4|length) > 0) then ($m_data | to_entries | map(select(.value.ip_mode == "v6pref")) | map({ type:"field", inboundTag:[.key | ascii_upcase], domain:$force_v4, outboundTag:"DIRECT-V4" })) else [] end)
           + (($root.route.rules // []) | map(mk_rule($m_data)))
-          + (if (($reality_domains|length) > 0) then [ { type:"field", domain:($reality_domains | map("domain:" + .)), outboundTag:"DIRECT-V4" } ] else [] end)
           + ($m_data | to_entries | map(select((.value.fixed_ip // "") != "")) | map(
               if .value.ip_version == "v6" and .value.ip_mode == "v6pref" then
                 [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["::/0"], outboundTag:("BIND-" + (.key | ascii_upcase)) },
@@ -1714,15 +1718,23 @@ jq --arg log "$LOG_PATH" \
           + (if ($pref == "v6pref" or $pref == "v6") and ($gv6|length) > 0 then
                 [ { type:"field", ip:["::/0"], outboundTag:"GLOBAL-V6-BIND" },
                   { type:"field", ip:["0.0.0.0/0"], outboundTag:"DIRECT-V4" } ]
-             elif ($pref == "v6only") and ($gv6|length) > 0 then
-                [ { type:"field", ip:["::/0"], outboundTag:"GLOBAL-V6-BIND" },
-                  { type:"field", ip:["0.0.0.0/0"], outboundTag:"BLOCK" } ]
+             elif ($pref == "v6only") then
+                (if ($gv6|length) > 0 then
+                    [ { type:"field", ip:["::/0"], outboundTag:"GLOBAL-V6-BIND" } ]
+                 else
+                    [ { type:"field", ip:["::/0"], outboundTag:"DIRECT-V6ONLY" } ]
+                 end)
+                + [ { type:"field", ip:["0.0.0.0/0"], outboundTag:"BLOCK" } ]
              elif ($pref == "v4pref" or $pref == "v4") and ($gv4|length) > 0 then
                 [ { type:"field", ip:["0.0.0.0/0"], outboundTag:"GLOBAL-V4-BIND" },
                   { type:"field", ip:["::/0"], outboundTag:"DIRECT-V6" } ]
-             elif ($pref == "v4only") and ($gv4|length) > 0 then
-                [ { type:"field", ip:["0.0.0.0/0"], outboundTag:"GLOBAL-V4-BIND" },
-                  { type:"field", ip:["::/0"], outboundTag:"BLOCK" } ]
+             elif ($pref == "v4only") then
+                (if ($gv4|length) > 0 then
+                    [ { type:"field", ip:["0.0.0.0/0"], outboundTag:"GLOBAL-V4-BIND" } ]
+                 else
+                    [ { type:"field", ip:["0.0.0.0/0"], outboundTag:"DIRECT-V4ONLY" } ]
+                 end)
+                + [ { type:"field", ip:["::/0"], outboundTag:"BLOCK" } ]
              else [] end)
           + [ { type:"field", network:"tcp,udp", outboundTag:"DIRECT" } ]
         )
@@ -1944,6 +1956,7 @@ restart_xray() {
     done
     
     if systemctl is-active --quiet xray; then
+      sync_hy2_network >/dev/null 2>&1 || true
       update_ip_async  # 启动成功立即触发 IP 探测
       ok "${success_msg} (systemd)"
       return 0
@@ -1962,6 +1975,7 @@ restart_xray() {
     done
     
     if rc-service xray status 2>/dev/null | grep -q started; then
+      sync_hy2_network >/dev/null 2>&1 || true
       update_ip_async
       ok "${success_msg} (OpenRC)"
       return 0
@@ -1971,6 +1985,7 @@ restart_xray() {
   # --- 路径 C: Fallback ---
   pkill -x xray >/dev/null 2>&1 || true
   if start_xray_singleton_force; then
+    sync_hy2_network >/dev/null 2>&1 || true
     auto_optimize_cpu
     update_ip_async
     ok "${success_msg} (Fallback)"
@@ -3533,6 +3548,11 @@ _global_ip_version_menu() {
         fi
 
         echo "$pref" > /etc/xray/ip_pref
+        if [[ "$target_v" == "v6" ]]; then
+            rm -f /etc/xray/global_egress_ip_v4 >/dev/null 2>&1 || true
+        else
+            rm -f /etc/xray/global_egress_ip_v6 >/dev/null 2>&1 || true
+        fi
         if [[ -n "$selected_fixed_ip" ]]; then
             echo "$selected_fixed_ip" > "$lock_file"
             ok "已锁定 ${target_v^^} 出口 IP: $selected_fixed_ip"
@@ -3702,9 +3722,9 @@ sync_hy2_network() {
     local tags; tags=$(jq -r 'to_entries[] | select(.value.type=="hysteria2") | .key' "$META" 2>/dev/null)
     [[ -z "$tags" ]] && return 0
 
-    local g_pref; g_pref=$(cat /etc/xray/ip_pref 2>/dev/null | tr -d '\r\n ' || echo "v4")
-    local g_v4; g_v4=$(cat /etc/xray/global_egress_ip_v4 2>/dev/null | tr -d '\r\n ')
-    local g_v6; g_v6=$(cat /etc/xray/global_egress_ip_v6 2>/dev/null | tr -d '\r\n ')
+    local g_pref; g_pref=$(_get_global_mode)
+    local g_v4; g_v4=$(_read_global_lock_ip_by_family v4)
+    local g_v6; g_v6=$(_read_global_lock_ip_by_family v6)
 
     for t in $tags; do
         local port; port=$(jq -r --arg t "$t" '.[$t].port' "$META")
@@ -3716,7 +3736,11 @@ sync_hy2_network() {
         
         if [[ "$eff_mode" == "follow_global" || "$eff_mode" == "follow" || "$eff_mode" == "null" || -z "$eff_mode" ]]; then
             eff_mode="$g_pref"
-            [[ "$g_pref" =~ v6 ]] && eff_ip="$g_v6" || eff_ip="$g_v4"
+            case "$g_pref" in
+                v6pref|v6only|v6) eff_ip="$g_v6" ;;
+                v4pref|v4only|v4) eff_ip="$g_v4" ;;
+                *) eff_ip="" ;;
+            esac
         fi
         
         local hy2_mode="auto"
@@ -3794,9 +3818,10 @@ _node_ip_mode_menu() {
     _probe_egress_once
 
     # 2. 读取当前节点的【旧配置】用于对比
-    local old_mode old_fixed_ip
+    local old_mode old_fixed_ip old_ip_version
     old_mode=$(jq -r --arg t "$target_tag" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
     old_fixed_ip=$(jq -r --arg t "$target_tag" '.[$t].fixed_ip // empty' "$META" 2>/dev/null)
+    old_ip_version=$(jq -r --arg t "$target_tag" '.[$t].ip_version // empty' "$META" 2>/dev/null)
     local cur_label="$(_ip_mode_desc "$old_mode")"
 
     printf " ${C_RESET}当前节点模式：${C_YELLOW}%s${C_RESET} ${C_PURPLE}(${C_RESET}%s${C_PURPLE})${C_RESET}\n\n" "$old_mode" "$cur_label"
@@ -3886,16 +3911,28 @@ _node_ip_mode_menu() {
         else
             if ! restart_xray; then
               warn "⚡ 重启失败，正在尝试回退..."
-              safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $m, "fixed_ip": $ip})}' --arg tag "$target_tag" --arg m "$old_mode" --arg ip "$old_fixed_ip"
+              if [[ -n "$old_fixed_ip" && -n "$old_ip_version" ]]; then
+                safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $m, "fixed_ip": $ip, "ip_version": $v})}' \
+                  --arg tag "$target_tag" --arg m "$old_mode" --arg ip "$old_fixed_ip" --arg v "$old_ip_version"
+              elif [[ -n "$old_fixed_ip" ]]; then
+                safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $m, "fixed_ip": $ip})}' \
+                  --arg tag "$target_tag" --arg m "$old_mode" --arg ip "$old_fixed_ip"
+              else
+                safe_json_edit "$META" '. + {($tag): (.[$tag] + {"ip_mode": $m})}' \
+                  --arg tag "$target_tag" --arg m "$old_mode"
+                safe_json_edit "$META" 'del(.[$tag].fixed_ip) | del(.[$tag].ip_version)' --arg tag "$target_tag"
+              fi
               restart_xray
             fi
         fi
         ;;
 
       6)
-        if [[ "$old_mode" == "follow_global" ]]; then
-            ok "当前已是跟随模式，跳过重启。"
-            continue
+        if [[ "$old_mode" == "follow_global" || "$old_mode" == "follow" || "$old_mode" == "null" || -z "$old_mode" ]]; then
+            if [[ -z "$old_fixed_ip" && -z "$old_ip_version" ]]; then
+                ok "当前已是跟随模式，且无残留锁定信息，跳过重启。"
+                continue
+            fi
         fi
         chattr -i "$META" 2>/dev/null || true
         safe_json_edit "$META" 'del(.[$tag].ip_mode) | del(.[$tag].fixed_ip) | del(.[$tag].ip_version)' --arg tag "$target_tag"

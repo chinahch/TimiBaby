@@ -2508,19 +2508,27 @@ EOF
         print_card "固定隧道配置成功" "$tag" "域名: $domain\n端口: $port" "$link"
     }
 
-    # --- 临时隧道逻辑 (保持不变) ---
     temp_tunnel_logic() {
         ensure_argo_deps
         say "启动临时隧道..."
         local ARGO_DIR="/root/agsbx"
         mkdir -p "$ARGO_DIR/temp_node"
-        pkill -f "cloudflared_temp"; pkill -f "xray_temp"
+
+        # 1. 强力清理旧进程，防止 "Text file busy"
+        pkill -9 -f "cloudflared_temp" >/dev/null 2>&1
+        pkill -9 -f "xray_temp" >/dev/null 2>&1
+        sleep 1
+        
+        # 2. 删除旧二进制文件确保写入成功
+        rm -f "$ARGO_DIR/temp_node/xray_temp" "$ARGO_DIR/temp_node/cloudflared_temp"
+        
         cp "$ARGO_DIR/xray" "$ARGO_DIR/temp_node/xray_temp"
         cp "$ARGO_DIR/cloudflared" "$ARGO_DIR/temp_node/cloudflared_temp"
+        chmod +x "$ARGO_DIR/temp_node/xray_temp" "$ARGO_DIR/temp_node/cloudflared_temp"
         
         local port=$((RANDOM % 10000 + 40000)); local uuid=$(uuidgen); local path="/$uuid"
         local pref ds lock_ip
-        IFS=$'	' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
+        IFS=$'\t' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
         local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
         [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
 
@@ -2530,10 +2538,22 @@ EOF
         nohup "$ARGO_DIR/temp_node/xray_temp" run -c "$ARGO_DIR/temp_node/config.json" >/dev/null 2>&1 &
         nohup "$ARGO_DIR/temp_node/cloudflared_temp" tunnel --url http://127.0.0.1:$port --no-autoupdate > "$ARGO_DIR/temp_node/cf.log" 2>&1 &
         
-        say "正在获取域名 (5s)..."
-        sleep 5
-        local url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$ARGO_DIR/temp_node/cf.log" | head -n1)
-        [[ -z "$url" ]] && { err "获取失败"; return; }
+        # 3. 智能获取域名 (循环探测，最高 12 秒)
+        say "正在获取 TryCloudflare 域名 (最高等待 12s)..."
+        local url=""
+        for i in {1..12}; do
+            sleep 1
+            url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$ARGO_DIR/temp_node/cf.log" | head -n1)
+            [[ -n "$url" ]] && break
+            echo -n "."
+        done
+        echo ""
+
+        [[ -z "$url" ]] && { 
+            err "获取失败。请检查网络是否能连接 Cloudflare，或查看日志: cat $ARGO_DIR/temp_node/cf.log"
+            return
+        }
+
         local domain=${url#https://}; local tag="Argo-Temp"
         local vm_json='{"v":"2","ps":"'$tag'","add":"'$domain'","port":"443","id":"'$uuid'","net":"ws","path":"'$path'","tls":"tls","sni":"'$domain'","host":"'$domain'"}'
         local link="vmess://$(echo -n "$vm_json" | base64 -w 0)"

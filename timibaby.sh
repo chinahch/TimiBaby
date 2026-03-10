@@ -303,12 +303,11 @@ detect_init_system() {
 trap 'disown_temp_tunnel >/dev/null 2>&1; echo; exit 0' INT
 trap 'exit 0' HUP
 
-# 交互输入保护：一旦 stdin 变为 EOF（例如放后台/SSH 断开），立即退出，避免 while true 空转吃 CPU
 safe_read() {
   # 用法：safe_read var "prompt"
   local __var="$1"; shift
   local __prompt="$1"
-  if ! read -r -p "$__prompt" "$__var"; then
+  if ! read -r -p "$__prompt" ${__var?}; then
     echo
     exit 0
   fi
@@ -1378,7 +1377,7 @@ check_and_repair_menu() {
   if (( did_fix == 1 )); then
     say "正在重启 Xray 服务以应用修复..."
     if ! restart_xray; then
-      warn "自动重启失败，请在“脚本服务”中手动选择 2) 重启 Xray 服务。"
+      warn "自动重启失败，请在 \"脚本服务\" 中手动选择 2) 重启 Xray 服务。"
     else
       ok "Xray 服务已重启。"
     fi

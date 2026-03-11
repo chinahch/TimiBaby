@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 # sk5.sh 融合 Misaka-blog Hysteria2 一键逻辑版 (UI重构+性能优化+全功能保留版)
 # 🚀 优化内容：移除启动阻塞、后台IP获取、Dashboard UI、保留所有业务逻辑
 # 🚀 代码大师修改：默认执行完整初始化，并自动设置 'my' 和 'MY' 别名快捷指令
@@ -20,9 +21,6 @@ declare -A GEO_CACHE 2>/dev/null || true
 
 # ============= 0. 全局配置与 UI 变量 =============
 VERSION="3.0.0 Optimized"
-ARGO_TEMP_CACHE="/root/agsbx/jh.txt"
-ARGO_FIXED_CACHE="/root/agsbx/gd.txt"
-ARGO_META_TAG_PREFIX="Argo-"
 XRAY_BASE_DIR="/etc/xray"
 CONFIG="${XRAY_BASE_DIR}/config.json"
 META="${XRAY_BASE_DIR}/nodes_meta.json"
@@ -51,8 +49,10 @@ fix_environment_lowmem() {
     fi
 
     # 2. 自动创建虚拟内存 (针对 < 512MB 的机器)
-    local total_mem=$(free -m | awk '/Mem:/ {print $2}')
-    local total_swap=$(free -m | awk '/Swap:/ {print $2}')
+    local total_mem
+local total_swap
+total_mem=$(free -m | awk '/Mem:/ {print $2}')
+total_swap=$(free -m | awk '/Swap:/ {print $2}')
     if [ "$total_mem" -le 300 ] && [ "$total_swap" -le 10 ]; then
         echo -e "${C_YELLOW}检测到小内存环境 ($total_mem MB)，正在开启临时 Swap...${C_RESET}"
         # Alpine/BusyBox 兼容的 dd 命令
@@ -74,7 +74,7 @@ auto_sync_time() {
     if command -v ntpdate >/dev/null 2>&1; then
         ntpdate -u pool.ntp.org >/dev/null 2>&1
     else
-        local remote_date=$(curl -sI https://www.google.com | grep -i '^date:' | cut -d' ' -f2-7)
+remote_date=$(curl -sI https://www.google.com | grep -i '^date:' | cut -d' ' -f2-7)
         [[ -n "$remote_date" ]] && date -s "$remote_date" >/dev/null 2>&1
     fi
     SYNC_DONE=1
@@ -163,7 +163,9 @@ _read_global_lock_ip_by_family() {
 }
 
 _read_global_lock_ip_for_pref() {
-  local pref="$(_sanitize_ip_pref "${1:-$(_get_global_mode)}")"
+  # 修改后
+local pref
+pref="$(_sanitize_ip_pref "${1:-$(_get_global_mode)}")"
   if _pref_is_v6_family "$pref"; then
     _read_global_lock_ip_by_family v6
   elif _pref_is_v4_family "$pref"; then
@@ -174,9 +176,13 @@ _read_global_lock_ip_for_pref() {
 }
 
 _get_global_egress_pref_and_lock() {
-  local pref="$(_get_global_mode)"
-  local ds="$(_pref_domain_strategy "$pref")"
-  local lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
+  local pref
+pref="$(_get_global_mode)"
+  # 修改后 (推荐)
+local ds
+ds="$(_pref_domain_strategy "$pref")"
+  local lock_ip
+lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
   printf '%s\t%s\t%s\n' "$pref" "$ds" "$lock_ip"
 }
 
@@ -305,12 +311,17 @@ trap 'exit 0' HUP
 
 safe_read() {
   # 用法：safe_read var "prompt"
-  local __var="$1"; shift
+  local __var="$1"
+  shift
   local __prompt="$1"
-  if ! read -r -p "$__prompt" ${__var?}; then
+  local __input=""
+
+  if ! read -r -p "$__prompt" __input; then
     echo
     exit 0
   fi
+
+  printf -v "$__var" '%s' "$__input"
 }
 
 daemonize() { setsid "$@" </dev/null >/dev/null 2>&1 & }
@@ -390,7 +401,7 @@ update_ip_async() {
         rm -f "$lock"
     ) &
 
-    echo $! > "$lock"
+    printf '%s\n' "$!" > "$lock"
 }
 
 
@@ -486,7 +497,8 @@ get_node_letter_suffix() {
   local alphabet=(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z)
   
   # 汇总当前所有已存在的标签
-  local existing_tags=$( (jq -r '.inbounds[].tag // empty' "$CONFIG" 2>/dev/null; jq -r 'keys[]' "$META" 2>/dev/null) | sort -u)
+  local existing_tags
+  existing_tags=$( (jq -r '.inbounds[].tag // empty' "$CONFIG" 2>/dev/null; jq -r 'keys[]' "$META" 2>/dev/null) | sort -u)
   
   # 遍历 A-Z，找到第一个没被占用的字母
   for letter in "${alphabet[@]}"; do
@@ -529,10 +541,10 @@ get_ip_country() {
     ip_data=$(curl -s -4 --connect-timeout 2 --max-time 3 "https://api.ipapi.is/?ip=${ip}" 2>/dev/null)
     
     if [[ -n "$ip_data" && "$ip_data" != "null" ]]; then
-        local is_hosting=$(echo "$ip_data" | jq -r '.is_hosting // false' 2>/dev/null)
-        local is_mobile=$(echo "$ip_data" | jq -r '.is_mobile // false' 2>/dev/null)
-        local is_business=$(echo "$ip_data" | jq -r '.is_business // false' 2>/dev/null)
-        local asn_type=$(echo "$ip_data" | jq -r '.asn.type // "unknown"' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        local is_hosting; is_hosting=$(echo "$ip_data" | jq -r '.is_hosting // false' 2>/dev/null)
+        local is_mobile; is_mobile=$(echo "$ip_data" | jq -r '.is_mobile // false' 2>/dev/null)
+        local is_business; is_business=$(echo "$ip_data" | jq -r '.is_business // false' 2>/dev/null)
+        local asn_type; asn_type=$(echo "$ip_data" | jq -r '.asn.type // "unknown"' 2>/dev/null | tr '[:upper:]' '[:lower:]')
 
         # --- 判断逻辑优先级 ---
         if [[ "$is_hosting" == "true" || "$asn_type" == "hosting" || "$asn_type" == "data center" ]]; then
@@ -626,8 +638,9 @@ get_all_ips_with_geo() {
     fi
 
     for line in "${all_addr_info[@]}"; do
-        local iface=$(echo "$line" | awk '{print $1}')
-        local lip=$(echo "$line" | awk '{print $2}')
+        local iface
+iface=$(echo "$line" | awk '{print $1}')
+        local lip; lip=$(echo "$line" | awk '{print $2}')
         [[ -z "$lip" ]] && continue
 
         # ========== 新增：先做“不可锁地址”过滤 ==========
@@ -709,78 +722,122 @@ get_all_ips_with_geo() {
 
 
 
-
 get_sys_status() {
-    # 1. 采集基础数据并脱水
-    local node_count=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0)
-    node_count=$(echo "$node_count" | tr -d '\n\r')
-    local core_ver=$($(_xray_bin) version 2>/dev/null | head -n1 | awk '{print $2}')
-    core_ver=$(echo "$core_ver" | tr -d '\n\r')
-    local sys_uptime=$(uptime -p 2>/dev/null | sed "s/up //; s/ days/天/; s/ day/天/; s/ hours/小时/; s/ hour/小时/; s/ minutes/分钟/; s/ minute/分钟/; s/,//g" | tr -d '\n\r')
-    
-    # 2. 系统 IP 获取及“无”处理
-    local sys_ip4=$(cat "$IP_CACHE_FILE" 2>/dev/null | tr -d '\n\r')
-    [[ -z "$sys_ip4" ]] && sys_ip4="无"
-    local sys_ip6=$(cat "${IP_CACHE_FILE}_v6" 2>/dev/null | tr -d '\n\r')
-    [[ -z "$sys_ip6" ]] && sys_ip6="无"
+    # 1. 先统一声明变量 (修复 SC2155)
+    local node_count core_ver sys_uptime sys_ip4 sys_ip6
+    local cur_session_ip="" local_loc="${C_GRAY}未知位置${C_RESET}"
+    local v4_ext_target="114.114.114.114"
+    local v6_ext_target="2400:3200::1"
+    local v4_delay="" v6_delay=""
+    local all_ips="" combined_ips=""
+    local pref="" lock_ip="" xray_egress="跟随系统 (默认)"
+    local xray_bin_path loc_data country city code
+    local rtt p4 p6 real_pub cc
 
-    # 3. 识别本地 SSH 来源及城市位置
-    local cur_session_ip=$(echo $SSH_CLIENT | awk '{print $1}')
-    local local_loc="${C_GRAY}未知位置${C_RESET}"
-    local v4_ext_target="114.114.114.114"; local v6_ext_target="2400:3200::1"
+    # 2. 获取节点总数
+    node_count=$(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0)
+    node_count=${node_count:-0}
+
+    # 3. 获取核心版本 (增加路径检查)
+    xray_bin_path=$(_xray_bin)
+    if [[ -x "$xray_bin_path" ]]; then
+        core_ver=$("$xray_bin_path" version 2>/dev/null | head -n1 | awk '{print $2}')
+    fi
+    core_ver=${core_ver:-"未安装"}
+
+    # 4. 系统运行时间
+    sys_uptime=$(uptime -p 2>/dev/null | sed "s/up //; s/ days/天/; s/ day/天/; s/ hours/小时/; s/ hour/小时/; s/ minutes/分钟/; s/ minute/分钟/; s/,//g")
+    sys_uptime=${sys_uptime:-"获取中"}
+
+    # 5. 读取缓存的系统 IP (优化读取方式)
+    if [[ -f "$IP_CACHE_FILE" ]]; then
+        sys_ip4=$(head -n 1 "$IP_CACHE_FILE" 2>/dev/null)
+    fi
+    sys_ip4=${sys_ip4:-"无"}
+
+    if [[ -f "${IP_CACHE_FILE}_v6" ]]; then
+        sys_ip6=$(head -n 1 "${IP_CACHE_FILE}_v6" 2>/dev/null)
+    fi
+    sys_ip6=${sys_ip6:-"无"}
+
+    # 6. 处理本地位置与 SSH 会话
+    if [[ -n "${SSH_CLIENT:-}" ]]; then
+        cur_session_ip=$(echo "$SSH_CLIENT" | awk '{print $1}')
+    fi
 
     if [[ -n "$cur_session_ip" ]]; then
-        local loc_data=$(curl -s --connect-timeout 2 "http://ip-api.com/json/$cur_session_ip?fields=country,city,countryCode&lang=zh-CN")
-        local country=$(echo "$loc_data" | jq -r '.country // empty')
-        local city=$(echo "$loc_data" | jq -r '.city // empty')
-        local code=$(echo "$loc_data" | jq -r '.countryCode // "US"')
-        [[ -n "$country" ]] && local_loc="${C_PURPLE}${country}${C_RESET}"
-        [[ -n "$city" ]] && local_loc="${local_loc} · ${C_PURPLE}${city}${C_RESET}"
-        if [[ "$code" != "CN" ]]; then v4_ext_target="1.1.1.1"; v6_ext_target="2606:4700:4700::1111"; fi
-    fi
+        # 探测位置
+        loc_data=$(curl -s --connect-timeout 2 "http://ip-api.com/json/$cur_session_ip?fields=country,city,countryCode&lang=zh-CN")
+        if [[ -n "$loc_data" ]]; then
+            country=$(echo "$loc_data" | jq -r '.country // empty')
+            city=$(echo "$loc_data" | jq -r '.city // empty')
+            code=$(echo "$loc_data" | jq -r '.countryCode // "US"')
 
-    # 4. 延迟检测逻辑 (统一黄色)
-    local v4_delay="" v6_delay=""
-    local all_ips=$(who | grep -oE "\(([0-9a-fA-F.:]+)\)" | tr -d "()" | sort -u)
-    local combined_ips=$(echo "$cur_session_ip $all_ips" | tr ' ' '\n' | sort -u)
+            [[ -n "$country" ]] && local_loc="${C_PURPLE}${country}${C_RESET}"
+            [[ -n "$city" ]] && local_loc="${local_loc} · ${C_PURPLE}${city}${C_RESET}"
 
-    for ip in $combined_ips; do
-        [[ -z "$ip" || "$ip" == " " ]] && continue
-        local rtt=$(ss -itn dst "$ip" 2>/dev/null | grep -oE "rtt:[0-9.]+" | cut -d: -f2 | head -n1)
-        if [[ -n "$rtt" ]]; then
-            if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then v4_delay="${C_YELLOW}${rtt}ms(本地)${C_RESET}"
-            elif [[ "$ip" == *:* ]]; then v6_delay="${C_YELLOW}${rtt}ms(本地)${C_RESET}"; fi
+            if [[ "$code" != "CN" ]]; then
+                v4_ext_target="1.1.1.1"
+                v6_ext_target="2606:4700:4700::1111"
+            fi
         fi
-    done
+    fi
 
+    # 7. 计算连接延迟
+    all_ips=$(who | grep -oE "\(([0-9a-fA-F.:]+)\)" | tr -d "()" | sort -u)
+    combined_ips=$(printf '%s\n%s\n' "$cur_session_ip" "$all_ips" | sed '/^$/d' | sort -u)
+
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        rtt=$(ss -itn dst "$ip" 2>/dev/null | grep -oE "rtt:[0-9.]+" | cut -d: -f2 | head -n1)
+
+        if [[ -n "$rtt" ]]; then
+            if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                v4_delay="${C_YELLOW}${rtt}ms(本地)${C_RESET}"
+            elif [[ "$ip" == *:* ]]; then
+                v6_delay="${C_YELLOW}${rtt}ms(本地)${C_RESET}"
+            fi
+        fi
+    done <<< "$combined_ips"
+
+    # 市政延迟探测
     if [[ -z "$v4_delay" && "$sys_ip4" != "无" ]]; then
-        local p4=$(ping -c 1 -W 1 "$v4_ext_target" 2>/dev/null | grep -oE "time=[0-9.]+" | cut -d= -f2)
-        v4_delay=$( [[ -n "$p4" ]] && echo -e "${C_YELLOW}${p4}ms(市)${C_RESET}" || echo -e "${C_RED}超时${C_RESET}" )
+        p4=$(ping -c 1 -W 1 "$v4_ext_target" 2>/dev/null | grep -oE "time=[0-9.]+" | cut -d= -f2)
+        v4_delay=$([[ -n "$p4" ]] && echo -e "${C_YELLOW}${p4}ms(市)${C_RESET}" || echo -e "${C_RED}超时${C_RESET}")
     fi
-    if [[ -z "$v6_delay" && "$sys_ip6" != "无" ]]; then
-        local p6=$(ping6 -c 1 -W 1 "$v6_ext_target" 2>/dev/null | grep -oE "time=[0-9.]+" | cut -d= -f2)
-        v6_delay=$( [[ -n "$p6" ]] && echo -e "${C_YELLOW}${p6}ms(市)${C_RESET}" || echo -e "${C_RED}超时${C_RESET}" )
-    fi
-    v4_delay=${v4_delay:-"${C_GRAY}无${C_RESET}"}; v6_delay=${v6_delay:-"${C_GRAY}无${C_RESET}"}
 
-    # 5. 出口逻辑渲染
-    local pref="$(_get_global_mode)"
-    local lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
-    local xray_egress="跟随系统 (默认)"
+    if [[ -z "$v6_delay" && "$sys_ip6" != "无" ]]; then
+        p6=$(ping6 -c 1 -W 1 "$v6_ext_target" 2>/dev/null | grep -oE "time=[0-9.]+" | cut -d= -f2)
+        v6_delay=$([[ -n "$p6" ]] && echo -e "${C_YELLOW}${p6}ms(市)${C_RESET}" || echo -e "${C_RED}超时${C_RESET}")
+    fi
+
+    v4_delay=${v4_delay:-"${C_GRAY}无${C_RESET}"}
+    v6_delay=${v6_delay:-"${C_GRAY}无${C_RESET}"}
+
+    # 8. Xray 出口偏好逻辑
+    pref="$(_get_global_mode)"
+    lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
+
     if [[ "$pref" != "off" && -n "$lock_ip" ]]; then
-        local real_pub
-        real_pub=$(cat "${IP_CACHE_FILE}_xray" 2>/dev/null | tr -d '\n\r')
-        [[ -z "$real_pub" ]] && real_pub="获取中..."
-        local cc="??"; [[ "$real_pub" != "获取中..." && "$real_pub" != "N/A" ]] && cc=$(get_ip_country "$real_pub")
-        xray_egress="${C_GREEN}${real_pub}${C_RESET} ${C_PURPLE}[${cc}]${C_RESET}"
+        if [[ -f "${IP_CACHE_FILE}_xray" ]]; then
+            real_pub=$(cat "${IP_CACHE_FILE}_xray" 2>/dev/null)
+        fi
+        real_pub=${real_pub:-"获取中..."}
+
+        if [[ "$real_pub" != "获取中..." && "$real_pub" != "N/A" ]]; then
+            cc=$(get_ip_country "$real_pub")
+            xray_egress="${C_GREEN}${real_pub}${C_RESET} ${C_PURPLE}[${cc}]${C_RESET}"
+        else
+            xray_egress="${C_YELLOW}获取中...${C_RESET}"
+        fi
     elif [[ "$pref" != "off" ]]; then
         xray_egress="${C_GRAY}$(_ip_mode_desc "$pref")${C_RESET} ${C_PURPLE}(未锁定本机出口IP)${C_RESET}"
     fi
 
-    # 6. 打印对齐 UI
+    # 9. 打印界面
     echo -e "${C_BLUE}┌──[ 系统监控 ]────────────────────────────────────────────────┐${C_RESET}"
-    echo -e "${C_BLUE}│${C_RESET} 状态: ${C_GREEN}[运行中]${C_RESET} | 节点: ${C_YELLOW}${node_count}${C_RESET} | 核心: ${C_CYAN}${core_ver:-未知}${C_RESET}"
-    echo -e "${C_BLUE}│${C_RESET} 本机: ${local_loc} | 运行: ${C_YELLOW}${sys_uptime:-0分钟}${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} 状态: ${C_GREEN}[运行中]${C_RESET} | 节点: ${C_YELLOW}${node_count}${C_RESET} | 核心: ${C_CYAN}${core_ver}${C_RESET}"
+    echo -e "${C_BLUE}│${C_RESET} 本机: ${local_loc} | 运行: ${C_YELLOW}${sys_uptime}${C_RESET}"
     echo -e "${C_BLUE}│${C_RESET} 延迟: V4: ${v4_delay} | V6: ${v6_delay}"
     echo -e "${C_BLUE}│${C_RESET} 系统 IPv4: ${C_GRAY}${sys_ip4}${C_RESET}"
     echo -e "${C_BLUE}│${C_RESET} 系统 IPv6: ${C_GRAY}${sys_ip6}${C_RESET}"
@@ -860,10 +917,11 @@ _check_model_config() {
   return 0
 }
 
-# 将当前模型配置同步生成到 XRAY_CONFIG，并做语法检查
 sync_xray_config() {
-  local model_cfg="$(_model_cfg)"
-  local out_cfg="$(_xray_cfg)"
+  local model_cfg
+  local out_cfg
+  model_cfg="$(_model_cfg)"
+  out_cfg="$(_xray_cfg)"
 
   _translate_model_to_xray "$model_cfg" "$out_cfg" || return 1
   _xray_test_config "$out_cfg"
@@ -884,26 +942,30 @@ resolve_service_cmd() {
 disown_temp_tunnel() {
   local TEMP_ARGO_DIR="/root/agsbx/temp_node"
   local TEMP_PID_FILE="$TEMP_ARGO_DIR/temp_cloudflared.pid"
-  local TEMP_XRAY_PID_FILE="$TEMP_ARGO_DIR/temp_xray.pid"  
-  
+  local TEMP_XRAY_PID_FILE="$TEMP_ARGO_DIR/temp_xray.pid"
+  local cfd_pid=""
+  local xray_pid=""
+
   if [[ -f "$TEMP_PID_FILE" ]]; then
-    local cfd_pid=$(cat "$TEMP_PID_FILE" 2>/dev/null)
+    cfd_pid=$(<"$TEMP_PID_FILE")
   else
-    local cfd_pid=$(pgrep -f "$TEMP_ARGO_DIR/cloudflared_temp" | head -n 1)
+    cfd_pid=$(pgrep -f "$TEMP_ARGO_DIR/cloudflared_temp" | head -n 1)
   fi
-  if [ -n "$cfd_pid" ] && ps -p "$cfd_pid" >/dev/null 2>&1; then
-    disown "$cfd_pid" 2>/dev/null || true 
+
+  if [[ -n "$cfd_pid" ]] && ps -p "$cfd_pid" >/dev/null 2>&1; then
+    disown "$cfd_pid" 2>/dev/null || true
   fi
-  
+
   if [[ -f "$TEMP_XRAY_PID_FILE" ]]; then
-    local xray_pid=$(cat "$TEMP_XRAY_PID_FILE" 2>/dev/null)
+    xray_pid=$(<"$TEMP_XRAY_PID_FILE")
   else
-    local xray_pid=$(pgrep -f "$TEMP_ARGO_DIR/xray_temp" | head -n 1)
+    xray_pid=$(pgrep -f "$TEMP_ARGO_DIR/xray_temp" | head -n 1)
   fi
-  if [ -n "$xray_pid" ] && ps -p "$xray_pid" >/dev/null 2>&1; then
+
+  if [[ -n "$xray_pid" ]] && ps -p "$xray_pid" >/dev/null 2>&1; then
     disown "$xray_pid" 2>/dev/null || true
   fi
-  
+
   rm -f "$TEMP_PID_FILE" "$TEMP_XRAY_PID_FILE"
   return 0
 }
@@ -912,7 +974,8 @@ _SYSTEMCTL_CMD="$(resolve_service_cmd systemctl || true)"
 _RCSERVICE_CMD="$(resolve_service_cmd rc-service || true)"
 
 _sb_any_port_listening() {
-  local cfg="$(_model_cfg)"
+  local cfg
+cfg="$(_model_cfg)"
   [[ -s "$cfg" ]] || return 1
   local ss_out
   ss_out=$(ss -ltnp 2>/dev/null)
@@ -1105,7 +1168,7 @@ enable_bbr() {
 
 # 修改后的安装函数
 install_xray_if_needed() {
-  local current_bin=$(_xray_bin)
+  local current_bin; current_bin=$(_xray_bin)
   if [[ "$1" != "--force" ]] && [[ -x "$current_bin" ]]; then return 0; fi
 
   # 1. 确保基础依赖（在子 shell 外处理，减少嵌套内存开销）
@@ -1204,10 +1267,11 @@ get_country_code() {
 }
 
 generate_unique_tag() {
-  local base="vless-reality-$(get_country_code)"
+  local base
+base="vless-reality-$(get_country_code)"
   local try=0 RAND CANDIDATE
   while true; do
-    RAND=$(tr -dc 'A-Z' </dev/urandom 2>/dev/null | head -c1)
+    RAND=$(tr -dc '[:upper:]' </dev/urandom | head -c1)
     CANDIDATE="${base}-${RAND}"
     if ! jq -e --arg t "$CANDIDATE" '.inbounds[] | select(.tag == $t)' "$CONFIG" >/dev/null 2>&1; then
       printf "%s\n" "$CANDIDATE"; return
@@ -1439,7 +1503,7 @@ install_watchdog_cron() {
 }
 
 install_singleton_wrapper() {
-  local xray_bin="/usr/local/bin/xray"
+ 
 
   # 1. 确保目录结构存在，并建立路径软链接
   mkdir -p /etc/xray /usr/local/etc/xray
@@ -2175,7 +2239,7 @@ add_node() {
           --arg port "$port" --arg user "$user" --arg pass "$pass" --arg tag "$tag"
         
         restart_xray "main_only"
-        local creds=$(printf "%s:%s" "$user" "$pass" | base64 -w0)
+        local creds; creds=$(printf "%s:%s" "$user" "$pass" | base64 -w0)
         print_card "SOCKS5 成功" "$tag" "端口: $port" "socks://${creds}@${PUBLIC_HOST}:${port}#${tag}"
     fi
 
@@ -2199,7 +2263,7 @@ add_node() {
 
         restart_xray "main_only"
         local userinfo="${method}:${pass}"
-        local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
+        local b64_creds; b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
         print_card "Shadowsocks 成功" "$tag" "端口: $port" "ss://${b64_creds}@${PUBLIC_HOST}:${port}#${tag}"
     fi
 
@@ -2210,7 +2274,11 @@ add_node() {
            safe_read port "请输入端口号 (留空随机, 输入0返回): "
            [[ "$port" == "0" ]] && return
            [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
-           check_nat_allow "$port" "tcp" && break || warn "端口 $port 不符合 NAT 限制"
+           if check_nat_allow "$port" "tcp"; then
+    break
+else
+    warn "端口 $port 不符合 NAT 限制"
+fi
         done
 
         local def_sni="www.microsoft.com"
@@ -2223,7 +2291,7 @@ add_node() {
         server_name="${input_sni:-$def_sni}"
         
         uuid=$(uuidgen)
-        local xray_cmd=$(_xray_bin)
+        local xray_cmd; xray_cmd=$(_xray_bin)
         extract_kv() { grep -iE "$1" | awk -F':' '{print $2}' | tr -d '[:space:]'; }
         key_pair=$($xray_cmd x25519 2>/dev/null)
         private_key=$(echo "$key_pair" | extract_kv 'private')
@@ -2239,7 +2307,7 @@ add_node() {
            --arg tag "$tag" --arg pbk "$public_key" --arg sid "$short_id" --arg sni "$server_name" --arg port "$port"
 
         restart_xray "main_only"
-        local host_link_disp=$(format_host_for_link "$PUBLIC_HOST")
+        local host_link_disp; host_link_disp=$(format_host_for_link "$PUBLIC_HOST")
         local link="vless://${uuid}@${host_link_disp}:${port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${public_key}&sid=${short_id}&sni=${server_name}&fp=chrome#${tag}"
         print_card "VLESS-REALITY 成功" "$tag" "端口: $port\nSNI: $server_name" "$link"
     fi
@@ -2251,11 +2319,15 @@ add_node() {
            safe_read port "请输入端口号 (留空随机, 输入0返回): "
            [[ "$port" == "0" ]] && return
            [[ -z "$port" ]] && port=$(get_random_allowed_port "tcp")
-           check_nat_allow "$port" "tcp" && break || warn "端口 $port 不符合 NAT 限制"
+           if check_nat_allow "$port" "tcp"; then
+    break
+else
+    warn "端口 $port 不符合 NAT 限制"
+fi
         done
 
         uuid=$(uuidgen)
-        local xray_cmd=$(_xray_bin)
+        local xray_cmd; xray_cmd=$(_xray_bin)
         say "正在生成 VLESS-ENC 原生密钥对..."
 
         get_vless_seed_internal() {
@@ -2292,7 +2364,6 @@ add_node() {
 # --- Hysteria 2 Logic (Keep Original) ---
 add_hysteria2_node() {
   ensure_runtime_deps
-  GLOBAL_IPV4=$(get_public_ipv4_ensure)
 
   local PUBLIC_HOST
   PUBLIC_HOST="$(get_public_ipv4_ensure)"
@@ -2306,7 +2377,7 @@ add_hysteria2_node() {
 
   # 安装 Hy2 核心
   if ! command -v hysteria >/dev/null 2>&1; then
-      local arch=$(uname -m); [[ "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
+      local arch; arch=$(uname -m); [[ "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
       curl -sSL "https://github.com/apernet/hysteria/releases/download/app/v2.6.2/hysteria-linux-${arch}" -o /usr/local/bin/hysteria
       chmod +x /usr/local/bin/hysteria
   fi
@@ -2315,7 +2386,7 @@ add_hysteria2_node() {
   local cert="/etc/hysteria2/${port}.crt"
   local key="/etc/hysteria2/${port}.key"
   local sni="www.bing.com"
-  local auth=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+  local auth; auth=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
 
   # 生成自签名证书
   openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$key" -out "$cert" -days 3650 -subj "/CN=$sni" >/dev/null 2>&1
@@ -2359,7 +2430,7 @@ EOF
 
   # 更新元数据 (移除 obfs 字段)
   local tag="Hy2-${port}"
-  local tmpm=$(mktemp)
+  local tmpm; tmpm=$(mktemp)
   jq --arg tag "$tag" --arg port "$port" --arg sni "$sni" --arg auth "$auth" \
     '. + {($tag): {type:"hysteria2", port:$port, sni:$sni, auth:$auth}}' "$META" >"$tmpm" && mv "$tmpm" "$META"
 
@@ -2374,7 +2445,9 @@ EOF
 call_233boy_builder() {
     local tag="$1"
     local port="$2"
-    local uuid=$(uuidgen)
+    # 正确写法
+local uuid
+uuid=$(uuidgen)
     
     # 1. 环境初始化 (屏蔽所有 233boy 脚本的安装输出)
     if ! command -v sb >/dev/null 2>&1; then
@@ -2389,7 +2462,7 @@ call_233boy_builder() {
     sb add tuic "$port" "$uuid" >/dev/null 2>&1
 
     # 3. 获取 IP 并生成你脚本原生风格的 UI 展示
-    local PUBLIC_HOST=$(get_public_ipv4_ensure)
+    local PUBLIC_HOST; PUBLIC_HOST=$(get_public_ipv4_ensure)
     
     # 构造动力链接 (包含 bbr、h3 和跳过证书验证参数)
     local link="tuic://${uuid}:${uuid}@${PUBLIC_HOST}:${port}?alpn=h3&allow_insecure=1&congestion_control=bbr#${tag}"
@@ -2476,7 +2549,8 @@ argo_menu_wrapper() {
 
         # 新增：自定义端口逻辑
         read -rp "请输入本地监听端口 (留空则自动分配): " input_port
-        local port=${input_port:-$(get_random_allowed_port "tcp")}
+        local link
+link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
         
         # 简单检查端口占用
         if lsof -i:"$port" >/dev/null 2>&1; then
@@ -2484,7 +2558,7 @@ argo_menu_wrapper() {
             return
         fi
 
-        local uuid=$(uuidgen); local path="/vm-${port}"; local tag="Argo-${port}"
+        local uuid; uuid=$(uuidgen); local path="/vm-${port}"; local tag="Argo-${port}"
         mkdir -p "/etc/xray/argo_users"
         local pref ds lock_ip
         IFS=$'	' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
@@ -2498,10 +2572,12 @@ EOF
         nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$token" >/dev/null 2>&1 &
         
         local vm_json='{"v":"2","ps":"'$tag'","add":"'$domain'","port":"443","id":"'$uuid'","net":"ws","path":"'$path'","tls":"tls","sni":"'$domain'","host":"'$domain'"}'
-        local link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
+        # 将声明与赋值分开
+local link
+link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
         
         # 存入 Meta，包含 Token 和 Port
-        local tmp=$(mktemp)
+        local tmp; tmp=$(mktemp)
         jq --arg t "$tag" --arg p "$port" --arg d "$domain" --arg raw "$link" --arg tk "$token" \
           '. + {($t): {type:"argo", subtype:"fixed", port:$p, domain:$d, raw:$raw, token:$tk}}' "$META" >"$tmp" && mv "$tmp" "$META"
         print_card "固定隧道配置成功" "$tag" "域名: $domain\n端口: $port" "$link"
@@ -2525,7 +2601,7 @@ EOF
         cp "$ARGO_DIR/cloudflared" "$ARGO_DIR/temp_node/cloudflared_temp"
         chmod +x "$ARGO_DIR/temp_node/xray_temp" "$ARGO_DIR/temp_node/cloudflared_temp"
         
-        local port=$((RANDOM % 10000 + 40000)); local uuid=$(uuidgen); local path="/$uuid"
+        local port; port=$((RANDOM % 10000 + 40000)); local uuid; uuid=$(uuidgen); local path="/$uuid"
         local pref ds lock_ip
         IFS=$'\t' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
         local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
@@ -2555,8 +2631,10 @@ EOF
 
         local domain=${url#https://}; local tag="Argo-Temp"
         local vm_json='{"v":"2","ps":"'$tag'","add":"'$domain'","port":"443","id":"'$uuid'","net":"ws","path":"'$path'","tls":"tls","sni":"'$domain'","host":"'$domain'"}'
-        local link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
-        local tmp=$(mktemp)
+        # 将声明与赋值分开
+local link
+link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
+        local tmp; tmp=$(mktemp)
         jq --arg t "$tag" --arg raw "$link" '. + {($t): {type:"argo", subtype:"temp", raw:$raw}}' "$META" >"$tmp" && mv "$tmp" "$META"
         print_card "临时隧道成功" "$tag" "域名: $domain" "$link"
         read -rp "按回车继续..." _
@@ -2565,7 +2643,7 @@ EOF
     uninstall_argo_all() {
         pkill -f "/root/agsbx"
         rm -rf /root/agsbx
-        local tmp=$(mktemp)
+        local tmp; tmp=$(mktemp)
         jq 'to_entries | map(select(.value.type != "argo")) | from_entries' "$META" > "$tmp" && mv "$tmp" "$META"
         ok "Argo 数据已清理"
     }
@@ -2577,19 +2655,24 @@ EOF
       say "3) 重启所有隧道服务 ${C_GREEN}(新增)${C_RESET}"
       say "4) 卸载/清理"
       say "0) 返回"
-      safe_read ac "选择: "
+      
+      local ac=""
+      safe_read ac " 请选择操作: "
+
       case "$ac" in
           1) temp_tunnel_logic ;;
           2) add_argo_user ;;
           3) restart_argo_services ;;
-          4) uninstall_argo_all ;;      0) return ;;
+          4) uninstall_argo_all ;;
+          0) return ;;
+          *) warn "无效选项" ;;
       esac
     done
-}
+} # 确保函数闭合
 
 view_nodes_menu() {
-  local V4_ADDR=$(get_public_ipv4_ensure)
-  local V6_ADDR=$(get_public_ipv6_ensure)
+  local V4_ADDR; V4_ADDR=$(get_public_ipv4_ensure)
+  local V6_ADDR; V6_ADDR=$(get_public_ipv6_ensure)
   local global_pref="v4"
   [[ -f "/etc/xray/ip_pref" ]] && global_pref=$(cat /etc/xray/ip_pref)
   
@@ -2685,7 +2768,7 @@ view_nodes_menu() {
   read -rp " 请选择要查看详情的节点序号: " v_choice
   [[ -z "$v_choice" || "$v_choice" == "0" ]] && return
   
-  local sel_idx=$((v_choice - 1))
+  local sel_idx; sel_idx=$((v_choice - 1))
   local target_tag="${NODE_TAGS[$sel_idx]}"
   local t_type="${NODE_TYPES[$sel_idx]}"
   local t_ip="${NODE_IPS[$sel_idx]}"
@@ -2697,35 +2780,35 @@ view_nodes_menu() {
   local final_link=""
   
   if [[ "${t_type,,}" == "shadowsocks" ]]; then
-      local method=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .method // "aes-256-gcm"' "$CONFIG" 2>/dev/null)
-      local pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .password // ""' "$CONFIG" 2>/dev/null)
+      local method; method=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .method // "aes-256-gcm"' "$CONFIG" 2>/dev/null)
+      local pass; pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .password // ""' "$CONFIG" 2>/dev/null)
       local userinfo="${method}:${pass}"
-      local b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
+      local b64_creds; b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
       final_link="ss://${b64_creds}@${t_ip}:${t_port}#${target_tag}"
       print_card "Shadowsocks 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n加密: ${method}\n密码: ${pass}" "$final_link"
 
   elif [[ "${t_type,,}" == "socks" ]]; then
-      local user=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].username // "user"' "$CONFIG" 2>/dev/null)
-      local pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].password // "pass"' "$CONFIG" 2>/dev/null)
+      local user; user=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].username // "user"' "$CONFIG" 2>/dev/null)
+      local pass; pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].password // "pass"' "$CONFIG" 2>/dev/null)
       final_link="socks://$(printf "%s:%s" "$user" "$pass" | base64 -w0)@${t_ip}:${t_port}#${target_tag}"
       print_card "SOCKS5 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n用户: ${user}\n密码: ${pass}" "$final_link"
 
   elif [[ "${t_type,,}" == "vless" ]]; then
       # 核心修复：必须先从文件读取 meta 数据
-      local meta_json=$(cat "$META" 2>/dev/null || echo "{}")
-      local uuid=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG" 2>/dev/null)
-      local c_seed=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].client_seed // empty')
+      local meta_json; meta_json=$(cat "$META" 2>/dev/null || echo "{}")
+      local uuid; uuid=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG" 2>/dev/null)
+      local c_seed; c_seed=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].client_seed // empty')
       
       # 格式化主机地址 (IPv6 自动加方括号)
-      local host_disp=$(format_host_for_link "$t_ip")
+      local host_disp; host_disp=$(format_host_for_link "$t_ip")
 
       if [[ -n "$c_seed" && "$c_seed" != "null" && "$c_seed" != "" ]]; then
           final_link="vless://${uuid}@${host_disp}:${t_port}?encryption=${c_seed}&type=tcp&security=none#${target_tag}"
           print_card "VLESS-ENC 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\n客户端密钥: ${c_seed:0:15}..." "$final_link"
       else
-          local pbk=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')
-          local sid=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')
-          local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')
+          local pbk; pbk=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')
+          local sid; sid=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')
+          local sni; sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')
           
           # 构造带方括号的 V6 链接
           final_link="vless://${uuid}@${host_disp}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
@@ -2733,8 +2816,8 @@ view_nodes_menu() {
       fi
 
   elif [[ "${t_type,,}" == "hysteria2" ]]; then
-      local auth=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth // empty')
-      local sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.bing.com"')
+      local auth; auth=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth // empty')
+      local sni; sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.bing.com"')
       final_link="hysteria2://${auth}@${t_ip}:${t_port}?sni=${sni}&insecure=1#${target_tag}"
       print_card "Hysteria2 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n认证: ${auth}\nSNI: ${sni}" "$final_link"
 
@@ -2743,7 +2826,7 @@ view_nodes_menu() {
       print_card "Argo Tunnel 详情" "$target_tag" "出口类型: Cloudflare 隧道" "$final_link"
 
   elif [[ "${t_type,,}" == "vmess" ]]; then
-      local uuid=$(jq -r --arg t "$target_tag" '.outbounds[] | select(.tag==$t) | .settings.vnext[0].users[0].id' "$CONFIG" 2>/dev/null)
+      local uuid; uuid=$(jq -r --arg t "$target_tag" '.outbounds[] | select(.tag==$t) | .settings.vnext[0].users[0].id' "$CONFIG" 2>/dev/null)
       print_card "VMess 落地详情" "$target_tag" "此为落地出口节点，UUID: ${uuid}" "需配合分流规则使用"
   fi
 
@@ -2811,12 +2894,12 @@ delete_node() {
   # 🚀 优化 A：在循环内只做非 JSON 的系统操作 (服务停止/进程杀除)
   for target_tag in "${selected_tags[@]}"; do
       if [[ "$target_tag" =~ Hy2 ]]; then
-          local p=$(echo "$target_tag" | grep -oE '[0-9]+')
+          local p; p=$(echo "$target_tag" | grep -oE '[0-9]+')
           [[ -n "$p" ]] && systemctl disable --now "hysteria2-$p" 2>/dev/null && rm -f "/etc/systemd/system/hysteria2-$p.service"
       fi
       if [[ "$target_tag" =~ Argo ]]; then
           # 针对性杀掉该端口的 argo 进程，而不是 pkill 全部
-          local ap=$(jq -r --arg t "$target_tag" '.[$t].port // empty' "$META" 2>/dev/null)
+          local ap; ap=$(jq -r --arg t "$target_tag" '.[$t].port // empty' "$META" 2>/dev/null)
           [[ -n "$ap" ]] && pkill -f "/etc/xray/argo_users/${ap}.json" 2>/dev/null
       fi
   done
@@ -2850,7 +2933,8 @@ delete_node() {
 
 import_link_outbound() {
     local link="$1"
-    local tag="IMP-$(date +%s)"
+    local tag
+tag="IMP-$(date +%s)"
     local type="" server="" port="" user="" pass="" new_node=""
     
     say "正在启动专业级解析与内核预校验..."
@@ -2859,7 +2943,7 @@ import_link_outbound() {
         local main_part="${link#ss://}"
         local userinfo_b64="${main_part%%@*}"
         local server_info="${main_part#*@}"
-        local decoded=$(printf "%s" "$userinfo_b64" | base64 -d 2>/dev/null | tr -d '\n\r')
+        local decoded; decoded=$(printf "%s" "$userinfo_b64" | base64 -d 2>/dev/null | tr -d '\n\r')
         [[ -z "$decoded" ]] && { err "Base64 解码失败"; return 1; }
         local method="${decoded%%:*}"
         local password="${decoded#*:}"
@@ -2872,8 +2956,8 @@ import_link_outbound() {
             '{type: "shadowsocks", tag: $t, server: $s, server_port: ($p|tonumber), method: $m, password: $pw}')
         type="ss"
     elif [[ "$link" == vless://* ]]; then
-        local uuid=$(echo "$link" | cut -d'@' -f1 | sed 's/vless:\/\///')
-        local server_port_raw=$(echo "$link" | cut -d'@' -f2 | cut -d'?' -f1)
+        local uuid; uuid=$(echo "$link" | cut -d'@' -f1 | sed 's/vless:\/\///')
+        local server_port_raw; server_port_raw=$(echo "$link" | cut -d'@' -f2 | cut -d'?' -f1)
         server="${server_port_raw%%:*}"
         port="${server_port_raw##*:}"
         port=$(echo "$port" | tr -cd '0-9')
@@ -2911,23 +2995,26 @@ import_link_outbound() {
         type="vless"
     elif [[ "$link" == vmess://* ]]; then
         local b64_data="${link#vmess://}"
-        local decoded=$(echo "$b64_data" | base64 -d 2>/dev/null)
+        local decoded; decoded=$(echo "$b64_data" | base64 -d 2>/dev/null)
         [[ -z "$decoded" ]] && { err "VMess Base64 解码失败"; return 1; }
         server=$(echo "$decoded" | jq -r '.add // empty')
         port=$(echo "$decoded" | jq -r '.port // empty')
-        local uuid=$(echo "$decoded" | jq -r '.id // empty')
-        local net=$(echo "$decoded" | jq -r '.net // "tcp"')
-        local path=$(echo "$decoded" | jq -r '.path // ""')
-        local host=$(echo "$decoded" | jq -r '.host // ""')
-        local tls=$(echo "$decoded" | jq -r '.tls // "none"')
-        local sni=$(echo "$decoded" | jq -r '.sni // ""')
+        local uuid; uuid=$(echo "$decoded" | jq -r '.id // empty')
+        local net; net=$(echo "$decoded" | jq -r '.net // "tcp"')
+        local path; path=$(echo "$decoded" | jq -r '.path // ""')
+        local host; host=$(echo "$decoded" | jq -r '.host // ""')
+        local tls; tls=$(echo "$decoded" | jq -r '.tls // "none"')
+        local sni; sni=$(echo "$decoded" | jq -r '.sni // ""')
         new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg u "$uuid" --arg net "$net" --arg path "$path" --arg host "$host" --arg tls "$tls" --arg sni "$sni" \
             '{type: "vmess", tag: $t, server: $s, server_port: ($p|tonumber), uuid: $u, transport: { type: $net, ws_settings: { path: $path, headers: { Host: $host } } }, tls: { enabled: (if $tls == "tls" then true else false end), server_name: $sni }}')
         type="vmess"
     fi
 
     test_outbound_connection "$type" "$server" "$port" "" ""
-    [[ $? -ne 0 ]] && { warn "落地探测不通，已取消导入"; return 1; }
+    if ! test_outbound_connection "$type" "$server" "$port" "$user" "$pass"; then
+    warn "落地测试未通过，已取消添加。"
+    return 1
+fi
 
     local sandbox="/tmp/sb_test_config.json"
     cp "$CONFIG" "$sandbox"
@@ -3215,7 +3302,7 @@ list_and_del_routing_rules() {
 
     # 1) 删除单条：输入纯数字
     if [[ "$action" =~ ^[0-9]+$ ]]; then
-        local del_idx=$((action-1))
+        local del_idx; del_idx=$((action-1))
         if (( del_idx < 0 || del_idx >= total )); then
             err "无效序号"
             return
@@ -3249,24 +3336,43 @@ list_and_del_routing_rules() {
 
 
 
-
-# --- NAT Mode Menu ---
 nat_mode_menu() {
   load_nat_data
+
+  local nm=""
+  local tmp=""
+  local r=""
+  local p=""
+  local arr_json=""
+
   echo -e "\n${C_CYAN}当前 NAT 模式: ${nat_mode:-关闭}${C_RESET}"
   echo "1) 范围端口"
   echo "2) 自定义 TCP/UDP"
   echo "3) 关闭"
-  read -rp "选择: " nm
-  local tmp=$(mktemp)
+
+  read -r -p "选择: " nm
+  tmp=$(mktemp)
+
   case "$nm" in
-      1) read -rp "输入范围 (10000-20000): " r
-         jq -n --arg r "$r" '{"mode":"range","ranges":[$r]}' > "$tmp" && mv "$tmp" "$NAT_FILE" ;;
-      2) read -rp "输入端口 (空格分隔): " p
-         local arr=$(echo "$p" | jq -R 'split(" ")|map(tonumber)')
-         jq -n --argjson a "$arr" '{"mode":"custom","custom_tcp":$a}' > "$tmp" && mv "$tmp" "$NAT_FILE" ;;
-      3) rm -f "$NAT_FILE" ;;
+      1)
+         read -r -p "输入范围 (10000-20000): " r
+         jq -n --arg r "$r" '{"mode":"range","ranges":[$r]}' > "$tmp" && mv "$tmp" "$NAT_FILE"
+         ;;
+      2)
+         read -r -p "输入端口 (空格分隔): " p
+         arr_json=$(printf '%s' "$p" | jq -R 'split(" ")|map(select(length>0))|map(tonumber)')
+         jq -n --argjson a "$arr_json" '{"mode":"custom","custom_tcp":$a}' > "$tmp" && mv "$tmp" "$NAT_FILE"
+         ;;
+      3)
+         rm -f "$NAT_FILE"
+         ;;
+      *)
+         warn "无效输入"
+         rm -f "$tmp"
+         return 1
+         ;;
   esac
+
   ok "设置已保存"
 }
 
@@ -3277,103 +3383,114 @@ show_menu_banner() {
     get_sys_status
 }
 # ============= 新增：状态维护子菜单 (UI优化+纯卸载逻辑) =============
+# ============= 状态维护子菜单 (ShellCheck 规范优化版) =============
 status_menu() {
-  while true; do
-    # 保留交互感，不强行 clear
-    echo -e "\n${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
-    echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 "
-    echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 "
-    echo -e " ${C_GREEN}3.${C_RESET} 更新核心版本 "
-    echo -e " ${C_RED}4.${C_RESET} 彻底卸载脚本 "
-    echo -e " ${C_GREEN}0.${C_RESET} 返回上级菜单"
-    echo ""
+    # 1. 显式声明局部变量，解决 SC2154/SC2155
+    local sc="" confirm="" self_path="" hy2_services="" svc=""
 
-    safe_read sc " 请输入选项: "
-    case "$sc" in
-      1) 
-          check_and_repair_menu
-          ;;
-      2) 
-          restart_xray
-          read -rp "按回车继续..." _
-          ;;
-      3) 
-          say "正在更新 Xray..."
-          rm -f /usr/local/bin/xray
-          install_xray_if_needed
-          restart_xray
-          read -rp "按回车继续..." _
-          ;;
-      4) 
-          echo ""
-          warn "⚠️  警告：此操作将永久删除所有节点配置、内核程序、运行日志、服务文件以及脚本自身！"
-          read -rp " 确认要彻底卸载并自毁脚本吗？(y/N): " confirm
-          if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-              say "正在执行强力清理程序..."
+    while true; do
+        echo -e "\n${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
+        echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 "
+        echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 "
+        echo -e " ${C_GREEN}3.${C_RESET} 更新核心版本 "
+        echo -e " ${C_RED}4.${C_RESET} 彻底卸载脚本 "
+        echo -e " ${C_GREEN}0.${C_RESET} 返回上级菜单"
+        echo ""
 
-              # 1. 停止并禁用所有相关服务
-              say "停止服务项..."
-              systemctl stop xray 2>/dev/null
-              systemctl disable xray 2>/dev/null
-              # 自动搜索并停止所有动态生成的 Hysteria2 服务
-              if command -v systemctl >/dev/null 2>&1; then
-                  local hy2_services
-                  hy2_services=$(systemctl list-unit-files | grep "hysteria2-" | awk '{print $1}')
-                  for svc in $hy2_services; do
-                      systemctl stop "$svc" 2>/dev/null
-                      systemctl disable "$svc" 2>/dev/null
-                      rm -f "/etc/systemd/system/$svc"
-                  done
-              fi
+        # 调用 safe_read，sc 已在顶部声明
+        local sc=""  # 👈 新增初始化
+safe_read sc " 请输入选项: "
 
-              # 2. 强力终止残留进程
-              say "终止残留进程 (Xray/Hy2/Argo)..."
-              pkill -9 -f "/usr/local/bin/xray" 2>/dev/null
-              pkill -9 -f "hysteria server" 2>/dev/null
-              pkill -9 -f "cloudflared" 2>/dev/null
-              pkill -9 -f "xray-singleton" 2>/dev/null
+        case "$sc" in
+            1)
+                check_and_repair_menu
+                ;;
+            2)
+                restart_xray
+                read -rp "按回车继续..." _
+                ;;
+            3)
+                say "正在尝试更新 Xray 核心..."
+                # 物理删除旧二进制，确保安装最新版
+                rm -f /usr/local/bin/xray
+                if install_xray_if_needed; then
+                    restart_xray
+                else
+                    err "核心更新失败。"
+                fi
+                read -rp "按回车继续..." _
+                ;;
+            4)
+                echo ""
+                warn "⚠️  警告：此操作将永久删除所有节点、内核、日志及脚本自身！"
+                read -rp " 确认要彻底卸载并自毁脚本吗？(y/N): " confirm
+                
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    say "正在执行强力清理程序..."
 
-              # 3. 清除所有二进制程序与目录
-              say "抹除核心文件与配置..."
-              # Xray 相关
-              rm -rf /etc/xray /var/log/xray.log /usr/local/bin/xray /usr/local/bin/xray-singleton /usr/local/bin/xray-sync
-              rm -f /etc/systemd/system/xray.service /etc/init.d/xray
-              # Hysteria 相关
-              rm -rf /etc/hysteria2 /usr/local/bin/hysteria
-              # Argo 相关
-              rm -rf /root/agsbx
+                    # --- A. 停止并禁用所有相关服务 ---
+                    say "停止服务项与清理守护任务..."
+                    systemctl stop xray 2>/dev/null
+                    systemctl disable xray 2>/dev/null
+                    
+                    # 动态搜索并清理所有 Hysteria2 服务
+                    if command -v systemctl >/dev/null 2>&1; then
+                        hy2_services=$(systemctl list-unit-files | grep "hysteria2-" | awk '{print $1}')
+                        for svc in $hy2_services; do
+                            systemctl stop "$svc" 2>/dev/null
+                            systemctl disable "$svc" 2>/dev/null
+                            rm -f "/etc/systemd/system/$svc"
+                        done
+                        systemctl daemon-reload 2>/dev/null
+                    fi
 
-              # 4. 清除缓存、环境变量与快捷指令
-              say "清理环境变量与别名..."
-              rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"*
-              sed -i '/alias my=/d' /root/.bashrc
-              sed -i '/alias MY=/d' /root/.bashrc
-              
-              # 刷新系统服务列表
-              systemctl daemon-reload 2>/dev/null
+                    # --- B. 强力终止所有残留进程 ---
+                    say "终止进程池 (Xray/Hy2/Argo/Watchdog)..."
+                    pkill -9 -f "/usr/local/bin/xray" 2>/dev/null
+                    pkill -9 -f "hysteria server" 2>/dev/null
+                    pkill -9 -f "cloudflared" 2>/dev/null
+                    pkill -9 -f "xray-singleton" 2>/dev/null
 
-              # 5. 脚本自毁逻辑
-              local self_path
-              self_path=$(readlink -f "$0") 
-              
-              ok "卸载完成！服务器已恢复洁净状态。"
-              
-              if [[ -f "$self_path" ]]; then
-                  say "脚本自毁中: $self_path"
-                  rm -f "$self_path"
-              fi
-              
-              echo -e "${C_PURPLE}江湖再见，祝你一路顺风！${C_RESET}"
-              exit 0
-          else
-              say "已取消卸载。"
-              sleep 1
-          fi
-          ;;
-      0) return ;;
-      *) warn "无效选项"; sleep 1 ;;
-    esac
-  done
+                    # --- C. 抹除文件系统记录 ---
+                    say "物理擦除核心文件与配置目录..."
+                    # 批量删除
+                    rm -rf /etc/xray /var/log/xray.log /usr/local/bin/xray \
+                           /usr/local/bin/xray-singleton /usr/local/bin/xray-sync \
+                           /etc/systemd/system/xray.service /etc/init.d/xray \
+                           /etc/hysteria2 /usr/local/bin/hysteria /root/agsbx
+
+                    # --- D. 清理环境变量与快捷指令 ---
+                    say "还原 .bashrc 别名设置..."
+                    rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"*
+                    # 一次性清理 my 和 MY 别名
+                    sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
+
+                    # --- E. 脚本自毁 ---
+                    self_path=$(readlink -f "$0" 2>/dev/null)
+                    ok "卸载完成！服务器已恢复纯净状态。"
+                    
+                    if [[ -f "$self_path" ]]; then
+                        say "脚本执行自毁: $self_path"
+                        # 延迟 1 秒删除自身，防止执行流中断报错
+                        rm -f "$self_path"
+                    fi
+                    
+                    echo -e "${C_PURPLE}江湖再见，祝你一路顺风！${C_RESET}"
+                    exit 0
+                else
+                    say "卸载已取消。"
+                    sleep 1
+                fi
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "无效选项: $sc"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # === 将“节点锁定出口IP”真正写入模型配置（/etc/xray/config.json） ===
@@ -3546,14 +3663,14 @@ _global_ip_version_menu() {
         lock_file="/etc/xray/global_egress_ip_${target_v}"
         local old_pref old_locked selected_fixed_ip=""
         old_pref="$(_get_global_mode)"
-        old_locked="$(cat "$lock_file" 2>/dev/null | tr -d '\r\n ')"
+        old_locked="$(tr -d '\r\n ' < "$lock_file" 2>/dev/null)"
 
         if [[ $target_count -ge 1 ]]; then
             echo -e "\n${C_CYAN}检测到可用的 ${target_v^^} 出口，请选择出口策略：${C_RESET}"
             local n=0
             for line in "${TARGET_IP_LIST[@]}"; do
                 n=$((n+1))
-                local check_ip=$(echo "$line" | awk '{print $1}')
+                local check_ip; check_ip=$(echo "$line" | awk '{print $1}')
                 if _is_bindable "$check_ip"; then
                     echo -e " ${C_GREEN}[$n]${C_RESET} $line ${C_GREEN}(可锁定)${C_RESET}"
                 else
@@ -3573,7 +3690,7 @@ _global_ip_version_menu() {
             fi
 
             if [[ "$ip_sel" =~ ^[0-9]+$ ]] && (( ip_sel >= 1 && ip_sel <= n )); then
-                local candidate_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+                local candidate_ip; candidate_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
                 if _is_bindable "$candidate_ip"; then
                     selected_fixed_ip="$candidate_ip"
                 else
@@ -3706,11 +3823,11 @@ ip_version_menu() {
     done
 
     # 4. 服务器全局策略
-    local g_idx=$((i+1))
+    local g_idx; g_idx=$((i+1))
     printf " ${C_GREEN}[%d]${C_RESET} ${C_CYAN}服务器全局策略\033[40G${C_PURPLE}(当前全局：${C_RESET}%s${C_PURPLE})${C_RESET}\n" "$g_idx" "$g_label"
     
     # 5. 【升级】核弹级一键重置选项 (颜色标红警示)
-    local r_idx=$((i+2))
+    local r_idx; r_idx=$((i+2))
     printf " ${C_GREEN}[%d]${C_RESET} ${C_RED}一键重置：恢复全局 并 清除所有节点独立设置${C_RESET}\n" "$r_idx"
     
     echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单\n"
@@ -3760,71 +3877,85 @@ ip_version_menu() {
 
 # ============= 完全独立的 Hysteria2 网络配置刷新 =============
 # ============= 完全独立的 Hysteria2 网络配置刷新 (路由语法终极修复版) =============
+# ============= 完全独立的 Hysteria2 网络配置刷新 (ShellCheck 优化版) =============
 sync_hy2_network() {
-    local tags; tags=$(jq -r 'to_entries[] | select(.value.type=="hysteria2") | .key' "$META" 2>/dev/null)
+    # 1. 声明所有局部变量 (SC2155: 避免 local 掩盖子 shell 退出码)
+    local tags g_pref g_v4 g_v6
+    local port ip_mode fixed_ip eff_mode eff_ip hy2_mode cfg svc
+
+    # 获取所有 Hy2 类型的节点标签
+    tags=$(jq -r 'to_entries[]? | select(.value.type=="hysteria2") | .key' "$META" 2>/dev/null)
     [[ -z "$tags" ]] && return 0
 
-    local g_pref; g_pref=$(_get_global_mode)
-    local g_v4; g_v4=$(_read_global_lock_ip_by_family v4)
-    local g_v6; g_v6=$(_read_global_lock_ip_by_family v6)
+    # 获取全局 IP 偏好
+    g_pref=$(_get_global_mode)
+    g_v4=$(_read_global_lock_ip_by_family v4)
+    g_v6=$(_read_global_lock_ip_by_family v6)
 
+    # 遍历标签进行配置同步
     for t in $tags; do
-        local port; port=$(jq -r --arg t "$t" '.[$t].port' "$META")
-        local ip_mode; ip_mode=$(jq -r --arg t "$t" '.[$t].ip_mode // "follow_global"' "$META")
-        local fixed_ip; fixed_ip=$(jq -r --arg t "$t" '.[$t].fixed_ip // empty' "$META")
+        # 获取节点具体参数
+        port=$(jq -r --arg t "$t" '.[$t].port // empty' "$META" 2>/dev/null)
+        [[ -z "$port" ]] && continue
+
+        ip_mode=$(jq -r --arg t "$t" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
+        fixed_ip=$(jq -r --arg t "$t" '.[$t].fixed_ip // empty' "$META" 2>/dev/null)
         
-        local eff_mode="$ip_mode"
-        local eff_ip="$fixed_ip"
+        eff_mode="$ip_mode"
+        eff_ip="$fixed_ip"
         
+        # 处理“跟随全局”逻辑
         if [[ "$eff_mode" == "follow_global" || "$eff_mode" == "follow" || "$eff_mode" == "null" || -z "$eff_mode" ]]; then
             eff_mode="$g_pref"
             case "$g_pref" in
                 v6pref|v6only|v6) eff_ip="$g_v6" ;;
                 v4pref|v4only|v4) eff_ip="$g_v4" ;;
-                *) eff_ip="" ;;
+                *)                eff_ip="" ;;
             esac
         fi
         
-        local hy2_mode="auto"
+        # 映射 Hy2 内部的 mode (4, 6, 46, 64)
         case "$eff_mode" in
             v4pref|v4) hy2_mode="46" ;;
             v6pref|v6) hy2_mode="64" ;;
-            v4only)    hy2_mode="4" ;;
-            v6only)    hy2_mode="6" ;;
+            v4only)    hy2_mode="4"  ;;
+            v6only)    hy2_mode="6"  ;;
             off)       hy2_mode="auto"; eff_ip="" ;;
             *)         hy2_mode="auto" ;;
         esac
         
-        local cfg="/etc/hysteria2/${port}.yaml"
+        cfg="/etc/hysteria2/${port}.yaml"
         if [[ -f "$cfg" ]]; then
-            # 1. 强力清理旧的 outbounds 和 acl
+            # 1. 清理旧的出站和 ACL 配置
             sed -i '/^outbound:/,$d' "$cfg"
             sed -i '/^outbounds:/,$d' "$cfg"
             sed -i '/^acl:/,$d' "$cfg"
             
-            # 2. 追加正确的服务器端出站设置与严格 ACL 语法
+            # 2. 写入新的网络出口规则 (SC2129: 使用代码块聚合重定向，提高效率)
             if [[ "$hy2_mode" != "auto" || -n "$eff_ip" ]]; then
-                echo "outbounds:" >> "$cfg"
-                echo "  - name: my_egress" >> "$cfg"
-                echo "    type: direct" >> "$cfg"
-                echo "    direct:" >> "$cfg"
-                echo "      mode: \"$hy2_mode\"" >> "$cfg"
-                if [[ -n "$eff_ip" && "$eff_ip" != "null" ]]; then
-                    if [[ "$eff_ip" == *:* ]]; then
-                        echo "      bindIPv6: \"$eff_ip\"" >> "$cfg"
-                    else
-                        echo "      bindIPv4: \"$eff_ip\"" >> "$cfg"
+                {
+                    echo "outbounds:"
+                    echo "  - name: my_egress"
+                    echo "    type: direct"
+                    echo "    direct:"
+                    echo "      mode: \"$hy2_mode\""
+                    if [[ -n "$eff_ip" && "$eff_ip" != "null" ]]; then
+                        if [[ "$eff_ip" == *:* ]]; then
+                            echo "      bindIPv6: \"$eff_ip\""
+                        else
+                            echo "      bindIPv4: \"$eff_ip\""
+                        fi
                     fi
-                fi
-                echo "acl:" >> "$cfg"
-                echo "  inline:" >> "$cfg"
-                # 核心修复：必须是 策略(规则) 的格式
-                echo "    - \"my_egress(all)\"" >> "$cfg"
+                    echo "acl:"
+                    echo "  inline:"
+                    echo "    - \"my_egress(all)\""
+                } >> "$cfg"
             fi
             
-            # 3. 独立重启 HY2 进程使其生效
-            if command -v systemctl >/dev/null 2>&1 && [[ -f "/etc/systemd/system/hysteria2-${port}.service" ]]; then
-                systemctl restart "hysteria2-${port}" 2>/dev/null || true
+            # 3. 重启服务 (兼容 systemd 和进程管理)
+            svc="hysteria2-${port}"
+            if command -v systemctl >/dev/null 2>&1 && [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+                systemctl restart "$svc" 2>/dev/null || true
             else
                 pkill -f "hysteria server -c $cfg" 2>/dev/null || true
                 nohup /usr/local/bin/hysteria server -c "$cfg" >/dev/null 2>&1 &
@@ -3872,7 +4003,8 @@ _node_ip_mode_menu() {
     old_mode=$(jq -r --arg t "$target_tag" '.[$t].ip_mode // "follow_global"' "$META" 2>/dev/null)
     old_fixed_ip=$(jq -r --arg t "$target_tag" '.[$t].fixed_ip // empty' "$META" 2>/dev/null)
     old_ip_version=$(jq -r --arg t "$target_tag" '.[$t].ip_version // empty' "$META" 2>/dev/null)
-    local cur_label="$(_ip_mode_desc "$old_mode")"
+    local cur_label
+cur_label="$(_ip_mode_desc "$old_mode")"
 
     printf " ${C_RESET}当前节点模式：${C_YELLOW}%s${C_RESET} ${C_PURPLE}(${C_RESET}%s${C_PURPLE})${C_RESET}\n\n" "$old_mode" "$cur_label"
 
@@ -3902,8 +4034,13 @@ _node_ip_mode_menu() {
         local selected_fixed_ip=""
         local -a TARGET_IP_LIST=()
         local target_count=0
-        [[ "$target_v" == "v6" ]] && { TARGET_IP_LIST=("${V6_LIST[@]}"); target_count=$v6_count; } \
-                                  || { TARGET_IP_LIST=("${V4_LIST[@]}"); target_count=$v4_count; }
+        if [[ "$target_v" == "v6" ]]; then
+    TARGET_IP_LIST=("${V6_LIST[@]}")
+    target_count=$v6_count
+else
+    TARGET_IP_LIST=("${V4_LIST[@]}")
+    target_count=$v4_count
+fi
 
         local __abort_lock_choose=0
 
@@ -3912,7 +4049,7 @@ _node_ip_mode_menu() {
             local n=0
             for line in "${TARGET_IP_LIST[@]}"; do
                 n=$((n+1))
-                local check_ip=$(echo "$line" | awk '{print $1}')
+                local check_ip; check_ip=$(echo "$line" | awk '{print $1}')
                 if _is_bindable "$check_ip"; then
                     echo -e " ${C_GREEN}[$n]${C_RESET} $line ${C_GREEN}(可锁定)${C_RESET}"
                 else
@@ -3933,7 +4070,7 @@ _node_ip_mode_menu() {
             fi
 
             if [[ "${__abort_lock_choose:-0}" != "1" ]] && [[ "$ip_sel" =~ ^[0-9]+$ ]] && (( ip_sel >= 1 && ip_sel <= n )); then
-                local candidate_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
+                local candidate_ip; candidate_ip=$(echo "${TARGET_IP_LIST[$((ip_sel-1))]}" | awk '{print $1}')
                 if _is_bindable "$candidate_ip"; then
                     selected_fixed_ip="$candidate_ip"
                 else
@@ -4044,9 +4181,11 @@ add_manual_proxy_outbound() {
         return 1
     fi
 
-    # 2) 测试连接
-    test_outbound_connection "$proto" "$server" "$port" "$user" "$pass"
-    [[ $? -ne 0 ]] && { warn "落地测试未通过，已取消添加。"; return 1; }
+    # 修复 line 3216 附近的逻辑
+if ! test_outbound_connection "$proto" "$server" "$port" "$user" "$pass"; then
+    warn "落地测试未通过，已取消添加。"
+    return 1
+fi
 
     # 3) 构建 JSON（关键修复：把 u/pw 传给 jq）
     local new_node
@@ -4107,7 +4246,8 @@ outbound_menu() {
     say "8) 一键诊断并修复配置 (救急专用)"
     say "0) 返回主菜单"
     
-    safe_read ob_choice " 请选择操作 [0-8]: "
+    local ob_choice=""  # 👈 新增初始化
+safe_read ob_choice " 请选择操作 [0-8]: "
     case "$ob_choice" in
       1|2) add_manual_proxy_outbound "$ob_choice" ;;
       3) add_manual_ss_outbound ;;
@@ -4137,7 +4277,7 @@ add_manual_ss_outbound() {
     
     local method="2022-blake3-aes-256-gcm"
     local tag="MAN-SS-${port}"
-    local new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg m "$method" --arg pw "$password" '{type: "shadowsocks", tag: $t, server: $s, server_port: ($p|tonumber), method: $m, password: $pw}')
+    local new_node; new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg m "$method" --arg pw "$password" '{type: "shadowsocks", tag: $t, server: $s, server_port: ($p|tonumber), method: $m, password: $pw}')
 
     local sandbox="/tmp/sb_ss_check.json"
     cp "$CONFIG" "$sandbox"
@@ -4196,13 +4336,13 @@ set_node_routing() {
   local idx=0
   for tag in "${PROXY_OUTS[@]}"; do
     idx=$((idx+1))
-    TEMP_OUT_LIST[$idx]="$tag"
+    TEMP_OUT_LIST[idx]="$tag"
     echo -e " ${C_GREEN}[$idx]${C_RESET} ${C_YELLOW}${tag}${C_RESET}  $(format_outbound_label "$tag")"
   done
 
   # 额外提供 direct（真正直连，不绑定 sendThrough）
   idx=$((idx+1))
-  TEMP_OUT_LIST[$idx]="direct"
+  TEMP_OUT_LIST[idx]="direct"
   echo -e " ${C_GREEN}[$idx]${C_RESET} ${C_YELLOW}direct${C_RESET}  直连 (不走代理/不绑定本机IP)"
 
   read -rp "请选择落地序号 (0 取消): " out_idx
@@ -4297,7 +4437,7 @@ set_node_routing() {
 
   # 逐个写入分类规则（插入到最前面：比其他泛规则更优先）
   for num in "${selected_nums[@]}"; do
-    local idx0=$((num-1))
+    local idx0; idx0=$((num-1))
     [[ $idx0 -lt 0 || $idx0 -ge ${#CAT_KEYS[@]} ]] && continue
 
     local key="${CAT_KEYS[$idx0]}"
@@ -4314,7 +4454,7 @@ set_node_routing() {
 
     # domains 字符串拆成数组（按空格）
     local dom_json
-    dom_json=$(printf "%s\n" $domains | jq -R -s 'split("\n") | map(select(length>0))')
+    dom_json=$(printf "%s\n" "$domains" | jq -R -s 'split("\n") | map(select(length>0))')
 
     local rule
     rule=$(jq -n --arg inb "$selected_inbound" --arg out "$selected_outbound_tag" --arg kind "media-split-$key" --argjson dom "$dom_json" \
@@ -4435,14 +4575,11 @@ node_speed_limit_menu() {
     read -rp "按回车返回..." _
 }
 
-# ============= 启动前最后的自动化加固 =============
-
-# ============= 启动前最后的自动化加固 =============
+# 修正后的加固部分 (大约在 4594 行)
 say "正在同步系统时间..."
 if command -v ntpdate >/dev/null 2>&1; then
     ntpdate -u pool.ntp.org >/dev/null 2>&1
 else
-    # 核心修复：删掉前面的 local 关键字
     remote_date=$(curl -sI https://www.google.com | grep -i '^date:' | cut -d' ' -f2-7)
     [[ -n "$remote_date" ]] && date -s "$remote_date" >/dev/null 2>&1
 fi
@@ -4477,8 +4614,10 @@ fi
 main_menu() {
   while true; do
     # 核心：如果发现 Xray 锁定了 IP 但探测结果还没出来，就尝试触发一次探测
-    local pref="$(_get_global_mode)"
-    local lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
+    local pref
+pref="$(_get_global_mode)"
+    local lock_ip
+lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
 
     if [[ -n "$lock_ip" && ! -f "${IP_CACHE_FILE}_xray_status" ]]; then
         update_ip_async

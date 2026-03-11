@@ -1323,6 +1323,7 @@ load_nat_data() {
 
 get_random_allowed_port() {
   local proto="$1"
+  load_nat_data
   local -a used=()
   mapfile -t used < <(jq -r '.inbounds[].listen_port' "$CONFIG" 2>/dev/null | grep -E '^[0-9]+$' || true)
   mapfile -t hy2u < <(jq -r 'to_entries[]? | select(.value.type=="hysteria2") | .value.port' "$META" 2>/dev/null || true)
@@ -3336,46 +3337,6 @@ list_and_del_routing_rules() {
 
 
 
-nat_mode_menu() {
-  load_nat_data
-
-  local nm=""
-  local tmp=""
-  local r=""
-  local p=""
-  local arr_json=""
-
-  echo -e "\n${C_CYAN}当前 NAT 模式: ${nat_mode:-关闭}${C_RESET}"
-  echo "1) 范围端口"
-  echo "2) 自定义 TCP/UDP"
-  echo "3) 关闭"
-
-  read -r -p "选择: " nm
-  tmp=$(mktemp)
-
-  case "$nm" in
-      1)
-         read -r -p "输入范围 (10000-20000): " r
-         jq -n --arg r "$r" '{"mode":"range","ranges":[$r]}' > "$tmp" && mv "$tmp" "$NAT_FILE"
-         ;;
-      2)
-         read -r -p "输入端口 (空格分隔): " p
-         arr_json=$(printf '%s' "$p" | jq -R 'split(" ")|map(select(length>0))|map(tonumber)')
-         jq -n --argjson a "$arr_json" '{"mode":"custom","custom_tcp":$a}' > "$tmp" && mv "$tmp" "$NAT_FILE"
-         ;;
-      3)
-         rm -f "$NAT_FILE"
-         ;;
-      *)
-         warn "无效输入"
-         rm -f "$tmp"
-         return 1
-         ;;
-  esac
-
-  ok "设置已保存"
-}
-
 # ============= 5. Dashboard UI & Entry =============
 
 show_menu_banner() {
@@ -4611,18 +4572,77 @@ fi
 /usr/local/bin/xray-sync >/dev/null 2>&1 || true
 
 
+nat_mode_menu() {
+  load_nat_data # 进入时先读取当前状态
+
+  local nm=""
+  local tmp=""
+  local r=""
+  local p=""
+  local arr_json=""
+
+  echo -e "\n${C_CYAN}当前 NAT 模式: ${nat_mode:-关闭}${C_RESET}"
+  echo "1) 范围端口"
+  echo "2) 自定义 TCP/UDP"
+  echo "3) 关闭"
+
+  read -r -p "选择: " nm
+  tmp=$(mktemp)
+
+  case "$nm" in
+      1)
+         read -r -p "输入范围 (10000-20000): " r
+         jq -n --arg r "$r" '{"mode":"range","ranges":[$r]}' > "$tmp" && mv "$tmp" "$NAT_FILE"
+         ;;
+      2)
+         read -r -p "输入端口 (空格分隔): " p
+         # 这里的 jq 处理确保将输入的空格分隔字符串转为数字数组
+         arr_json=$(printf '%s' "$p" | jq -R 'split(" ")|map(select(length>0))|map(tonumber)')
+         jq -n --argjson a "$arr_json" '{"mode":"custom","custom_tcp":$a}' > "$tmp" && mv "$tmp" "$NAT_FILE"
+         ;;
+      3)
+         rm -f "$NAT_FILE"
+         ;;
+      *)
+         warn "无效输入"
+         rm -f "$tmp"
+         return 1
+         ;;
+  esac
+
+  # 🌟 关键修复：保存后立即刷新内存变量
+  load_nat_data 
+  ok "设置已保存，当前模式已更新为: ${nat_mode:-关闭}"
+}
+
+
+setup_shortcuts() {
+  local SCRIPT_PATH
+  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null)"
+  [[ -z "$SCRIPT_PATH" ]] && SCRIPT_PATH="$PWD/$(basename "$0")"
+
+  if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
+
+  sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
+  echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
+  echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
+}
+
+# ============= 主菜单函数 =============
 main_menu() {
   while true; do
     # 核心：如果发现 Xray 锁定了 IP 但探测结果还没出来，就尝试触发一次探测
     local pref
-pref="$(_get_global_mode)"
+    pref="$(_get_global_mode)"
     local lock_ip
-lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
+    lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
 
     if [[ -n "$lock_ip" && ! -f "${IP_CACHE_FILE}_xray_status" ]]; then
         update_ip_async
     fi
+    
     show_menu_banner
+    
     echo -e ""
     echo -e " ${C_GREEN}1.${C_RESET} 添加节点 "
     echo -e " ${C_GREEN}2.${C_RESET} 查看节点 "
@@ -4630,12 +4650,14 @@ lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
     echo -e " ${C_GREEN}4.${C_RESET} 状态维护 "
     echo -e " ${C_GREEN}5.${C_RESET} 网络切换 "
     echo -e " ${C_GREEN}6.${C_RESET} 落地出口 "
-    echo -e " ${C_GREEN}7.${C_RESET} 节点限速 ${C_YELLOW}(New)${C_RESET}" # 👈 新增这一行
+    echo -e " ${C_GREEN}7.${C_RESET} 节点限速 ${C_YELLOW}(New)${C_RESET}"
+    echo -e " ${C_GREEN}8.${C_RESET} NAT 模式设置"
     echo -e " ${C_GREEN}0.${C_RESET} 退出脚本"
     echo -e ""
     echo -e "${C_BLUE}──────────────────────────────────────────────────────────────${C_RESET}"
     
-    if ! safe_read choice " 请输入选项 [0-7]: "; then # 👈 注意改成 0-7
+    local choice=""
+    if ! safe_read choice " 请输入选项 [0-8]: "; then 
       echo
       exit 0
     fi
@@ -4647,31 +4669,20 @@ lock_ip="$(_read_global_lock_ip_for_pref "$pref")"
       4) status_menu ;;
       5) ip_version_menu ;;
       6) outbound_menu ;;
-      7) node_speed_limit_menu ;; # 👈 新增触发函数
+      7) node_speed_limit_menu ;;
+      8) nat_mode_menu ;;
       0) exit 0 ;;
       *) warn "无效输入" ;;
     esac
   done
 }
 
+# ============= 执行流程 (入口) =============
 
-setup_shortcuts() {
-  local SCRIPT_PATH
-  SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null)"
-  [[ -z "$SCRIPT_PATH" ]] && SCRIPT_PATH="$PWD/$(basename "$0")"
-
-  if [[ ! -f /root/.bashrc ]]; then touch /root/.bashrc; fi
-
-  # 自动同步别名
-  sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
-  echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
-  echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
-}
-
-# 启动执行流程
+# 1. 快捷指令设置
 setup_shortcuts
 
-# 环境基础检查
+# 2. 基础环境初始化检查
 if [[ ! -x "/usr/local/bin/xray" ]] || [[ ! -f "$CONFIG" ]]; then
     echo -e "${C_PURPLE}检测到环境缺失，正在初始化...${C_RESET}"
     ensure_dirs
@@ -4680,12 +4691,11 @@ if [[ ! -x "/usr/local/bin/xray" ]] || [[ ! -f "$CONFIG" ]]; then
     install_xray_if_needed
 fi
 
-# 触发一次同步，确保配置文件路径和逻辑闭环生效
+# 3. 核心功能预备
 /usr/local/bin/xray-sync >/dev/null 2>&1 || true
-
 update_ip_async
-load_nat_data
+load_nat_data # 🌟 这里必须预加载，否则添加节点时读取不到 NAT 设置
 auto_optimize_cpu
 
-# 最终进入主菜单
+# 4. 进入主循环
 main_menu

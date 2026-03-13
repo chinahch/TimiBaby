@@ -1760,10 +1760,11 @@ jq --arg log "$LOG_PATH" \
         domainStrategy: $rds,
         rules: (
           [ { type:"field", inboundTag:["API"], outboundTag:"API" } ]
+          + (($root.route.rules // []) | map(select(.kind == "node-blacklist")) | map(mk_rule($m_data)))
           + mk_global_override_rules($m_data)
           + (if (($force_v4|length) > 0 and ($pref == "v6pref" or $pref == "v6")) then [ { type:"field", domain:$force_v4, outboundTag:"DIRECT-V4" } ] else [] end)
           + (if (($force_v4|length) > 0) then ($m_data | to_entries | map(select(.value.ip_mode == "v6pref")) | map({ type:"field", inboundTag:[.key | ascii_upcase], domain:$force_v4, outboundTag:"DIRECT-V4" })) else [] end)
-          + (($root.route.rules // []) | map(mk_rule($m_data)))
+          + (($root.route.rules // []) | map(select(.kind != "node-blacklist")) | map(mk_rule($m_data)))
           + ($m_data | to_entries | map(select((.value.fixed_ip // "") != "")) | map(
               if .value.ip_version == "v6" and .value.ip_mode == "v6pref" then
                 [ { type:"field", inboundTag:[.key | ascii_upcase], ip:["::/0"], outboundTag:("BIND-" + (.key | ascii_upcase)) },
@@ -4416,10 +4417,11 @@ outbound_menu() {
     say "6) 设置节点落地关联 (Inbound ➔ Outbound)"
     say "7) 查看/解除 关联规则"
     say "8) 一键诊断并修复配置 (救急专用)"
+    say "9) 设置节点域名黑名单 (拦截/阻断) ${C_YELLOW}(New)${C_RESET}"
     say "0) 返回主菜单"
     
-    local ob_choice=""  # 👈 新增初始化
-safe_read ob_choice " 请选择操作 [0-8]: "
+    local ob_choice="" 
+    safe_read ob_choice " 请选择操作 [0-9]: "
     case "$ob_choice" in
       1|2) add_manual_proxy_outbound "$ob_choice" ;;
       3) add_manual_ss_outbound ;;
@@ -4432,6 +4434,7 @@ safe_read ob_choice " 请选择操作 [0-8]: "
       6) set_node_routing ;;
       7) list_and_del_routing_rules ;;
       8) repair_config_structure ;;
+      9) node_blacklist_menu ;; # <--- 新增的入口在这里
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -4842,6 +4845,145 @@ setup_shortcuts() {
   echo "alias my='$SCRIPT_PATH'" >> /root/.bashrc
   echo "alias MY='$SCRIPT_PATH'" >> /root/.bashrc
 }
+
+# ============= 节点级黑名单管理 (最高优先级拦截) =============
+node_blacklist_menu() {
+  echo -e "\n${C_CYAN}=== 设置节点域名黑名单 (拦截/阻断) ===${C_RESET}"
+
+  # 1) 确保结构存在
+  safe_json_edit "$CONFIG" '(.route //= {}) | (.route.rules //= []) | (.inbounds //= [])' >/dev/null 2>&1 || true
+
+  # 2) 提取并选择入站节点
+  mapfile -t IN_TAGS < <(jq -r '.inbounds[]? | select(.tag != null) | .tag' "$CONFIG" 2>/dev/null)
+  if [ ${#IN_TAGS[@]} -eq 0 ]; then
+    err "当前没有任何入站节点，请先添加一个节点。"
+    return
+  fi
+
+  local i=0
+  for t in "${IN_TAGS[@]}"; do
+    i=$((i+1))
+    echo -e " ${C_GREEN}[$i]${C_RESET} ${C_YELLOW}${t}${C_RESET}"
+  done
+  read -rp "请选择要设置黑名单的节点序号 (0 取消): " in_idx
+  [[ -z "${in_idx:-}" || "$in_idx" == "0" ]] && return
+  if ! [[ "$in_idx" =~ ^[0-9]+$ ]] || (( in_idx < 1 || in_idx > ${#IN_TAGS[@]} )); then
+    warn "无效序号"
+    return
+  fi
+  local selected_inbound="${IN_TAGS[$((in_idx-1))]}"
+
+  # 3) 进入该节点的黑名单管理子菜单
+  while true; do
+    echo -e "\n${C_CYAN}=== 节点 [${C_YELLOW}${selected_inbound}${C_CYAN}] 的拦截名单 ===${C_RESET}"
+
+    # 实时获取当前节点的黑名单列表
+    local current_domains
+    current_domains=$(jq -r --arg inb "$selected_inbound" '
+      .route.rules[]? | select(.kind == "node-blacklist" and ((.inbound|type)=="array" and (.inbound|index($inb))!=null)) | .domain[]?
+    ' "$CONFIG" 2>/dev/null)
+
+    local -a DOMAINS=()
+    if [[ -n "$current_domains" ]]; then
+      mapfile -t DOMAINS < <(echo "$current_domains")
+    fi
+
+    if [[ ${#DOMAINS[@]} -eq 0 ]]; then
+      echo -e " 当前状态: ${C_GRAY}无任何黑名单规则，流量畅通${C_RESET}"
+    else
+      echo -e " ${C_RED}当前已拦截的域名/规则: ${C_RESET}"
+      local n=0
+      for d in "${DOMAINS[@]}"; do
+        n=$((n+1))
+        echo -e "  ${C_RED}[$n]${C_RESET} $d"
+      done
+    fi
+    echo -e "${C_GRAY}------------------------------------------------${C_RESET}"
+    say "1) 添加拦截域名/规则"
+    say "2) 删除选中域名/规则"
+    say "3) 清空该节点所有黑名单"
+    say "0) 返回上级"
+
+    local act
+    safe_read act " 请选择操作: "
+    case "$act" in
+      1)
+        echo -e "\n${C_YELLOW}支持格式说明：${C_RESET}"
+        echo " - 纯域名自动补全(推荐): 输入 baidu.com 会被处理为 domain:baidu.com"
+        echo " - 原生规则直接写: geosite:ads, keyword:taobao, full:www.abc.com"
+        read -rp "请输入要拦截的域名 (多个用空格分隔): " add_input
+        [[ -z "$add_input" ]] && continue
+
+        # 智能补全域名前缀
+        local formatted_domains=""
+        for d in $add_input; do
+          if [[ "$d" =~ ^(domain:|geosite:|keyword:|regexp:|full:|ext:) ]]; then
+            formatted_domains+="$d "
+          else
+            formatted_domains+="domain:$d "
+          fi
+        done
+
+        local dom_json
+        dom_json=$(echo "$formatted_domains" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s -c .)
+
+        # 核心：写入规则，并通过 jq 强制将 node-blacklist 类型的规则拍到数组最顶端(Index 0)
+        safe_json_edit "$CONFIG" '
+          .route.rules as $rules |
+          ($rules | map(select(.kind == "node-blacklist" and ((.inbound|type)=="array" and (.inbound|index($inb))!=null)))) as $existing |
+          if ($existing | length > 0) then
+            .route.rules |= map(
+              if (.kind == "node-blacklist" and ((.inbound|type)=="array" and (.inbound|index($inb))!=null)) then
+                .domain = ((.domain // []) + $dom | unique)
+              else . end
+            )
+          else
+            .route.rules = ([{ inbound: [$inb], outbound: "BLOCK", domain: $dom, kind: "node-blacklist" }] + $rules)
+          end |
+          .route.rules |= (map(select(.kind == "node-blacklist")) + map(select(.kind != "node-blacklist")))
+        ' --arg inb "$selected_inbound" --argjson dom "$dom_json" >/dev/null 2>&1 || true
+
+        ok "黑名单已更新！(绝对优先级已生效)"
+        restart_xray
+        ;;
+      2)
+        if [[ ${#DOMAINS[@]} -eq 0 ]]; then
+          warn "当前无黑名单可删。"
+          continue
+        fi
+        read -rp "请输入要删除的序号 (如 1): " del_idx
+        if [[ "$del_idx" =~ ^[0-9]+$ ]] && (( del_idx >= 1 && del_idx <= ${#DOMAINS[@]} )); then
+          local target_domain="${DOMAINS[$((del_idx-1))]}"
+          
+          # 精准删除指定域名，如果 domain 数组空了，就拔掉整个规则
+          safe_json_edit "$CONFIG" '
+            .route.rules |= map(
+              if (.kind == "node-blacklist" and ((.inbound|type)=="array" and (.inbound|index($inb))!=null)) then
+                .domain = (.domain - [$del_dom])
+              else . end
+            ) |
+            .route.rules |= map(select(not (.kind == "node-blacklist" and (.domain | length == 0))))
+          ' --arg inb "$selected_inbound" --arg del_dom "$target_domain" >/dev/null 2>&1 || true
+
+          ok "已解除拦截: $target_domain"
+          restart_xray
+        else
+          warn "无效序号"
+        fi
+        ;;
+      3)
+        safe_json_edit "$CONFIG" '
+          .route.rules |= map(select(.kind == "node-blacklist" and ((.inbound|type)=="array" and (.inbound|index($inb))!=null) | not))
+        ' --arg inb "$selected_inbound" >/dev/null 2>&1 || true
+        ok "已清空该节点所有黑名单规则！"
+        restart_xray
+        ;;
+      0) break ;;
+      *) warn "无效操作" ;;
+    esac
+  done
+}
+
 
 # ============= 主菜单函数 =============
 main_menu() {

@@ -30,6 +30,7 @@
 # 🚀 优化内容：移除启动阻塞、后台IP获取、Dashboard UI、保留所有业务逻辑
 # 🚀 代码大师修改：默认执行完整初始化，并自动设置 'my' 和 'MY' 别名快捷指令
 
+
 # 防止在无 TTY / 后台环境下空转（交互菜单脚本必须有这个）
 # 如确实需要在无 TTY 环境运行：ALLOW_NO_TTY=1 ./baby.sh
 if ! [[ -t 0 ]]; then
@@ -1524,7 +1525,7 @@ install_watchdog_cron() {
   local marker="# xray-watchdog"
   crontab -l >/dev/null 2>&1 || true
   crontab -l 2>/dev/null | grep -v "$marker" > /tmp/crontab.tmp 2>/dev/null || true
-  echo "*/5 * * * * /usr/local/bin/xray-singleton >/dev/null 2>&1  $marker" >> /tmp/crontab.tmp
+  echo "* * * * * /usr/local/bin/xray-singleton >/dev/null 2>&1  $marker" >> /tmp/crontab.tmp
   crontab /tmp/crontab.tmp
   rm -f /tmp/crontab.tmp
 }
@@ -1736,6 +1737,18 @@ jq --arg log "$LOG_PATH" \
        + (if (.protocol? != null) then { protocol:(if (.protocol|type)=="array" then .protocol else [.protocol] end) } else {} end)
       );
 
+
+  def mk_global_override_rules(m):
+    m
+    | to_entries
+    | map(select((.value.global_outbound // "") != ""))
+    | map({
+        type:"field",
+        inboundTag:[.key | ascii_upcase],
+        network:"tcp,udp",
+        outboundTag:((.value.global_outbound // "DIRECT") | ascii_upcase)
+      });
+
   . as $root
   | ($meta[0] // {}) as $m_data
   | ([ $root.inbounds[]? | select(.type=="vless" and .server_seed==null) | (.tls.server_name // .tls.reality.handshake.server // empty) ] | unique) as $reality_domains
@@ -1774,6 +1787,7 @@ jq --arg log "$LOG_PATH" \
         domainStrategy: $rds,
         rules: (
           [ { type:"field", inboundTag:["API"], outboundTag:"API" } ]
+          + mk_global_override_rules($m_data)
           + (if (($force_v4|length) > 0 and ($pref == "v6pref" or $pref == "v6")) then [ { type:"field", domain:$force_v4, outboundTag:"DIRECT-V4" } ] else [] end)
           + (if (($force_v4|length) > 0) then ($m_data | to_entries | map(select(.value.ip_mode == "v6pref")) | map({ type:"field", inboundTag:[.key | ascii_upcase], domain:$force_v4, outboundTag:"DIRECT-V4" })) else [] end)
           + (($root.route.rules // []) | map(mk_rule($m_data)))
@@ -1853,16 +1867,8 @@ if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# 3. 如果主进程已在运行，则不做破坏性重启，避免断流
-if pgrep -f "/usr/local/bin/xray run -c $OUT_CFG" >/dev/null 2>&1; then
-    pid=$(pgrep -o -f "/usr/local/bin/xray run -c $OUT_CFG" || true)
-    if [[ -n "${pid:-}" ]]; then
-        echo "$pid" > "$PIDFILE"
-    fi
-    exit 0
-fi
-
-# 4. 仅在进程不存在时兜底拉起
+# 3. 杀死旧进程并启动新进程
+pkill -f "/usr/local/bin/xray run -c" >/dev/null 2>&1 || true
 setsid "$BIN" run -c "$OUT_CFG" >> "$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 WRAP
@@ -1919,8 +1925,11 @@ start_xray_singleton_force() {
       /usr/local/bin/xray-sync >/dev/null 2>&1 || true
   fi
 
-  # 2. 清理陈旧 PID 锁，但不再粗暴 -9 杀全量进程，避免正在转发的连接被硬断
+  # 2. 彻底清理旧进程与 PID 锁
+  # 使用 -9 强制杀死，防止僵尸进程占用 11732 或 47302 端口
+  pkill -9 -f "/usr/local/bin/xray" >/dev/null 2>&1 || true
   rm -f /run/xray.pid /var/run/xray.pid >/dev/null 2>&1 || true
+  sleep 1
 
   # 3. 启动前语法自检 (关键防线)
   # 如果配置测试不通过，直接报错，不盲目启动
@@ -2018,8 +2027,8 @@ restart_xray() {
   rm -f "${IP_CACHE_FILE}_xray" "${IP_CACHE_FILE}_xray_status" /tmp/ip_probe.lock 2>/dev/null
   install_singleton_wrapper >/dev/null 2>&1 || true
 
-  # 注意：普通重启不再自动重建 tc 根队列，避免删除 qdisc 时造成在线连接抖动/断流。
-  # 如需变更端口限速，仅在用户显式设置限速后调用 apply_port_limits。
+  # 每次重启 Xray 时，重新下发底层的 tc 限速规则
+  apply_port_limits
 
   # 2. 先同步主模型并做 Xray 语法校验
   if ! sync_xray_config >/dev/null 2>&1; then
@@ -2117,10 +2126,25 @@ auto_fix_mtu_mss() {
 
     say "当前网卡 $iface MTU: ${current_mtu:-未知}, 建议 MTU: $target_mtu"
 
-    # 稳定性优先：不再自动修改物理网卡 MTU，也不重启 networkd。
-    # 这些动作会直接影响现有连接，容易造成你反馈的“严重断流”。
+    # 1. 修复 MTU
     if [[ "$current_mtu" != "$target_mtu" && -n "$current_mtu" ]]; then
-        warn "检测到潜在的 MTU 黑洞风险，但为避免断流，当前版本不会自动修改网卡 MTU；仅添加 MSS 保险规则。"
+        warn "检测到潜在的 MTU 黑洞风险，正在自动修复 (调整网卡 MTU 为 $target_mtu)..."
+        ip link set dev "$iface" mtu "$target_mtu" 2>/dev/null
+        
+        # 针对 systemd-networkd 环境进行永久化写入
+        if [[ -d /etc/systemd/network ]]; then
+            local net_file
+            net_file=$(grep -rl "Name=$iface" /etc/systemd/network/ 2>/dev/null | head -n 1)
+            if [[ -n "$net_file" ]]; then
+                if grep -q '^MTUBytes=' "$net_file"; then
+                    sed -i "s/^MTUBytes=.*/MTUBytes=$target_mtu/" "$net_file"
+                else
+                    sed -i "/\[Link\]/a MTUBytes=$target_mtu" "$net_file"
+                fi
+                systemctl restart systemd-networkd 2>/dev/null
+            fi
+        fi
+        ok "网卡 $iface MTU 已调整为 $target_mtu"
     fi
 
     # 2. 添加 TCP MSS Clamping 保险丝 (无论 MTU 是否修改都加上，防止多层套娃导致的包过大)
@@ -3102,7 +3126,20 @@ repair_config_structure() {
         ' >/dev/null 2>&1 || true
     fi
 
-    # 4) 兼容字段：route.final（你的 xray-sync 不一定用它，但留着也无害）
+    # 4) 清理 META 中指向不存在落地的 global_outbound，避免全局落地残留导致配置引用失效
+    local OUT_TAGS_JSON
+    OUT_TAGS_JSON=$(jq -c '[.outbounds[]? | select(.tag!=null) | .tag]' "$CONFIG" 2>/dev/null || echo '[]')
+    safe_json_edit "$META" '
+      with_entries(
+        .value |= (
+          if ((.global_outbound // "") != "") and (($tags | index(.global_outbound)) == null) and (.global_outbound != "direct") then
+            del(.global_outbound)
+          else . end
+        )
+      )
+    ' --argjson tags "$OUT_TAGS_JSON" >/dev/null 2>&1 || true
+
+    # 5) 兼容字段：route.final（你的 xray-sync 不一定用它，但留着也无害）
     safe_json_edit "$CONFIG" '.route.final = "direct"' >/dev/null 2>&1 || true
 
     # 5) 最终校验 & 重启
@@ -3325,6 +3362,10 @@ list_and_del_routing_rules() {
             return
         fi
 
+        local deleted_kind deleted_inbound
+        deleted_kind=$(jq -r --arg idx "$del_idx" '.route.rules[$idx|tonumber].kind // ""' "$CONFIG" 2>/dev/null)
+        deleted_inbound=$(jq -r --arg idx "$del_idx" '(.route.rules[$idx|tonumber].inbound // [""])[0] // ""' "$CONFIG" 2>/dev/null)
+
         safe_json_edit "$CONFIG" '
           .route.rules |= (
             to_entries
@@ -3332,6 +3373,10 @@ list_and_del_routing_rules() {
             | map(.value)
           )
         ' --arg idx "$del_idx" >/dev/null 2>&1 || true
+
+        if [[ "$deleted_kind" == "media-split-GLOBAL" && -n "$deleted_inbound" ]]; then
+            safe_json_edit "$META" 'del(.[$inb].global_outbound)' --arg inb "$deleted_inbound" >/dev/null 2>&1 || true
+        fi
 
         ok "已删除第 ${action} 条规则。"
         restart_xray
@@ -3341,6 +3386,7 @@ list_and_del_routing_rules() {
     # 2) all：清空全部规则
     if [[ "$action" == "all" ]]; then
         safe_json_edit "$CONFIG" '.route.rules = []' >/dev/null 2>&1 || true
+        safe_json_edit "$META" 'with_entries(.value |= del(.global_outbound))' >/dev/null 2>&1 || true
         ok "已清空所有分流规则（恢复直连）。"
         restart_xray
         return
@@ -4385,20 +4431,24 @@ set_node_routing() {
     echo -e "➜ 全局代理：${C_YELLOW}${selected_inbound}${C_RESET} -> ${C_GREEN}${selected_outbound_tag}${C_RESET}"
 
     # 构建全局规则，并放到 rules 最前面
+    # 同时把 global_outbound 记入 META，供 xray-sync 生成最高优先级兜底规则。
     local global_rule
-    global_rule=$(jq -n --arg inb "$selected_inbound" --arg out "$selected_outbound_tag" \
-      '{inbound: [$inb], outbound: $out, kind: "media-split-GLOBAL"}')
+    global_rule=$(jq -n --arg inb "$selected_inbound" --arg out "$selected_outbound_tag"       '{inbound: [$inb], outbound: $out, kind: "media-split-GLOBAL"}')
 
     safe_json_edit "$CONFIG" '
       .route.rules = ([ $rule ] + (.route.rules // []))
     ' --argjson rule "$global_rule" >/dev/null 2>&1 || true
+
+    safe_json_edit "$META" '
+      .[$inb] = ((.[$inb] // {}) + {global_outbound: $out})
+    ' --arg inb "$selected_inbound" --arg out "$selected_outbound_tag" >/dev/null 2>&1 || true
 
     ok "规则已写入：${selected_inbound} -> ${selected_outbound_tag}"
     restart_xray
     return
   fi
 
-  # 分类模式
+  # 分类模式：进入分类分流前，清理该入站的全局落地兜底，避免继续覆盖分类规则
   local -a selected_nums=()
   if echo "$sel_raw" | grep -qiE '(^|,)\s*a\s*(,|$)'; then
     # 全选 -> 1..N
@@ -4575,10 +4625,10 @@ if [[ ! -f "$IP_CACHE_FILE" ]]; then
 fi
 
 # 4. 自动挂载守护进程 (无人值守模式)
-# 保留守护，但采用非破坏性单例守护：仅在主进程缺失时兜底拉起，不会定时强杀重启。
+# 增加 crontab 命令存在性检查，防止在极简版系统报错
 if command -v crontab >/dev/null 2>&1; then
     if ! crontab -l 2>/dev/null | grep -q "xray-singleton"; then
-        say "正在开启稳态守护模式..."
+        say "正在开启无人值守守护模式..."
         install_watchdog_cron
     fi
 fi
@@ -4693,6 +4743,7 @@ main_menu() {
   done
 }
 
+
 # ================= 运维收尾检查说明 =================
 # 用途：
 # 用于人工检查当前是否已经恢复到“单开、无旧 watchdog、重复配置已处理”的状态。
@@ -4724,7 +4775,6 @@ main_menu() {
 # - XRAY PROCESS 中只有一条 Xray
 # - FILE STATUS 中主配置存在，重复配置已改名或不存在
 # ==================================================
-
 # ============= 执行流程 (入口) =============
 
 # 1. 快捷指令设置

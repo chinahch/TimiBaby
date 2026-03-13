@@ -1,35 +1,8 @@
 #!/usr/bin/env bash
-# ================= 稳定性约束（后续修改此脚本时必须遵守） =================
-# 本脚本默认目标：优先保证不断流、不中断现有连接。
-#
-# 1. watchdog / singleton 只能做“进程不存在时兜底拉起”，
-#    禁止写成“定时强杀主进程再重启”。
-#
-# 2. 普通 restart_xray() 只允许重启/拉起 Xray，
-#    禁止顺带自动重建 tc/qdisc、修改 MTU、重启 networkd、重启无关隧道进程。
-#
-# 3. apply_port_limits() 属于高影响操作，
-#    只能在“用户手动修改限速配置后”单独调用，
-#    禁止在普通重启、守护、自检、配置同步时自动调用。
-#
-# 4. auto_fix_mtu_mss() 默认只允许做 MSS 保护，
-#    禁止自动修改默认网卡 MTU，禁止自动重启 networkd/systemd-networkd。
-#
-# 5. IPv4/IPv6 策略默认优先非破坏性模式，
-#    禁止默认激进启用 v4only / v6only / BLOCK，除非用户明确要求。
-#
-# 6. cloudflared / argo / tunnel 类进程，
-#    禁止无条件 pkill 后再拉起，只能在明确异常或人工维护时重启。
-#
-# 7. 所有自动修复逻辑必须遵循：
-#    先检测 -> 再记录 -> 再兜底
-#    不允许默认执行会打断现有连接的操作。
-# =======================================================================
 # shellcheck disable=SC2016
 # sk5.sh 融合 Misaka-blog Hysteria2 一键逻辑版 (UI重构+性能优化+全功能保留版)
 # 🚀 优化内容：移除启动阻塞、后台IP获取、Dashboard UI、保留所有业务逻辑
 # 🚀 代码大师修改：默认执行完整初始化，并自动设置 'my' 和 'MY' 别名快捷指令
-
 
 # 防止在无 TTY / 后台环境下空转（交互菜单脚本必须有这个）
 # 如确实需要在无 TTY 环境运行：ALLOW_NO_TTY=1 ./baby.sh
@@ -1915,64 +1888,78 @@ start_xray_legacy_nohup() {
 }
 
 start_xray_singleton_force() {
-  # 1. 核心环境预修复：路径对齐与配置同步
-  # 彻底解决你遇到的 "open config.json: no such file" 问题
   mkdir -p /usr/local/etc/xray /etc/xray
   ln -sf /etc/xray/xray_config.json /usr/local/etc/xray/config.json
 
-  # 强制同步一次配置，确保 API 标签和闭合逻辑已注入，防止 status 23 错误
-  if command -v xray-sync >/dev/null 2>&1; then
-      /usr/local/bin/xray-sync >/dev/null 2>&1 || true
+  # 1. 🚀 性能优化：只在主配置缺失时才尝试同步，避免每次重启都做重复的 JSON 读写
+  if [[ ! -f /etc/xray/xray_config.json ]] && [[ -x /usr/local/bin/xray-sync ]]; then
+  /usr/local/bin/xray-sync >/dev/null 2>&1 || warn "xray-sync 执行失败，继续尝试使用现有配置启动"
+fi
+
+  # 2. 🛡️ 稳定性优化：先温和停止(TERM)释放端口，再必要时强杀(KILL)
+  pkill -TERM -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1 || true
+  sleep 0.5
+  if pgrep -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1; then
+      pkill -9 -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1 || true
+      sleep 0.2
   fi
 
-  # 2. 彻底清理旧进程与 PID 锁
-  # 使用 -9 强制杀死，防止僵尸进程占用 11732 或 47302 端口
-  pkill -9 -f "/usr/local/bin/xray" >/dev/null 2>&1 || true
   rm -f /run/xray.pid /var/run/xray.pid >/dev/null 2>&1 || true
-  sleep 1
 
-  # 3. 启动前语法自检 (关键防线)
-  # 如果配置测试不通过，直接报错，不盲目启动
+  # 3. 启动前语法自检
   if ! /usr/local/bin/xray run -test -c /etc/xray/xray_config.json >/dev/null 2>&1; then
-      err "Xray 启动失败：配置文件校验未通过，请检查 /etc/xray/config.json"
+      err "Xray 启动失败：配置文件校验未通过，请检查 /etc/xray/xray_config.json"
       return 1
   fi
 
-  # 4. 动态内存压制策略 (自动适配容器与 VPS)
+  # 4. 动态内存压制策略
   local total_mem
   total_mem=$(free -m | awk '/Mem:/ {print $2}')
-  
-  # 显式指定资源路径，减少核心启动时的 IO 扫描
   export XRAY_LOCATION_ASSET=/usr/local/bin/
 
   if [[ "$total_mem" -le 300 ]]; then
-    # 【极致省电模式】：针对小内存容器
     export GOMEMLIMIT=64MiB
-    export GOGC=15  # 激进回收
-    export GODEBUG=madvdontneed=1 # 立即归还内存给宿主机
-    say "检测到极小内存环境 ($total_mem MB)，已开启极致压制模式"
+    export GOGC=15
+    export GODEBUG=madvdontneed=1
   else
-    # 【标准性能模式】：针对普通 VPS
     export GOMEMLIMIT=128MiB
     export GOGC=50
   fi
 
-  # 5. 异步探测任务延迟执行
-  # 避开启动时的 CPU 峰值，确保节点能优先跑起来
-  (sleep 30 && update_ip_async) &
+  # 5. 🧹 防堆叠优化：清理旧的后台延迟任务，防止高频重启导致并发错乱
+  pkill -f "sleep 30 && update_ip_async" >/dev/null 2>&1 || true
+  (sleep 30 && update_ip_async) >/dev/null 2>&1 &
 
-  # 6. 执行启动
-  # 使用绝对路径和明确的配置文件，确保单例运行
-  daemonize /usr/local/bin/xray run -c /etc/xray/xray_config.json
+  # 6. 执行启动并捕获执行错误
+  if ! daemonize /usr/local/bin/xray run -c /etc/xray/xray_config.json; then
+      err "Xray 启动命令执行失败"
+      return 1
+  fi
 
-  # 7. 观察期与深度状态校验
-  sleep 3
-  if ! pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1; then
-    err "启动失败：进程可能由于内存溢出 (OOM) 或端口占用被杀掉"
-    if [[ -f "/var/log/xray.log" ]]; then
-       echo -e "${C_GRAY}日志最后 3 行内容：${C_RESET}"
-       tail -n 3 /var/log/xray.log
-    fi
+  # 7. ⏱️ 智能探活优化：连续存活 3 轮 (0.6秒) 即判定成功，拒绝无意义的死等
+  local tries=0
+  local alive_rounds=0
+  local is_alive=0
+  while (( tries < 15 )); do
+      sleep 0.2
+      # 使用精确的进程匹配，防止误判
+      if pgrep -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1; then
+          is_alive=1
+          alive_rounds=$((alive_rounds + 1))
+          if (( alive_rounds >= 3 )); then
+              break
+          fi
+      else
+          is_alive=0
+          alive_rounds=0
+          break
+      fi
+      tries=$((tries + 1))
+  done
+
+  if (( is_alive == 0 )); then
+    err "启动失败：/etc/xray/xray_config.json 对应进程未能稳定存活，可能是 OOM、端口占用或运行期崩溃"
+    [[ -f /var/log/xray.log ]] && tail -n 3 /var/log/xray.log
     return 1
   fi
 
@@ -2972,45 +2959,125 @@ delete_node() {
   read -rp "按回车返回..." _
 }
 
+# ============================================================
+# 链接导入支持说明（落地协议）
+# ------------------------------------------------------------
+# 本函数当前仅负责“链接导入”类型的落地添加，支持以下协议：
+#
+# 1) Shadowsocks
+#    - 支持 ss:// 链接
+#    - 当前仅支持带 @ 的常见格式
+#    - 不支持无 @ 的纯 SIP002 SS 链接（此类需手动添加）
+#
+# 2) VLESS
+#    - 支持 vless:// 链接
+#    - 支持常见 TLS / Reality 参数
+#    - 当前已处理的常见字段包括：
+#      uuid / server / port / flow / sni / pbk / sid / fp /
+#      type / headerType / security / encryption
+#
+# 3) VMess
+#    - 支持 vmess:// 链接
+#    - 支持常见 TCP / WS / TLS 参数
+#    - 当前已处理的常见字段包括：
+#      add / port / id / net / path / host / tls / sni
+#
+# 注意：
+# - 本函数“不支持自动导入”的协议包括：
+#   socks:// / socks5:// / http:// / https:// / trojan:// /
+#   hysteria:// / hy2:// / tuic:// / wireguard://
+#
+# - 整个脚本的落地能力并不等于本函数的导入能力：
+#   菜单里仍可通过“手动添加”方式添加 SOCKS5 / HTTP / Shadowsocks 落地。
+#   本函数仅负责：SS / VLESS / VMess 三类链接导入。
+# ============================================================
+
+
 import_link_outbound() {
     local link="$1"
-    local tag
-tag="IMP-$(date +%s)"
-    local type="" server="" port="" user="" pass="" new_node=""
+    local tag="IMP-$(date +%s)"
+    local type="" server="" port="" pass="" new_node=""
     
     say "正在启动专业级解析与内核预校验..."
-    
+
+    # ==========================================
+    # 修复 1：放回内部，确保 100% 能被调用到
+    # ==========================================
+    _urldecode() {
+        local url_encoded="${1//+/ }"
+        printf '%b' "${url_encoded//%/\\x}"
+    }
+
     if [[ "$link" == ss://* ]]; then
         local main_part="${link#ss://}"
-        local userinfo_b64="${main_part%%@*}"
-        local server_info="${main_part#*@}"
-        local decoded; decoded=$(printf "%s" "$userinfo_b64" | base64 -d 2>/dev/null | tr -d '\n\r')
-        [[ -z "$decoded" ]] && { err "Base64 解码失败"; return 1; }
-        local method="${decoded%%:*}"
-        local password="${decoded#*:}"
-        password=$(printf "%s" "$password" | tr -cd 'A-Za-z0-9+/=_:-')
-        local server_port="${server_info%%[?#]*}"
-        server="${server_port%%:*}"
-        port="${server_port##*:}"
-        port=$(echo "$port" | tr -cd '0-9')
-        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg m "$method" --arg pw "$password" \
-            '{type: "shadowsocks", tag: $t, server: $s, server_port: ($p|tonumber), method: $m, password: $pw}')
-        type="ss"
+        main_part="${main_part%%#*}" # 去除末尾的备注
+        
+        # 兼容 SIP002 格式 (处理带 @ 的常见格式)
+        if [[ "$main_part" == *@* ]]; then
+            local userinfo_b64="${main_part%%@*}"
+            local server_info="${main_part#*@}"
+            
+            # 补齐 base64 padding 并解码
+            local pad=$(( 4 - ${#userinfo_b64} % 4 ))
+            [[ $pad -lt 4 ]] && userinfo_b64="${userinfo_b64}$(printf '%0.s=' $(seq 1 $pad))"
+            
+            local decoded
+            decoded=$(printf "%s" "$userinfo_b64" | tr '_-' '/+' | base64 -d 2>/dev/null | tr -d '\n\r')
+            [[ -z "$decoded" ]] && { err "SS Base64 解码失败"; return 1; }
+            
+            local method="${decoded%%:*}"
+            local password="${decoded#*:}"
+            
+            # 处理 IPv6 和 端口
+            if [[ "$server_info" =~ ^\[(.*)\]:(.*)$ ]]; then
+                server="${BASH_REMATCH[1]}"
+                port="${BASH_REMATCH[2]}"
+            else
+                server="${server_info%%:*}"
+                port="${server_info##*:}"
+            fi
+            
+            password=$(_urldecode "$password")
+            pass="$password"
+            port=$(echo "$port" | tr -cd '0-9')
+            
+            new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg m "$method" --arg pw "$password" \
+                '{type: "shadowsocks", tag: $t, server: $s, server_port: ($p|tonumber), method: $m, password: $pw}')
+            type="ss"
+        else
+            err "暂不支持无 @ 的纯 SIP002 SS 链接格式 (需手动添加)"
+            return 1
+        fi
+
     elif [[ "$link" == vless://* ]]; then
-        local uuid; uuid=$(echo "$link" | cut -d'@' -f1 | sed 's/vless:\/\///')
-        local server_port_raw; server_port_raw=$(echo "$link" | cut -d'@' -f2 | cut -d'?' -f1)
-        server="${server_port_raw%%:*}"
-        port="${server_port_raw##*:}"
+        local uuid_part="${link#vless://}"
+        local uuid="${uuid_part%%@*}"
+        
+        [[ -z "$uuid" ]] && { err "VLESS 链接解析失败：缺少 UUID"; return 1; }
+
+        local server_port_raw="${uuid_part#*@}"
+        server_port_raw="${server_port_raw%%#*}"
+        server_port_raw="${server_port_raw%%\?*}" 
+        
+        if [[ "$server_port_raw" =~ ^\[(.*)\]:(.*)$ ]]; then
+            server="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+        else
+            server="${server_port_raw%%:*}"
+            port="${server_port_raw##*:}"
+        fi
         port=$(echo "$port" | tr -cd '0-9')
+
         local qs=""
         [[ "$link" == *"?"* ]] && qs="${link#*\?}" && qs="${qs%%#*}"
         
-        local flow="" sni="" pbk="" sid="" fp="" net="tcp" htype="none" enc=""
+        # ⚠️ 恢复 enc 变量的解析
+        local flow="" sni="" pbk="" sid="" fp="" net="tcp" htype="none" enc="none" security="none"
         if [[ -n "$qs" ]]; then
             IFS='&' read -r -a _pairs <<< "$qs"
             for kv in "${_pairs[@]}"; do
                 local k="${kv%%=*}"
-                local v="${kv#*=}"
+                local v="$(_urldecode "${kv#*=}")"
                 case "$k" in
                     flow) flow="$v" ;;
                     sni) sni="$v" ;;
@@ -3019,54 +3086,136 @@ tag="IMP-$(date +%s)"
                     fp) fp="$v" ;;
                     type) net="$v" ;;
                     headerType) htype="$v" ;;
-                    encryption) enc="$v" ;;
+                    encryption) enc="$v" ;; # 👈 重新捕获后量子密钥
+                    security) security="$v" ;;
                 esac
             done
         fi
-        
-        local client_seed=""
-        if [[ -n "$enc" && "$enc" != "none" ]]; then
-            client_seed="$enc"
-        fi
 
+        # ⚠️ 将 client_seed 动态拼装回 JSON 结构中
         new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg u "$uuid" \
             --arg flow "$flow" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" \
-            --arg net "$net" --arg htype "$htype" --arg c_seed "$client_seed" \
-            '{type: "vless", tag: $t, server: $s, server_port: ($p|tonumber), uuid: $u, flow: $flow, client_seed: $c_seed, transport: { type: $net, header_type: $htype }, tls: { server_name: $sni, reality: { public_key: $pbk, short_id: (if $sid != "" then [$sid] else [] end) }, utls: { fingerprint: $fp } }}')
+            --arg net "$net" --arg htype "$htype" --arg enc "$enc" --arg sec "$security" '
+            {
+                type: "vless",
+                tag: $t,
+                server: $s,
+                server_port: ($p|tonumber),
+                uuid: $u,
+                transport: (if $net == "tcp" and $htype != "none"
+                            then { type: $net, header_type: $htype }
+                            else { type: $net }
+                            end)
+            }
+            + (if $flow != "" then { flow: $flow } else {} end)
+            + (if $enc != "none" and $enc != "" then { client_seed: $enc } else {} end) # 👈 关键：还原魔改密钥映射
+            + (if $sec == "reality" then
+                { tls: { enabled: true, server_name: $sni, reality: { public_key: $pbk, short_id: (if $sid != "" then [$sid] else [] end) }, utls: { fingerprint: $fp } } }
+             elif $sec == "tls" then
+                { tls: { enabled: true, server_name: $sni, utls: { fingerprint: $fp } } }
+             else
+                {}
+             end)
+        ')
         type="vless"
+
     elif [[ "$link" == vmess://* ]]; then
         local b64_data="${link#vmess://}"
-        local decoded; decoded=$(echo "$b64_data" | base64 -d 2>/dev/null)
+        
+        local pad=$(( 4 - ${#b64_data} % 4 ))
+        [[ $pad -lt 4 ]] && b64_data="${b64_data}$(printf '%0.s=' $(seq 1 $pad))"
+        local decoded
+        decoded=$(printf "%s" "$b64_data" | tr '_-' '/+' | base64 -d 2>/dev/null)
+        
         [[ -z "$decoded" ]] && { err "VMess Base64 解码失败"; return 1; }
+        
         server=$(echo "$decoded" | jq -r '.add // empty')
         port=$(echo "$decoded" | jq -r '.port // empty')
-        local uuid; uuid=$(echo "$decoded" | jq -r '.id // empty')
-        local net; net=$(echo "$decoded" | jq -r '.net // "tcp"')
-        local path; path=$(echo "$decoded" | jq -r '.path // ""')
-        local host; host=$(echo "$decoded" | jq -r '.host // ""')
-        local tls; tls=$(echo "$decoded" | jq -r '.tls // "none"')
-        local sni; sni=$(echo "$decoded" | jq -r '.sni // ""')
-        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg u "$uuid" --arg net "$net" --arg path "$path" --arg host "$host" --arg tls "$tls" --arg sni "$sni" \
-            '{type: "vmess", tag: $t, server: $s, server_port: ($p|tonumber), uuid: $u, transport: { type: $net, ws_settings: { path: $path, headers: { Host: $host } } }, tls: { enabled: (if $tls == "tls" then true else false end), server_name: $sni }}')
+        local uuid=$(echo "$decoded" | jq -r '.id // empty')
+        
+        [[ -z "$uuid" ]] && { err "VMess 链接解析失败：缺少 UUID"; return 1; }
+        
+        local net=$(echo "$decoded" | jq -r '.net // "tcp"')
+        local path=$(echo "$decoded" | jq -r '.path // ""')
+        local host=$(echo "$decoded" | jq -r '.host // ""')
+        local tls=$(echo "$decoded" | jq -r '.tls // "none"')
+        local sni=$(echo "$decoded" | jq -r '.sni // ""')
+        
+        new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg u "$uuid" \
+            --arg net "$net" --arg path "$path" --arg host "$host" --arg tls "$tls" --arg sni "$sni" '
+            {
+                type: "vmess",
+                tag: $t,
+                server: $s,
+                server_port: ($p|tonumber),
+                uuid: $u,
+                transport: (
+                    if $net == "ws" then
+                        { type: $net, ws_settings: { path: $path, headers: (if $host != "" then {Host: $host} else {} end) } }
+                    else
+                        { type: $net }
+                    end
+                )
+            }
+            +
+            (if $tls == "tls" then
+                { tls: { enabled: true, server_name: $sni } }
+             else
+                {}
+             end)
+        ')
         type="vmess"
     fi
 
-    test_outbound_connection "$type" "$server" "$port" "" ""
-    if ! test_outbound_connection "$type" "$server" "$port" "$user" "$pass"; then
-    warn "落地测试未通过，已取消添加。"
-    return 1
-fi
+    # --- 拦截校验 ---
+    if [[ -z "$type" || -z "$server" || -z "$port" || -z "$new_node" ]]; then
+        err "链接解析失败或暂不支持该分享格式"
+        return 1
+    fi
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        err "解析错误：端口不是有效数字 ($port)"
+        return 1
+    fi
 
-    local sandbox="/tmp/sb_test_config.json"
-    cp "$CONFIG" "$sandbox"
-    jq --argjson node "$new_node" '(.outbounds //= []) | .outbounds += [$node]' "$sandbox" > "${sandbox}.tmp" && mv "${sandbox}.tmp" "$sandbox"
+    # --- 连通性测试 ---
+    # 注：此处仅验证 server:port 的网络层 TCP 可达性，不校验协议认证信息
+    if ! test_outbound_connection "$type" "$server" "$port" "" "$pass"; then
+        warn "落地网络层联通性测试未通过，已取消添加。"
+        return 1
+    fi
+
+    # --- 沙箱写入与强验证文件操作 ---
+    local config_dir
+    config_dir="$(dirname "$CONFIG")"
     
+    local sandbox
+    # ==========================================
+    # 修复 2：去掉 .json 后缀，满足某些系统的 mktemp 强制规范
+    # ==========================================
+    sandbox="$(mktemp "$config_dir/sb_test_config_XXXXXX")"
+    [[ -z "$sandbox" || ! -f "$sandbox" ]] && { err "创建配置沙箱失败，请检查磁盘空间或权限"; return 1; }
+    
+    local sandbox_tmp="${sandbox}.tmp"
+    
+    cp "$CONFIG" "$sandbox" || { err "复制主配置文件到沙箱失败"; rm -f "$sandbox" "$sandbox_tmp"; return 1; }
+    
+    if ! jq --argjson node "$new_node" '(.outbounds //= []) | .outbounds += [$node]' "$sandbox" > "$sandbox_tmp"; then
+        err "写入 JSON 节点信息失败"
+        rm -f "$sandbox" "$sandbox_tmp"
+        return 1
+    fi
+    
+    mv "$sandbox_tmp" "$sandbox" || { err "临时配置替换失败"; rm -f "$sandbox" "$sandbox_tmp"; return 1; }
+    
+    # --- 终极核验与安全清理 ---
     if _check_model_config "$sandbox" >/dev/null 2>&1; then
-        mv "$sandbox" "$CONFIG"
+        mv "$sandbox" "$CONFIG" || { err "写回主配置失败"; rm -f "$sandbox" "$sandbox_tmp"; return 1; }
+        rm -f "$sandbox_tmp" 2>/dev/null
         ok "导入成功！(请前往‘设置节点落地关联’以生效)"
     else
-        err "✖ 内核校验失败"
-        rm -f "$sandbox"
+        err "✖ 内核 JSON 结构校验失败，该链接可能包含特殊或非法参数"
+        rm -f "$sandbox" "$sandbox_tmp" 2>/dev/null
+        return 1
     fi
 }
 
@@ -4743,38 +4892,6 @@ main_menu() {
   done
 }
 
-
-# ================= 运维收尾检查说明 =================
-# 用途：
-# 用于人工检查当前是否已经恢复到“单开、无旧 watchdog、重复配置已处理”的状态。
-# 这是检查命令，不会修改系统。
-#
-# 检查命令：
-# echo '===== CRONTAB ====='; crontab -l 2>/dev/null; echo; \
-# echo '===== XRAY PROCESS ====='; ps -ef | grep xray | grep -v grep; echo; \
-# echo '===== FILE STATUS ====='; ls -l /etc/xray/xray_config.json /usr/local/etc/xray/config.json /usr/local/etc/xray/config.json.duplicate.bak 2>/dev/null
-#
-# 输出含义：
-# 1. CRONTAB
-#    查看当前定时任务，确认是否还存在旧的 xray-singleton watchdog。
-#
-# 2. XRAY PROCESS
-#    查看当前正在运行的 Xray 进程，正常应只保留一条主进程。
-#
-# 3. FILE STATUS
-#    查看配置文件状态，确认：
-#    - /etc/xray/xray_config.json 存在
-#    - /usr/local/etc/xray/config.json 是否已移除
-#    - /usr/local/etc/xray/config.json.duplicate.bak 是否存在
-#
-# 说明：
-# 2>/dev/null 表示忽略报错输出，避免文件不存在或没有 crontab 时刷出无关错误信息。
-#
-# 正常结果应为：
-# - CRONTAB 中没有 xray-singleton
-# - XRAY PROCESS 中只有一条 Xray
-# - FILE STATUS 中主配置存在，重复配置已改名或不存在
-# ==================================================
 # ============= 执行流程 (入口) =============
 
 # 1. 快捷指令设置

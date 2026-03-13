@@ -4693,6 +4693,38 @@ main_menu() {
   done
 }
 
+# ================= 运维收尾检查说明 =================
+# 用途：
+# 用于人工检查当前是否已经恢复到“单开、无旧 watchdog、重复配置已处理”的状态。
+# 这是检查命令，不会修改系统。
+#
+# 检查命令：
+# echo '===== CRONTAB ====='; crontab -l 2>/dev/null; echo; \
+# echo '===== XRAY PROCESS ====='; ps -ef | grep xray | grep -v grep; echo; \
+# echo '===== FILE STATUS ====='; ls -l /etc/xray/xray_config.json /usr/local/etc/xray/config.json /usr/local/etc/xray/config.json.duplicate.bak 2>/dev/null
+#
+# 输出含义：
+# 1. CRONTAB
+#    查看当前定时任务，确认是否还存在旧的 xray-singleton watchdog。
+#
+# 2. XRAY PROCESS
+#    查看当前正在运行的 Xray 进程，正常应只保留一条主进程。
+#
+# 3. FILE STATUS
+#    查看配置文件状态，确认：
+#    - /etc/xray/xray_config.json 存在
+#    - /usr/local/etc/xray/config.json 是否已移除
+#    - /usr/local/etc/xray/config.json.duplicate.bak 是否存在
+#
+# 说明：
+# 2>/dev/null 表示忽略报错输出，避免文件不存在或没有 crontab 时刷出无关错误信息。
+#
+# 正常结果应为：
+# - CRONTAB 中没有 xray-singleton
+# - XRAY PROCESS 中只有一条 Xray
+# - FILE STATUS 中主配置存在，重复配置已改名或不存在
+# ==================================================
+
 # ============= 执行流程 (入口) =============
 
 # 1. 快捷指令设置

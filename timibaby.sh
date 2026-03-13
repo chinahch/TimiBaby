@@ -1498,7 +1498,7 @@ install_watchdog_cron() {
   local marker="# xray-watchdog"
   crontab -l >/dev/null 2>&1 || true
   crontab -l 2>/dev/null | grep -v "$marker" > /tmp/crontab.tmp 2>/dev/null || true
-  echo "* * * * * /usr/local/bin/xray-singleton >/dev/null 2>&1  $marker" >> /tmp/crontab.tmp
+  echo "*/5 * * * * /usr/local/bin/xray-singleton >/dev/null 2>&1  $marker" >> /tmp/crontab.tmp
   crontab /tmp/crontab.tmp
   rm -f /tmp/crontab.tmp
 }
@@ -1827,8 +1827,16 @@ if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# 3. 杀死旧进程并启动新进程
-pkill -f "/usr/local/bin/xray run -c" >/dev/null 2>&1 || true
+# 3. 如果主进程已在运行，则不做破坏性重启，避免断流
+if pgrep -f "/usr/local/bin/xray run -c $OUT_CFG" >/dev/null 2>&1; then
+    pid=$(pgrep -o -f "/usr/local/bin/xray run -c $OUT_CFG" || true)
+    if [[ -n "${pid:-}" ]]; then
+        echo "$pid" > "$PIDFILE"
+    fi
+    exit 0
+fi
+
+# 4. 仅在进程不存在时兜底拉起
 setsid "$BIN" run -c "$OUT_CFG" >> "$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 WRAP
@@ -1885,11 +1893,8 @@ start_xray_singleton_force() {
       /usr/local/bin/xray-sync >/dev/null 2>&1 || true
   fi
 
-  # 2. 彻底清理旧进程与 PID 锁
-  # 使用 -9 强制杀死，防止僵尸进程占用 11732 或 47302 端口
-  pkill -9 -f "/usr/local/bin/xray" >/dev/null 2>&1 || true
+  # 2. 清理陈旧 PID 锁，但不再粗暴 -9 杀全量进程，避免正在转发的连接被硬断
   rm -f /run/xray.pid /var/run/xray.pid >/dev/null 2>&1 || true
-  sleep 1
 
   # 3. 启动前语法自检 (关键防线)
   # 如果配置测试不通过，直接报错，不盲目启动
@@ -1987,8 +1992,8 @@ restart_xray() {
   rm -f "${IP_CACHE_FILE}_xray" "${IP_CACHE_FILE}_xray_status" /tmp/ip_probe.lock 2>/dev/null
   install_singleton_wrapper >/dev/null 2>&1 || true
 
-  # 每次重启 Xray 时，重新下发底层的 tc 限速规则
-  apply_port_limits
+  # 注意：普通重启不再自动重建 tc 根队列，避免删除 qdisc 时造成在线连接抖动/断流。
+  # 如需变更端口限速，仅在用户显式设置限速后调用 apply_port_limits。
 
   # 2. 先同步主模型并做 Xray 语法校验
   if ! sync_xray_config >/dev/null 2>&1; then
@@ -2086,25 +2091,10 @@ auto_fix_mtu_mss() {
 
     say "当前网卡 $iface MTU: ${current_mtu:-未知}, 建议 MTU: $target_mtu"
 
-    # 1. 修复 MTU
+    # 稳定性优先：不再自动修改物理网卡 MTU，也不重启 networkd。
+    # 这些动作会直接影响现有连接，容易造成你反馈的“严重断流”。
     if [[ "$current_mtu" != "$target_mtu" && -n "$current_mtu" ]]; then
-        warn "检测到潜在的 MTU 黑洞风险，正在自动修复 (调整网卡 MTU 为 $target_mtu)..."
-        ip link set dev "$iface" mtu "$target_mtu" 2>/dev/null
-        
-        # 针对 systemd-networkd 环境进行永久化写入
-        if [[ -d /etc/systemd/network ]]; then
-            local net_file
-            net_file=$(grep -rl "Name=$iface" /etc/systemd/network/ 2>/dev/null | head -n 1)
-            if [[ -n "$net_file" ]]; then
-                if grep -q '^MTUBytes=' "$net_file"; then
-                    sed -i "s/^MTUBytes=.*/MTUBytes=$target_mtu/" "$net_file"
-                else
-                    sed -i "/\[Link\]/a MTUBytes=$target_mtu" "$net_file"
-                fi
-                systemctl restart systemd-networkd 2>/dev/null
-            fi
-        fi
-        ok "网卡 $iface MTU 已调整为 $target_mtu"
+        warn "检测到潜在的 MTU 黑洞风险，但为避免断流，当前版本不会自动修改网卡 MTU；仅添加 MSS 保险规则。"
     fi
 
     # 2. 添加 TCP MSS Clamping 保险丝 (无论 MTU 是否修改都加上，防止多层套娃导致的包过大)
@@ -4559,10 +4549,10 @@ if [[ ! -f "$IP_CACHE_FILE" ]]; then
 fi
 
 # 4. 自动挂载守护进程 (无人值守模式)
-# 增加 crontab 命令存在性检查，防止在极简版系统报错
+# 保留守护，但采用非破坏性单例守护：仅在主进程缺失时兜底拉起，不会定时强杀重启。
 if command -v crontab >/dev/null 2>&1; then
     if ! crontab -l 2>/dev/null | grep -q "xray-singleton"; then
-        say "正在开启无人值守守护模式..."
+        say "正在开启稳态守护模式..."
         install_watchdog_cron
     fi
 fi

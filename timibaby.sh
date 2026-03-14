@@ -2245,7 +2245,7 @@ add_node() {
     if [[ "$proto" == "6" ]]; then
         read -rp "请输入 TUIC 端口 (回车随机): " input_port
         [[ -z "$input_port" ]] && input_port=$(shuf -i 20000-60000 -n 1)
-        call_233boy_builder "$tag" "$input_port"
+        call_native_tuic_builder "$tag" "$input_port"
         return
     fi
 
@@ -2470,38 +2470,468 @@ EOF
 }
 
 
-# --- 深度封装 233 动力引擎 (全静默模式) ---
-call_233boy_builder() {
-    local tag="$1"
-    local port="$2"
-    # 正确写法
-local uuid
-uuid=$(uuidgen)
-    
-    # 1. 环境初始化 (屏蔽所有 233boy 脚本的安装输出)
-    if ! command -v sb >/dev/null 2>&1; then
-        say "正在执行内核初始化 (静默模式)..."
-        # 使用 -s 屏蔽下载，2>/dev/null 屏蔽所有文字输出
-        curl -sL https://github.com/233boy/sing-box/raw/main/install.sh | bash >/dev/null 2>&1
+
+# ==========================================================
+# --- Sing-box / TUIC 专属辅助函数 ---
+# ==========================================================
+sb_ensure_base_config() {
+    mkdir -p /etc/sing-box/bin
+    mkdir -p /var/log/sing-box
+    if [[ ! -f /etc/sing-box/config.json ]]; then
+        cat > /etc/sing-box/config.json <<EOF
+{
+  "log": {
+    "output": "/var/log/sing-box/access.log",
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "direct"
+  }
+}
+EOF
+    fi
+}
+
+sb_install_core_if_needed() {
+    if [ -L "/etc/sing-box" ]; then
+        say "检测到 /etc/sing-box 是软链接，正在解除绑定..."
+        rm -f /etc/sing-box
+    fi
+    mkdir -p /etc/sing-box/bin
+    mkdir -p /var/log/sing-box
+    if ! command -v sing-box >/dev/null 2>&1; then
+        say "正在下载官方 Sing-box 核心..."
+        local arch latest_sb dl_url
+        arch=$(uname -m)
+        if [[ "$arch" == "x86_64" ]]; then arch="amd64"; else arch="arm64"; fi
+        latest_sb=$(curl -s --max-time 5 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+        [[ -z "$latest_sb" || "$latest_sb" == "null" ]] && latest_sb="v1.11.4"
+        dl_url="https://github.com/SagerNet/sing-box/releases/download/${latest_sb}/sing-box-${latest_sb#v}-linux-${arch}.tar.gz"
+        wget -qO /tmp/sing-box.tar.gz "$dl_url"
+        tar -xzf /tmp/sing-box.tar.gz -C /tmp/
+        mv /tmp/sing-box-*/sing-box /usr/local/bin/
+        chmod +x /usr/local/bin/sing-box
+        rm -rf /tmp/sing-box*
+    fi
+    mkdir -p /etc/systemd/system/sing-box.service.d
+    cat > /etc/systemd/system/sing-box.service.d/override.conf <<EOF
+[Service]
+Environment="ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true"
+Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
+EOF
+    cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box Service
+After=network.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable sing-box >/dev/null 2>&1
+}
+
+sb_ensure_cert() {
+    local PUBLIC_HOST="$1"
+    mkdir -p /etc/sing-box/bin
+    if [[ ! -f /etc/sing-box/bin/tls.cer || ! -f /etc/sing-box/bin/tls.key ]]; then
+        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) -days 3650 -keyout /etc/sing-box/bin/tls.key -out /etc/sing-box/bin/tls.cer -subj "/CN=${PUBLIC_HOST}" >/dev/null 2>&1
+    fi
+}
+
+sb_restart_service() {
+    systemctl restart sing-box >/dev/null 2>&1
+    sleep 1
+    systemctl is-active --quiet sing-box
+}
+
+sb_parse_host_port() {
+    local input="$1"
+    local clean=""
+    local host=""
+    local port=""
+
+    clean="$input"
+    clean="${clean//$'
+'/}"
+    clean="${clean//$'
+'/}"
+    clean="${clean%%\?*}"
+    clean="${clean%%#*}"
+    clean="${clean%%/*}"
+    clean="${clean% }"
+    clean="${clean# }"
+
+    if [[ -z "$clean" ]]; then
+        return 1
     fi
 
-    # 2. 调用核心进行后台构建 (彻底屏蔽 UI 和字眼)
-    # 利用 233 脚本的非交互命令行功能处理防火墙和优化
-    say "正在优化系统防火墙并注入内核补丁..."
-    sb add tuic "$port" "$uuid" >/dev/null 2>&1
+    if [[ "$clean" =~ ^\[([^][]+)\]:([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$clean" =~ ^([^:]+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$clean" =~ ^(.+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
 
-    # 3. 获取 IP 并生成你脚本原生风格的 UI 展示
-    local PUBLIC_HOST; PUBLIC_HOST=$(get_public_ipv4_ensure)
-    
-    # 构造动力链接 (包含 bbr、h3 和跳过证书验证参数)
-    local link="tuic://${uuid}:${uuid}@${PUBLIC_HOST}:${port}?alpn=h3&allow_insecure=1&congestion_control=bbr#${tag}"
-    
-    echo -e "\n${C_GREEN}✔ 节点已通过内核增强引擎构建完成！${C_RESET}"
-    
-    # 调用你脚本自带的卡片 UI
-    print_card "TUIC v5 部署成功" "$tag" "端口: $port\nUUID: $uuid\n优化: BBR / H3 链路加速" "$link"
-    
-    warn "管理提示：如需维护此节点，请在终端输入指令: sb"
+    host="${host#[}"
+    host="${host%]}"
+    host="${host% }"
+    host="${host# }"
+    port="$(echo "$port" | tr -cd '0-9')"
+
+    if [[ -z "$host" || -z "$port" ]]; then
+        return 1
+    fi
+
+    SB_PARSED_HOST="$host"
+    SB_PARSED_PORT="$port"
+    return 0
+}
+
+# ==========================================================
+# --- 替换以下 6 个 Sing-box 辅助函数 (防弹修复版) ---
+# ==========================================================
+
+# 1. 修复 %3A 无法正确解析为冒号的 Bug
+sb_url_decode() {
+    local data="$1"
+    data="${data//+/ }"
+    printf '%b' "${data//%/\\x}"
+}
+
+# ==========================================================
+# --- 替换以下 6 个 Sing-box 辅助函数 (完美解决 index(.tag) 崩溃 BUG) ---
+# ==========================================================
+
+sb_remove_old_binding_for_inbound() {
+    local inbound_tag="$1"
+    local tmp_conf
+    tmp_conf=$(mktemp)
+    jq --arg inb "$inbound_tag" '
+      (.route //= {}) |
+      (.route.rules //= []) |
+      (.outbounds //= []) |
+      ([.route.rules[]? | select(type=="object") | select(.inbound != null and (.inbound|type)=="array" and (.inbound|index($inb)!=null)) | .outbound] | unique) as $old_outs |
+      .route.rules = ([{"ip_is_private": true, "outbound": "direct"}] + [ .route.rules[]? | select(type=="object") | select(.ip_is_private != true) | select(.inbound == null or (.inbound|type)!="array" or (.inbound|index($inb)==null)) ]) |
+      .outbounds = [ .outbounds[]? | select(type=="object") | select(.tag == "direct" or (.tag as $t | $old_outs | index($t) | not)) ] |
+      if any(.outbounds[]? | select(type=="object"); .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
+      .route.final = "direct"
+    ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+}
+
+sb_bind_outbound_to_inbound() {
+    local inbound_tag="$1"
+    local outbound_json="$2"
+    local outbound_tag="$3"
+    local tmp_conf
+    tmp_conf=$(mktemp)
+    jq --argjson node "$outbound_json" --arg inb "$inbound_tag" --arg out "$outbound_tag" '
+      (.outbounds //= []) |
+      (.route //= {}) |
+      (.route.rules //= []) |
+      .outbounds = ([ .outbounds[]? | select(type=="object") | select(.tag != $out) ] + [$node]) |
+      .route.rules = ([{"ip_is_private": true, "outbound": "direct"}] + [ .route.rules[]? | select(type=="object") | select(.ip_is_private != true) | select(.inbound == null or (.inbound|type)!="array" or .inbound[0] != $inb) ] + [{"inbound": [$inb], "outbound": $out}]) |
+      if any(.outbounds[]? | select(type=="object"); .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
+      .route.final = "direct"
+    ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+}
+
+sb_cleanup_unreferenced_outbounds() {
+    [[ ! -f /etc/sing-box/config.json ]] && return 0
+    local tmp_conf
+    tmp_conf=$(mktemp)
+    jq '
+      (.route //= {}) |
+      (.route.rules //= []) |
+      (.outbounds //= []) |
+      . as $root |
+      .outbounds = [
+        .outbounds[]?
+        | select(type == "object")
+        | select(
+            .tag == "direct"
+            or ((.tag | startswith("sb-landing-") | not))
+            or (.tag as $t | [ $root.route.rules[]? | select(type=="object") | .outbound ] | index($t) != null)
+          )
+      ]
+    ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+}
+
+delete_sb_node_by_tag() {
+    local tag="$1"
+    [[ -z "$tag" ]] && return 1
+    [[ ! -f /etc/sing-box/config.json ]] && { err "未找到 Sing-box 配置文件"; return 1; }
+    local tmp_conf
+    tmp_conf=$(mktemp)
+    jq --arg t "$tag" '
+      (.inbounds //= []) |
+      (.outbounds //= []) |
+      (.route //= {}) |
+      (.route.rules //= []) |
+      .inbounds = [ .inbounds[]? | select(type=="object") | select(.tag != $t) ] |
+      .route.rules = [
+        .route.rules[]?
+        | select(type=="object") | select(.inbound == null or ((.inbound|type)!="array") or (.inbound|index($t) == null))
+      ] |
+      .outbounds = [ .outbounds[]? | select(type=="object") | select(.tag != ("sb-landing-" + $t)) ] |
+      if any(.outbounds[]? | select(type=="object"); .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
+      .route.final = "direct"
+    ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+    sb_cleanup_unreferenced_outbounds
+    if sb_restart_service; then
+        ok "TUIC 节点 [$tag] 已删除"
+        return 0
+    else
+        err "Sing-box 重启失败，请检查配置"
+        return 1
+    fi
+}
+
+sb_drop_invalid_outbounds() {
+    [[ ! -f /etc/sing-box/config.json ]] && return 0
+    local tmp_conf
+    tmp_conf=$(mktemp)
+    jq '
+      (.outbounds //= []) |
+      (.route //= {}) |
+      (.route.rules //= []) |
+      . as $root |
+      .outbounds = [
+        .outbounds[]?
+        | select(type == "object")
+        | select(
+            .type == "direct"
+            or .type == "block"
+            or .type == "dns"
+            or (
+                ((.server? // "") | type) == "string"
+                and ((.server? // "") | length) > 0
+                and ((.server? // "") | startswith("[") | not)
+            )
+            or (.server != null)
+          )
+      ] |
+      .route.rules = [
+        .route.rules[]?
+        | select(type == "object")
+        | select(.outbound == null or .outbound == "direct" or (.outbound as $o | [ $root.outbounds[]? | select(type=="object") | .tag ] | index($o) != null))
+      ] |
+      if ((.route.final // "direct") as $f | [ .outbounds[]? | select(type=="object") | .tag ] | index($f) == null) then .route.final = "direct" else . end
+    ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+}
+
+clear_sb_routing() {
+    echo -e "\n${C_CYAN}=== 解除 TUIC 节点落地绑定 ===${C_RESET}"
+    [[ ! -f "/etc/sing-box/config.json" ]] && { err "未找到 Sing-box 配置"; return; }
+
+    sb_select_tuic_inbound || return
+    local sel_inbound="$SB_SELECTED_INBOUND"
+
+    sb_remove_old_binding_for_inbound "$sel_inbound"
+
+    local tmp_conf
+    tmp_conf=$(mktemp)
+    jq --arg inb "$sel_inbound" '
+      (.route //= {}) |
+      (.route.rules //= []) |
+      .route.rules = ([{"ip_is_private": true, "outbound": "direct"}] + [ .route.rules[]? | select(type=="object") | select(.ip_is_private != true) ] + [{"inbound": [$inb], "outbound": "direct"}]) |
+      .route.final = "direct"
+    ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+
+    if sb_restart_service; then
+        ok "节点 [$sel_inbound] 已恢复为原生直连。"
+    else
+        err "Sing-box 重启失败，请检查配置"
+        return 1
+    fi
+}
+
+sb_url_param_get() {
+    local url="$1"
+    local key="$2"
+    local query=""
+    local part=""
+    query="${url#*\?}"
+    [[ "$query" == "$url" ]] && return 1
+    query="${query%%#*}"
+    IFS='&' read -r -a __pairs <<< "$query"
+    for part in "${__pairs[@]}"; do
+        if [[ "$part" == "${key}="* ]]; then
+            SB_PARAM_VALUE=$(sb_url_decode "${part#*=}")
+            return 0
+        fi
+    done
+    return 1
+}
+
+sb_list_tuic_inbounds() {
+    jq -r '.inbounds[]? | select(.type == "tuic") | "\(.tag)|\(.listen_port)"' /etc/sing-box/config.json 2>/dev/null
+}
+
+sb_select_tuic_inbound() {
+    mapfile -t SB_INBOUNDS < <(sb_list_tuic_inbounds)
+    if [[ ${#SB_INBOUNDS[@]} -eq 0 ]]; then
+        err "当前没有任何 TUIC 入站节点，请先添加 TUIC 节点。"
+        return 1
+    fi
+    echo -e "\n${C_YELLOW}请选择要绑定落地的 TUIC 节点：${C_RESET}"
+    local i=0 line tag port idx=""
+    for line in "${SB_INBOUNDS[@]}"; do
+        i=$((i+1))
+        tag="${line%%|*}"
+        port="${line##*|}"
+        echo -e " ${C_GREEN}[$i]${C_RESET} ${C_CYAN}${tag}${C_RESET} 端口:${port}"
+    done
+    read -rp "请输入序号 (1-${i}, 输入0取消): " idx
+    [[ -z "$idx" || "$idx" == "0" ]] && return 1
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > i )); then
+        warn "无效选择"
+        return 1
+    fi
+    SB_SELECTED_INBOUND="${SB_INBOUNDS[$((idx-1))]%%|*}"
+    return 0
+}
+
+
+
+
+
+sb_get_outbound_desc() {
+    local outbound_tag="$1"
+    jq -r --arg o "$outbound_tag" '
+      .outbounds[]? | select(.tag == $o) |
+      if .type == "direct" then
+        "原生直连"
+      elif .type == "shadowsocks" then
+        "\(.server):\(.server_port) [shadowsocks]"
+      elif .type == "tuic" then
+        "\(.server):\(.server_port) [tuic]"
+      elif .type == "hysteria2" then
+        "\(.server):\(.server_port) [hysteria2]"
+      else
+        ((.server // "unknown") + ":" + ((.server_port // 0)|tostring) + " [" + (.type // "unknown") + "]")
+      end
+    ' /etc/sing-box/config.json 2>/dev/null | head -n 1
+}
+
+sb_get_inbound_link_preview() {
+    local tag="$1"
+    [[ ! -f /etc/sing-box/config.json ]] && return 0
+    jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t and .type == "tuic") | [(.users[0].uuid // ""), (.listen_port // ""), (.tls.server_name // ""), (.users[0].password // "")] | @tsv' /etc/sing-box/config.json 2>/dev/null | head -n 1
+}
+
+
+delete_xray_node_by_tag() {
+    local tag="$1"
+    [[ -z "$tag" ]] && return 1
+    [[ ! -f "$CONFIG" ]] && { err "未找到 Xray 配置文件"; return 1; }
+    safe_json_edit "$CONFIG" '.inbounds = [ .inbounds[]? | select(.tag != $t) ]' --arg t "$tag" >/dev/null 2>&1 || true
+    safe_json_edit "$CONFIG" '(.route //= {}) | (.route.rules //= []) | .route.rules = [ .route.rules[]? | select(.inbound == null or ((.inbound|type) != "array") or (.inbound|index($t) == null)) ]' --arg t "$tag" >/dev/null 2>&1 || true
+    if [[ -f "$META" ]]; then
+        local tmp_meta
+        tmp_meta=$(mktemp)
+        jq --arg t "$tag" 'del(.[$t])' "$META" > "$tmp_meta" && mv "$tmp_meta" "$META"
+    fi
+    restart_xray main_only >/dev/null 2>&1 || restart_xray >/dev/null 2>&1 || true
+    ok "Xray 节点 [$tag] 已删除"
+    return 0
+}
+
+
+# --- 原生 Sing-box TUIC 部署逻辑 (含软链接自动解绑) ---
+call_native_tuic_builder() {
+    local tag="$1"
+    local port="$2"
+    local uuid
+    local PUBLIC_HOST
+    local new_inbound
+    local tmp_conf
+    local host_disp
+    local link
+
+    uuid=$(uuidgen)
+    PUBLIC_HOST=$(get_public_ipv4_ensure)
+    [[ -z "$tag" ]] && tag="tuic-${port}"
+
+    sb_install_core_if_needed
+    sb_ensure_base_config
+    sb_ensure_cert "$PUBLIC_HOST"
+
+    new_inbound=$(jq -n \
+      --arg t "$tag" \
+      --arg p "$port" \
+      --arg u "$uuid" \
+      '{
+        type: "tuic",
+        tag: $t,
+        listen: "::",
+        listen_port: ($p|tonumber),
+        users: [
+          {
+            uuid: $u,
+            password: $u
+          }
+        ],
+        congestion_control: "bbr",
+        tls: {
+          enabled: true,
+          alpn: ["h3"],
+          certificate_path: "/etc/sing-box/bin/tls.cer",
+          key_path: "/etc/sing-box/bin/tls.key"
+        }
+      }'
+    )
+
+    tmp_conf=$(mktemp)
+
+    jq --argjson inb "$new_inbound" --arg t "$tag" '
+      (.inbounds //= []) |
+      (.outbounds //= []) |
+      (.route //= {}) |
+      (.route.rules //= []) |
+      .inbounds = [ .inbounds[]? | select(.tag != $t) ] + [$inb] |
+      if any(.outbounds[]?; .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
+      .route.rules = ([{"ip_is_private": true, "outbound": "direct"}] + [ .route.rules[]? | select(.ip_is_private != true) ]) |
+      (.route.final //= "direct")
+    ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+
+    if sb_restart_service; then
+        host_disp=$(format_host_for_link "$PUBLIC_HOST")
+        link="tuic://${uuid}:${uuid}@${host_disp}:${port}?alpn=h3&allow_insecure=1&congestion_control=bbr&sni=${PUBLIC_HOST}#${tag}"
+        print_card "TUIC v5 原生部署（保留既有落地）" "$tag" "端口: $port\nUUID: $uuid" "$link"
+    else
+        err "Sing-box 启动失败，请检查 /etc/sing-box/config.json"
+        return 1
+    fi
+
     read -rp "按回车返回主菜单..." _
 }
 
@@ -2700,264 +3130,203 @@ link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
 } # 确保函数闭合
 
 view_nodes_menu() {
-  local V4_ADDR; V4_ADDR=$(get_public_ipv4_ensure)
-  local V6_ADDR; V6_ADDR=$(get_public_ipv6_ensure)
-  local global_pref="v4"
-  [[ -f "/etc/xray/ip_pref" ]] && global_pref=$(cat /etc/xray/ip_pref)
-  
-  # 预先清理可能影响 read 的变量
-  NODE_TAGS=()
-  NODE_TYPES=()
-  NODE_PORTS=()
-  NODE_IPS=()
-  NODE_V_DISP=()
-  local idx=1
+    echo -e "\n${C_CYAN}=== 节点列表预览（Xray + Sing-box） ===${C_RESET}"
 
-  echo -e "\n${C_CYAN}=== 节点列表预览 (极致修复版) ===${C_RESET}"
-  echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
-  printf " ${C_YELLOW}%-4s | %-20s | %-15s | %-8s | %-15s${C_RESET}\n" "序号" "节点标签" "协议/状态" "端口" "出口 IP (版本)"
-  echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+    local total_count=0
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+    printf " %-4s | %-20s | %-16s | %-8s | %-28s\n" "序号" "节点标签" "协议/类型" "端口" "出口 / 备注"
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
 
-  # 🚀 增强版 jq 解析：显式处理空值，防止字段缩水导致 read 错位
-  local parsed_data
-  parsed_data=$(jq -r -n --slurpfile cfg "$CONFIG" --slurpfile meta "$META" '
-    ($cfg[0].inbounds // []) as $inbounds |
-    ($meta[0] // {}) as $m |
-    ( ($inbounds | map(select(.tag != null) | .tag)) + ($m | keys) | unique )[] as $tag |
-    ($inbounds | map(select(.tag == $tag)) | .[0] // {}) as $inb |
-    ($m[$tag] // {}) as $mt |
-    [
-      $tag,
-      ($mt.type // $inb.type // "UNKNOWN"),
-      ($inb.port // $inb.listen_port // $mt.port // "0"),
-      ($mt.fixed_ip // "NONE"),
-      ($mt.ip_version // "NONE"),
-      ($mt.server_seed // "NONE"),
-      ($mt.pbk // "NONE")
-    ] | @tsv
-  ' 2>/dev/null)
+    NODE_KIND_LIST=()
+    NODE_TAG_LIST=()
+    NODE_PORT_LIST=()
+    NODE_PROTO_LIST=()
+    NODE_NOTE_LIST=()
 
-  # 使用 IFS 严格分隔
-  while IFS=$'\t' read -r tag type port fixed_ip node_v is_enc has_pbk; do
-      [[ -z "$tag" || "$tag" == "null" ]] && continue
-      
-      # 1. 修正协议显示逻辑
-      local check_type="${type,,}"
-      local display_type="${type^^}"
-      
-      if [[ "$check_type" == "vless" ]]; then
-          if [[ "$is_enc" != "NONE" && -n "$is_enc" ]]; then
-              display_type="VLESS-ENC"
-          elif [[ "$has_pbk" != "NONE" && -n "$has_pbk" ]]; then
-              display_type="VLESS-REALITY"
-          else
-              display_type="VLESS"
-          fi
-      elif [[ "$check_type" == "argo" ]]; then
-          [[ "$fixed_ip" != "NONE" ]] && display_type="ARGO-FIXED" || display_type="ARGO-TEMP"
-      fi
+    if [[ -f "$CONFIG" ]]; then
+        while IFS=$'\t' read -r tag proto port; do
+            [[ -z "$tag" ]] && continue
+            total_count=$((total_count+1))
+            local note=""
+            note=$(jq -r --arg t "$tag" '
+              ([.route.rules[]? | select(.inbound != null and (.inbound|type)=="array" and (.inbound|index($t)!=null)) | .outboundTag // .outbound // ""][0]) // "直连/默认"
+            ' "$CONFIG" 2>/dev/null)
+            NODE_KIND_LIST+=("xray")
+            NODE_TAG_LIST+=("$tag")
+            NODE_PORT_LIST+=("$port")
+            NODE_PROTO_LIST+=("${proto:-unknown}")
+            NODE_NOTE_LIST+=("$note")
+        done < <(
+            jq -r '
+              .inbounds[]? | select(.tag != null) | [(.tag // ""), (.protocol // .type // "unknown"), ((.port // .listen_port // "N/A")|tostring)] | @tsv
+            ' "$CONFIG" 2>/dev/null
+        )
+    fi
 
-      # 2. 修正 IP 显示逻辑 (防止密钥混入)
-      local use_v="${node_v}"
-      [[ "$use_v" == "NONE" || -z "$use_v" ]] && use_v="$global_pref"
-      
-      local CURRENT_IP="$V4_ADDR"
-      [[ "$use_v" == "v6" && -n "$V6_ADDR" ]] && CURRENT_IP="$V6_ADDR"
-      
-      # 如果有固定 IP 且它看起来不像密钥（长度小于 50），则使用它
-      if [[ "$fixed_ip" != "NONE" && -n "$fixed_ip" ]]; then
-          if ((${#fixed_ip} < 50)); then
-              CURRENT_IP="$fixed_ip"
-          fi
-      fi
+    if [[ -f /etc/sing-box/config.json ]]; then
+        while IFS='|' read -r tag port; do
+            [[ -z "$tag" ]] && continue
+            total_count=$((total_count+1))
+            local outbound_tag=""
+            local outbound_desc="原生直连"
+            outbound_tag=$(jq -r --arg t "$tag" '
+              ([.route.rules[]? | select(.inbound != null and (.inbound|type)=="array" and (.inbound|index($t)!=null)) | .outbound][0]) // .route.final // "direct"
+            ' /etc/sing-box/config.json 2>/dev/null)
+            if [[ -n "$outbound_tag" && "$outbound_tag" != "direct" ]]; then
+                outbound_desc=$(sb_get_outbound_desc "$outbound_tag")
+                [[ -z "$outbound_desc" ]] && outbound_desc="$outbound_tag"
+            fi
+            NODE_KIND_LIST+=("sing-box")
+            NODE_TAG_LIST+=("$tag")
+            NODE_PORT_LIST+=("$port")
+            NODE_PROTO_LIST+=("tuic")
+            NODE_NOTE_LIST+=("$outbound_desc")
+        done < <(jq -r '.inbounds[]? | select(.type == "tuic") | "\(.tag)|\(.listen_port)"' /etc/sing-box/config.json 2>/dev/null)
+    fi
 
-      NODE_TAGS+=("$tag")
-      NODE_TYPES+=("$type")
-      NODE_PORTS+=("$port")
-      NODE_IPS+=("$CURRENT_IP")
-      NODE_V_DISP+=("$use_v")
+    if [[ "$total_count" -eq 0 ]]; then
+        echo -e "${C_GRAY} 当前没有任何节点。${C_RESET}"
+        echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+        echo -e "\n [0] 返回主菜单"
+        read -rp " 按回车返回..." _
+        return
+    fi
 
-      local line_color="$C_YELLOW"
-      [[ "$display_type" =~ "ARGO" || "$display_type" == "HYSTERIA2" ]] && line_color="$C_PURPLE"
-      
-      local short_tag="${tag:0:20}"
-      # 最终打印：如果 IP 依然过长，强行截断显示或显示“检测中”
-      local ip_disp="${CURRENT_IP}"
-      ((${#ip_disp} > 40)) && ip_disp="IP 检测异常"
+    local i
+    for ((i=0; i<${#NODE_TAG_LIST[@]}; i++)); do
+        printf " %-4s | %-20s | %-16s | %-8s | %-28s\n" \
+            "$((i+1))" \
+            "${NODE_TAG_LIST[$i]:0:20}" \
+            "${NODE_PROTO_LIST[$i]} [${NODE_KIND_LIST[$i]}]" \
+            "${NODE_PORT_LIST[$i]}" \
+            "${NODE_NOTE_LIST[$i]:0:28}"
+    done
 
-      printf " ${C_GREEN}[%2d]${C_RESET} | ${line_color}%-20s${C_RESET} | %-15s | %-8s | %-15s\n" \
-              "$idx" "$short_tag" "$display_type" "$port" "${ip_disp} (${use_v})"
-      
-      ((idx++))
-  done <<< "$parsed_data"
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+    echo -e "\n [0] 返回主菜单"
 
-  echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
-  echo -e " ${C_GREEN}[0]${C_RESET} 返回主菜单"
+    local sel=""
+    read -rp " 请选择要查看详情的节点序号: " sel
+    [[ -z "$sel" || "$sel" == "0" ]] && return
 
-  read -rp " 请选择要查看详情的节点序号: " v_choice
-  [[ -z "$v_choice" || "$v_choice" == "0" ]] && return
-  
-  local sel_idx; sel_idx=$((v_choice - 1))
-  local target_tag="${NODE_TAGS[$sel_idx]}"
-  local t_type="${NODE_TYPES[$sel_idx]}"
-  local t_ip="${NODE_IPS[$sel_idx]}"
-  local t_port="${NODE_PORTS[$sel_idx]}"
-  
-  [[ -z "$target_tag" ]] && { echo -e "${C_RED}错误：无效序号${C_RESET}"; sleep 1; return; }
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#NODE_TAG_LIST[@]} )); then
+        warn "无效选择"
+        return
+    fi
 
-  # --- 详情查看部分保持不变 (这里保留 get_ip_country 没关系，因为点进详情只查一个 IP) ---
-  local final_link=""
-  
-  if [[ "${t_type,,}" == "shadowsocks" ]]; then
-      local method; method=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .method // "aes-256-gcm"' "$CONFIG" 2>/dev/null)
-      local pass; pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .password // ""' "$CONFIG" 2>/dev/null)
-      local userinfo="${method}:${pass}"
-      local b64_creds; b64_creds=$(printf "%s" "$userinfo" | base64 -w0)
-      final_link="ss://${b64_creds}@${t_ip}:${t_port}#${target_tag}"
-      print_card "Shadowsocks 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n加密: ${method}\n密码: ${pass}" "$final_link"
+    local idx=$((sel-1))
+    local kind="${NODE_KIND_LIST[$idx]}"
+    local tag="${NODE_TAG_LIST[$idx]}"
+    local port="${NODE_PORT_LIST[$idx]}"
+    local proto="${NODE_PROTO_LIST[$idx]}"
+    local note="${NODE_NOTE_LIST[$idx]}"
 
-  elif [[ "${t_type,,}" == "socks" ]]; then
-      local user; user=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].username // "user"' "$CONFIG" 2>/dev/null)
-      local pass; pass=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].password // "pass"' "$CONFIG" 2>/dev/null)
-      final_link="socks://$(printf "%s:%s" "$user" "$pass" | base64 -w0)@${t_ip}:${t_port}#${target_tag}"
-      print_card "SOCKS5 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n用户: ${user}\n密码: ${pass}" "$final_link"
+    echo -e "\n${C_CYAN}=== 节点详情 ===${C_RESET}"
+    echo -e " 类型: ${C_YELLOW}${kind}${C_RESET}"
+    echo -e " 标签: ${C_YELLOW}${tag}${C_RESET}"
+    echo -e " 协议: ${C_YELLOW}${proto}${C_RESET}"
+    echo -e " 端口: ${C_YELLOW}${port}${C_RESET}"
+    echo -e " 出口: ${C_YELLOW}${note}${C_RESET}"
 
-  elif [[ "${t_type,,}" == "vless" ]]; then
-      # 核心修复：必须先从文件读取 meta 数据
-      local meta_json; meta_json=$(cat "$META" 2>/dev/null || echo "{}")
-      local uuid; uuid=$(jq -r --arg t "$target_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG" 2>/dev/null)
-      local c_seed; c_seed=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].client_seed // empty')
-      
-      # 格式化主机地址 (IPv6 自动加方括号)
-      local host_disp; host_disp=$(format_host_for_link "$t_ip")
+    if [[ "$kind" == "sing-box" ]]; then
+        local preview
+        preview=$(sb_get_inbound_link_preview "$tag")
+        if [[ -n "$preview" ]]; then
+            local uuid="" p2="" sni="" pw=""
+            IFS=$'\t' read -r uuid p2 sni pw <<< "$preview"
+            echo -e " UUID: ${C_GREEN}${uuid}${C_RESET}"
+            [[ -n "$sni" ]] && echo -e " SNI: ${C_GREEN}${sni}${C_RESET}"
+        fi
+    fi
 
-      if [[ -n "$c_seed" && "$c_seed" != "null" && "$c_seed" != "" ]]; then
-          final_link="vless://${uuid}@${host_disp}:${t_port}?encryption=${c_seed}&type=tcp&security=none#${target_tag}"
-          print_card "VLESS-ENC 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\n客户端密钥: ${c_seed:0:15}..." "$final_link"
-      else
-          local pbk; pbk=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].pbk // empty')
-          local sid; sid=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sid // empty')
-          local sni; sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.microsoft.com"')
-          
-          # 构造带方括号的 V6 链接
-          final_link="vless://${uuid}@${host_disp}:${t_port}?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=${pbk}&sid=${sid}&sni=${sni}&fp=chrome#${target_tag}"
-          print_card "VLESS-REALITY 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\nUUID: ${uuid}\nSNI: ${sni}\nPublic Key: ${pbk}\nShort ID: ${sid}" "$final_link"
-      fi
-
-  elif [[ "${t_type,,}" == "hysteria2" ]]; then
-      local auth; auth=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].auth // empty')
-      local sni; sni=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].sni // "www.bing.com"')
-      final_link="hysteria2://${auth}@${t_ip}:${t_port}?sni=${sni}&insecure=1#${target_tag}"
-      print_card "Hysteria2 详情" "$target_tag" "地址: ${t_ip}\n端口: ${t_port}\n认证: ${auth}\nSNI: ${sni}" "$final_link"
-
-  elif [[ "${t_type,,}" == "argo" ]]; then
-      final_link=$(echo "$meta_json" | jq -r --arg t "$target_tag" '.[$t].raw')
-      print_card "Argo Tunnel 详情" "$target_tag" "出口类型: Cloudflare 隧道" "$final_link"
-
-  elif [[ "${t_type,,}" == "vmess" ]]; then
-      local uuid; uuid=$(jq -r --arg t "$target_tag" '.outbounds[] | select(.tag==$t) | .settings.vnext[0].users[0].id' "$CONFIG" 2>/dev/null)
-      print_card "VMess 落地详情" "$target_tag" "此为落地出口节点，UUID: ${uuid}" "需配合分流规则使用"
-  fi
-
-  read -rp "按回车返回节点列表..." _
-  view_nodes_menu
+    echo ""
+    read -rp "按回车返回..." _
 }
 
 delete_node() {
-  echo -e "\n${C_CYAN}=== 删除节点 (支持多选) ===${C_RESET}"
-  echo -e "${C_GRAY}提示：输入多个序号可用空格或逗号分隔，如: 1 3 5 或 1,2,5${C_RESET}\n"
+    echo -e "\n${C_CYAN}=== 删除节点（Xray + Sing-box） ===${C_RESET}"
 
-  # 1. 快速聚合所有标签 (使用单次 jq)
-  local parsed_types
-  parsed_types=$(jq -r -n --slurpfile cfg "$CONFIG" --slurpfile meta "$META" '
-    ($cfg[0].inbounds // []) as $inbounds |
-    ($meta[0] // {}) as $m |
-    ( ($inbounds | map(select(.tag != null) | .tag)) + ($m | keys) | unique )[] as $tag |
-    ($inbounds | map(select(.tag == $tag)) | .[0] // {}) as $inb |
-    ($m[$tag] // {}) as $mt |
-    [ $tag, ($mt.protocol // $mt.type // $inb.protocol // $inb.type // "未知") ] | @tsv
-  ' 2>/dev/null)
+    NODE_KIND_LIST=()
+    NODE_TAG_LIST=()
+    NODE_PORT_LIST=()
+    NODE_PROTO_LIST=()
 
-  if [[ -z "$parsed_types" ]]; then
-      warn "当前没有任何节点可删除。"
-      read -rp "按回车返回..." _
-      return
-  fi
+    if [[ -f "$CONFIG" ]]; then
+        while IFS=$'\t' read -r tag proto port; do
+            [[ -z "$tag" ]] && continue
+            NODE_KIND_LIST+=("xray")
+            NODE_TAG_LIST+=("$tag")
+            NODE_PORT_LIST+=("$port")
+            NODE_PROTO_LIST+=("${proto:-unknown}")
+        done < <(
+            jq -r '.inbounds[]? | select(.tag != null) | [(.tag // ""), (.protocol // .type // "unknown"), ((.port // .listen_port // "N/A")|tostring)] | @tsv' "$CONFIG" 2>/dev/null
+        )
+    fi
 
-  local -a ALL_TAGS=()
-  local i=0
-  while IFS=$'\t' read -r tag type_info; do
-      [[ -z "$tag" ]] && continue
-      ALL_TAGS+=("$tag")
-      i=$((i+1))
-      echo -e " ${C_GREEN}[$i]${C_RESET} ${C_YELLOW}${tag}${C_RESET} ${C_GRAY}(${type_info})${C_RESET}"
-  done <<< "$parsed_types"
-  echo -e " ${C_RED}[00]${C_RESET} 删除全部节点"
-  echo -e " ${C_GREEN}[0]${C_RESET} 取消返回"
+    if [[ -f /etc/sing-box/config.json ]]; then
+        while IFS='|' read -r tag port; do
+            [[ -z "$tag" ]] && continue
+            NODE_KIND_LIST+=("sing-box")
+            NODE_TAG_LIST+=("$tag")
+            NODE_PORT_LIST+=("$port")
+            NODE_PROTO_LIST+=("tuic")
+        done < <(jq -r '.inbounds[]? | select(.type == "tuic") | "\(.tag)|\(.listen_port)"' /etc/sing-box/config.json 2>/dev/null)
+    fi
 
-  read -rp "请输入要删除的节点序号: " choice
-  [[ "$choice" == "0" || -z "$choice" ]] && return
+    if [[ "${#NODE_TAG_LIST[@]}" -eq 0 ]]; then
+        warn "当前没有任何节点可删除。"
+        read -rp "按回车返回..." _
+        return
+    fi
 
-  # 2. 处理选中序号
-  local -a selected_tags=()
-  if [[ "$choice" == "00" ]]; then
-      selected_tags=("${ALL_TAGS[@]}")
-  else
-      local clean_choice="${choice//,/ }"
-      for idx in $clean_choice; do
-          if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "$i" ]; then
-              selected_tags+=("${ALL_TAGS[$((idx-1))]}")
-          fi
-      done
-  fi
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+    printf " %-4s | %-20s | %-16s | %-8s\n" "序号" "节点标签" "协议/类型" "端口"
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
 
-  [[ ${#selected_tags[@]} -eq 0 ]] && return
+    local i
+    for ((i=0; i<${#NODE_TAG_LIST[@]}; i++)); do
+        printf " %-4s | %-20s | %-16s | %-8s\n" \
+            "$((i+1))" \
+            "${NODE_TAG_LIST[$i]:0:20}" \
+            "${NODE_PROTO_LIST[$i]} [${NODE_KIND_LIST[$i]}]" \
+            "${NODE_PORT_LIST[$i]}"
+    done
 
-  # 3. 确认预览
-  echo -e "\n${C_RED}确认删除以下 ${#selected_tags[@]} 个节点？${C_RESET}"
-  read -rp "输入 y 确认执行: " confirm
-  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+    echo -e "${C_GRAY}————————————————————————————————————————————————————————————————————————————————${C_RESET}"
+    echo -e "\n [0] 返回主菜单"
 
-  say "正在执行批量清理..."
+    local sel=""
+    read -rp " 请输入要删除的节点序号: " sel
+    [[ -z "$sel" || "$sel" == "0" ]] && return
 
-  # 🚀 优化 A：在循环内只做非 JSON 的系统操作 (服务停止/进程杀除)
-  for target_tag in "${selected_tags[@]}"; do
-      if [[ "$target_tag" =~ Hy2 ]]; then
-          local p; p=$(echo "$target_tag" | grep -oE '[0-9]+')
-          [[ -n "$p" ]] && systemctl disable --now "hysteria2-$p" 2>/dev/null && rm -f "/etc/systemd/system/hysteria2-$p.service"
-      fi
-      if [[ "$target_tag" =~ Argo ]]; then
-          # 针对性杀掉该端口的 argo 进程，而不是 pkill 全部
-          local ap; ap=$(jq -r --arg t "$target_tag" '.[$t].port // empty' "$META" 2>/dev/null)
-          [[ -n "$ap" ]] && pkill -f "/etc/xray/argo_users/${ap}.json" 2>/dev/null
-      fi
-  done
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#NODE_TAG_LIST[@]} )); then
+        warn "无效选择"
+        return
+    fi
 
-  # 🚀 优化 B：批量处理 JSON。把所有要删的标签转成一个 JSON 数组，一次性交给 jq。
-  local tags_json
-  tags_json=$(printf "%s\n" "${selected_tags[@]}" | jq -R . | jq -s -c .)
+    local idx=$((sel-1))
+    local kind="${NODE_KIND_LIST[$idx]}"
+    local tag="${NODE_TAG_LIST[$idx]}"
+    local proto="${NODE_PROTO_LIST[$idx]}"
+    local port="${NODE_PORT_LIST[$idx]}"
 
-  # 一次性清理 CONFIG (包含 inbounds 和对应的路由规则)
-  safe_json_edit "$CONFIG" '
-    (.inbounds |= map(select(.tag as $t | $tags | index($t) == null))) |
-    (.route.rules |= map(select(
-      if (.inbound | type) == "array" then
-        (.inbound | any(. as $in | $tags | index($in) != null)) | not
-      else
-        ($tags | index(.inbound) == null)
-      end
-    )))
-  ' --argjson tags "$tags_json"
+    echo ""
+    warn "你将删除节点：${tag} | ${proto} | 端口 ${port} | 类型 ${kind}"
+    read -rp "确认删除？(y/N): " yn
+    yn="${yn:-N}"
 
-  # 一次性清理 META
-  safe_json_edit "$META" 'with_entries(select(.key as $k | $tags | index($k) == null))' --argjson tags "$tags_json"
+    if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
+        say "已取消删除。"
+        return
+    fi
 
-  # 🚀 优化 C：使用之前定义的 "main_only" 模式重启，不触碰 Argo 同步逻辑
-  # 同时配合之前优化过的“轮询检测”版 restart_xray，速度提升 5 倍以上
-  restart_xray "main_only"
+    if [[ "$kind" == "xray" ]]; then
+        delete_xray_node_by_tag "$tag"
+    else
+        delete_sb_node_by_tag "$tag"
+    fi
 
-  ok "已成功移除选中的 ${#selected_tags[@]} 个节点。"
-  read -rp "按回车返回..." _
+    read -rp "按回车返回..." _
 }
 
 # ============================================================
@@ -3555,105 +3924,289 @@ show_menu_banner() {
     # 删除了开头的 clear
     get_sys_status
 }
+
+repair_singbox_service() {
+    echo -e "
+${C_CYAN}=== Sing-box 检测与修复 ===${C_RESET}"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        err "缺少 jq，无法检测 Sing-box 配置。"
+        return 1
+    fi
+
+    if [[ ! -x /usr/local/bin/sing-box ]]; then
+        warn "未检测到 Sing-box 核心，正在安装..."
+        sb_install_core_if_needed || { err "Sing-box 安装失败"; return 1; }
+    else
+        ok "Sing-box 已安装"
+    fi
+
+    sb_ensure_base_config
+
+    if [[ -f /etc/sing-box/config.json ]]; then
+        if jq empty /etc/sing-box/config.json >/dev/null 2>&1; then
+            ok "Sing-box 配置 JSON 格式有效"
+        else
+            err "Sing-box 配置 JSON 格式损坏，请手动检查 /etc/sing-box/config.json"
+            return 1
+        fi
+
+        if /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+            ok "Sing-box 配置校验通过"
+        else
+            warn "Sing-box 配置校验失败，尝试清理异常落地..."
+            sb_drop_invalid_outbounds || true
+            if /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+                ok "已自动清理异常落地并修复配置"
+            else
+                err "Sing-box 配置仍然无效，请检查 /etc/sing-box/config.json"
+                return 1
+            fi
+        fi
+    fi
+
+    ok "Sing-box 状态良好。"
+    return 0
+}
+
+restart_singbox_core() {
+    if [[ ! -f /etc/sing-box/config.json ]]; then
+        err "未找到 /etc/sing-box/config.json"
+        return 1
+    fi
+    if [[ ! -x /usr/local/bin/sing-box ]]; then
+        err "未检测到 Sing-box 核心，请先安装或更新。"
+        return 1
+    fi
+    if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        warn "Sing-box 配置校验失败，尝试自动清理异常落地..."
+        sb_drop_invalid_outbounds || true
+    fi
+    if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        err "Sing-box 配置无效，已取消重启。"
+        return 1
+    fi
+    if sb_restart_service; then
+        ok "Sing-box 主服务已重启成功"
+        return 0
+    fi
+    err "Sing-box 重启失败"
+    return 1
+}
+
+update_singbox_core() {
+    say "正在尝试更新 Sing-box 核心..."
+    rm -f /usr/local/bin/sing-box
+    sb_install_core_if_needed
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        err "Sing-box 更新失败"
+        return 1
+    fi
+    if [[ ! -f /etc/sing-box/config.json ]]; then
+        sb_ensure_base_config
+    fi
+    restart_singbox_core
+}
+
+uninstall_xray_stack() {
+    say "正在卸载 Xray 组件..."
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    pkill -9 -f "/usr/local/bin/xray" 2>/dev/null || true
+    pkill -9 -f "xray-singleton" 2>/dev/null || true
+    rm -rf /etc/xray /var/log/xray.log /usr/local/bin/xray            /usr/local/bin/xray-singleton /usr/local/bin/xray-sync            /etc/systemd/system/xray.service /etc/init.d/xray
+    ok "Xray 组件已卸载"
+}
+
+uninstall_singbox_stack() {
+    say "正在卸载 Sing-box 组件..."
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl disable sing-box 2>/dev/null || true
+    pkill -9 -f "/usr/local/bin/sing-box" 2>/dev/null || true
+    rm -rf /etc/sing-box /var/log/sing-box
+    rm -f /usr/local/bin/sing-box
+    rm -f /etc/systemd/system/sing-box.service
+    rm -rf /etc/systemd/system/sing-box.service.d
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    ok "Sing-box 组件已卸载"
+}
+
+uninstall_hy2_related() {
+    local hy2_services="" svc=""
+    systemctl stop hysteria2 2>/dev/null || true
+    systemctl disable hysteria2 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        hy2_services=$(systemctl list-unit-files 2>/dev/null | grep "hysteria2-" | awk '{print $1}')
+        for svc in $hy2_services; do
+            systemctl stop "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+            rm -f "/etc/systemd/system/$svc"
+        done
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    pkill -9 -f "hysteria server" 2>/dev/null || true
+    rm -rf /etc/hysteria2 /usr/local/bin/hysteria
+}
+
+full_self_destruct() {
+    local confirm="" self_path=""
+    echo ""
+    warn "⚠️  警告：此操作将永久删除所有节点、Xray、Sing-box、Hysteria2、日志及脚本自身！"
+    read -rp " 确认要彻底卸载并自毁脚本吗？(y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        say "卸载已取消。"
+        return 1
+    fi
+    say "正在执行强力清理程序..."
+    uninstall_xray_stack
+    uninstall_singbox_stack
+    uninstall_hy2_related
+    say "终止辅助进程..."
+    pkill -9 -f "cloudflared" 2>/dev/null || true
+    rm -rf /root/agsbx
+    rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"* 2>/dev/null || true
+    sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc 2>/dev/null || true
+    self_path=$(readlink -f "$0" 2>/dev/null)
+    ok "卸载完成！服务器已恢复纯净状态。"
+    if [[ -n "$self_path" && -f "$self_path" ]]; then
+        say "脚本执行自毁: $self_path"
+        rm -f "$self_path"
+    fi
+    echo -e "${C_PURPLE}江湖再见，祝你一路顺风！${C_RESET}"
+    exit 0
+}
+
+
 # ============= 新增：状态维护子菜单 (UI优化+纯卸载逻辑) =============
 # ============= 状态维护子菜单 (ShellCheck 规范优化版) =============
 status_menu() {
-    # 1. 显式声明局部变量，解决 SC2154/SC2155
-    local sc="" confirm="" self_path="" hy2_services="" svc=""
+    local sc=""
+    local confirm=""
 
     while true; do
-        echo -e "\n${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
-        echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复 "
-        echo -e " ${C_GREEN}2.${C_RESET} 重启核心服务 "
-        echo -e " ${C_GREEN}3.${C_RESET} 更新核心版本 "
-        echo -e " ${C_RED}4.${C_RESET} 彻底卸载脚本 "
+        echo -e "
+${C_CYAN}=== 状态维护与管理 ===${C_RESET}"
+        echo -e " ${C_GREEN}1.${C_RESET} 系统深度修复"
+        echo -e " ${C_GREEN}2.${C_RESET} 重启 Xray"
+        echo -e " ${C_GREEN}3.${C_RESET} 重启 Sing-box"
+        echo -e " ${C_GREEN}4.${C_RESET} 重启全部核心"
+        echo -e " ${C_GREEN}5.${C_RESET} 更新 Xray 核心"
+        echo -e " ${C_GREEN}6.${C_RESET} 更新 Sing-box 核心"
+        echo -e " ${C_GREEN}7.${C_RESET} 更新全部核心"
+        echo -e " ${C_RED}8.${C_RESET} 卸载 Xray 组件"
+        echo -e " ${C_RED}9.${C_RESET} 卸载 Sing-box 组件"
+        echo -e " ${C_RED}10.${C_RESET} 卸载 Xray + Sing-box + Hysteria2"
+        echo -e " ${C_RED}11.${C_RESET} 彻底卸载脚本（含自毁）"
         echo -e " ${C_GREEN}0.${C_RESET} 返回上级菜单"
         echo ""
 
-        # 调用 safe_read，sc 已在顶部声明
-        local sc=""  # 👈 新增初始化
-safe_read sc " 请输入选项: "
+        safe_read sc " 请输入选项: "
 
         case "$sc" in
             1)
-                check_and_repair_menu
+                echo -e "
+${C_CYAN}=== 系统深度修复 ===${C_RESET}"
+                echo -e " ${C_GREEN}1.${C_RESET} 修复 Xray"
+                echo -e " ${C_GREEN}2.${C_RESET} 修复 Sing-box"
+                echo -e " ${C_GREEN}3.${C_RESET} 修复全部"
+                echo -e " ${C_GREEN}0.${C_RESET} 返回"
+                local rc=""
+                safe_read rc " 请选择修复对象: "
+                case "$rc" in
+                    1) check_and_repair_menu ;;
+                    2) repair_singbox_service; read -rp "按回车继续..." _ ;;
+                    3)
+                        check_and_repair_menu
+                        repair_singbox_service
+                        read -rp "按回车继续..." _
+                        ;;
+                    0) ;;
+                    *) warn "无效选项"; sleep 1 ;;
+                esac
                 ;;
             2)
                 restart_xray
                 read -rp "按回车继续..." _
                 ;;
             3)
+                restart_singbox_core
+                read -rp "按回车继续..." _
+                ;;
+            4)
+                restart_xray
+                restart_singbox_core
+                read -rp "按回车继续..." _
+                ;;
+            5)
                 say "正在尝试更新 Xray 核心..."
-                # 物理删除旧二进制，确保安装最新版
                 rm -f /usr/local/bin/xray
                 if install_xray_if_needed; then
                     restart_xray
                 else
-                    err "核心更新失败。"
+                    err "Xray 核心更新失败。"
                 fi
                 read -rp "按回车继续..." _
                 ;;
-            4)
-                echo ""
-                warn "⚠️  警告：此操作将永久删除所有节点、内核、日志及脚本自身！"
-                read -rp " 确认要彻底卸载并自毁脚本吗？(y/N): " confirm
-                
-                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                    say "正在执行强力清理程序..."
-
-                    # --- A. 停止并禁用所有相关服务 ---
-                    say "停止服务项与清理守护任务..."
-                    systemctl stop xray 2>/dev/null
-                    systemctl disable xray 2>/dev/null
-                    
-                    # 动态搜索并清理所有 Hysteria2 服务
-                    if command -v systemctl >/dev/null 2>&1; then
-                        hy2_services=$(systemctl list-unit-files | grep "hysteria2-" | awk '{print $1}')
-                        for svc in $hy2_services; do
-                            systemctl stop "$svc" 2>/dev/null
-                            systemctl disable "$svc" 2>/dev/null
-                            rm -f "/etc/systemd/system/$svc"
-                        done
-                        systemctl daemon-reload 2>/dev/null
-                    fi
-
-                    # --- B. 强力终止所有残留进程 ---
-                    say "终止进程池 (Xray/Hy2/Argo/Watchdog)..."
-                    pkill -9 -f "/usr/local/bin/xray" 2>/dev/null
-                    pkill -9 -f "hysteria server" 2>/dev/null
-                    pkill -9 -f "cloudflared" 2>/dev/null
-                    pkill -9 -f "xray-singleton" 2>/dev/null
-
-                    # --- C. 抹除文件系统记录 ---
-                    say "物理擦除核心文件与配置目录..."
-                    # 批量删除
-                    rm -rf /etc/xray /var/log/xray.log /usr/local/bin/xray \
-                           /usr/local/bin/xray-singleton /usr/local/bin/xray-sync \
-                           /etc/systemd/system/xray.service /etc/init.d/xray \
-                           /etc/hysteria2 /usr/local/bin/hysteria /root/agsbx
-
-                    # --- D. 清理环境变量与快捷指令 ---
-                    say "还原 .bashrc 别名设置..."
-                    rm -f "$IP_CACHE_FILE" "${IP_CACHE_FILE}_v6" "/tmp/my_ip_cache"*
-                    # 一次性清理 my 和 MY 别名
-                    sed -i '/alias my=/d; /alias MY=/d' /root/.bashrc
-
-                    # --- E. 脚本自毁 ---
-                    self_path=$(readlink -f "$0" 2>/dev/null)
-                    ok "卸载完成！服务器已恢复纯净状态。"
-                    
-                    if [[ -f "$self_path" ]]; then
-                        say "脚本执行自毁: $self_path"
-                        # 延迟 1 秒删除自身，防止执行流中断报错
-                        rm -f "$self_path"
-                    fi
-                    
-                    echo -e "${C_PURPLE}江湖再见，祝你一路顺风！${C_RESET}"
-                    exit 0
+            6)
+                update_singbox_core
+                read -rp "按回车继续..." _
+                ;;
+            7)
+                say "正在更新全部核心..."
+                rm -f /usr/local/bin/xray
+                if install_xray_if_needed; then
+                    restart_xray
                 else
-                    say "卸载已取消。"
-                    sleep 1
+                    err "Xray 核心更新失败。"
                 fi
+                update_singbox_core
+                read -rp "按回车继续..." _
+                ;;
+            8)
+                echo ""
+                warn "⚠️  此操作将删除 Xray 节点、核心、配置与日志。"
+                read -rp " 确认卸载 Xray 组件吗？(y/N): " confirm
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    uninstall_xray_stack
+                    uninstall_hy2_related
+                else
+                    say "已取消。"
+                fi
+                read -rp "按回车继续..." _
+                ;;
+            9)
+                echo ""
+                warn "⚠️  此操作将删除 Sing-box 节点、核心、配置与日志。"
+                read -rp " 确认卸载 Sing-box 组件吗？(y/N): " confirm
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    uninstall_singbox_stack
+                else
+                    say "已取消。"
+                fi
+                read -rp "按回车继续..." _
+                ;;
+            10)
+                echo ""
+                warn "⚠️  此操作将删除 Xray、Sing-box、Hysteria2 及其全部配置，但不会自毁脚本。"
+                read -rp " 确认继续吗？(y/N): " confirm
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                    uninstall_xray_stack
+                    uninstall_singbox_stack
+                    uninstall_hy2_related
+                    ok "全部核心组件已卸载，脚本仍保留。"
+                else
+                    say "已取消。"
+                fi
+                read -rp "按回车继续..." _
+                ;;
+            11)
+                full_self_destruct
                 ;;
             0)
                 return 0
@@ -3665,6 +4218,7 @@ safe_read sc " 请输入选项: "
         esac
     done
 }
+
 
 # === 将“节点锁定出口IP”真正写入模型配置（/etc/xray/config.json） ===
 # === 将“节点锁定出口IP”写入模型配置（/etc/xray/config.json） ===
@@ -4404,41 +4958,241 @@ fi
 
 
 
+# ==========================================================
+# --- Sing-box 专属落地管理 (链接导入 + 动态路由绑定) ---
+# ==========================================================
+
+import_sb_landing_link() {
+    echo -e "
+${C_CYAN}=== 导入落地链接并绑定到 TUIC 节点 ===${C_RESET}"
+    [[ ! -f "/etc/sing-box/config.json" ]] && { err "未找到 /etc/sing-box/config.json，请先部署 TUIC 节点。"; return; }
+
+    sb_select_tuic_inbound || return
+
+    local sel_inbound="$SB_SELECTED_INBOUND"
+    local link=""
+    local out_tag="sb-landing-$(date +%s)-$RANDOM"
+    local new_node=""
+    local server=""
+    local port=""
+    local tmp_before=""
+
+    echo ""
+    read -rp "请粘贴落地链接 (支持 ss:// tuic:// hy2:// hysteria2://，输入0取消): " link
+    [[ -z "$link" || "$link" == "0" ]] && return
+    link="${link//$'
+'/}"
+    link="${link//$'
+'/}"
+
+    if [[ "$link" == ss://* ]]; then
+        local main_part userinfo_b64 server_info pad decoded method password
+        main_part="${link#ss://}"
+        main_part="${main_part%%#*}"
+        main_part="${main_part%%\?*}"
+        [[ "$main_part" == */ ]] && main_part="${main_part%/}"
+        if [[ "$main_part" != *@* ]]; then
+            err "当前仅支持带 @ 的新版 SS 链接，例如：ss://base64@host:port#name"
+            return
+        fi
+        userinfo_b64="${main_part%%@*}"
+        server_info="${main_part#*@}"
+        server_info="${server_info%%\?*}"
+        server_info="${server_info%%#*}"
+        server_info="${server_info%/}"
+        pad=$((4 - ${#userinfo_b64} % 4))
+        [[ $pad -lt 4 ]] && userinfo_b64="${userinfo_b64}$(printf '%0.s=' $(seq 1 $pad))"
+        decoded=$(printf "%s" "$userinfo_b64" | tr '_-' '/+' | base64 -d 2>/dev/null | tr -d '
+
+')
+        [[ -z "$decoded" ]] && { err "SS 链接解码失败"; return; }
+        method="${decoded%%:*}"
+        password="${decoded#*:}"
+        sb_parse_host_port "$server_info" || { err "SS 链接 host/port 解析失败"; return; }
+        server="$SB_PARSED_HOST"
+        port="$SB_PARSED_PORT"
+        new_node=$(jq -n --arg t "$out_tag" --arg s "$server" --arg p "$port" --arg m "$method" --arg pw "$password" '{type: "shadowsocks", tag: $t, server: $s, server_port: ($p|tonumber), method: $m, password: $pw, udp_over_tcp: true}')
+
+    elif [[ "$link" == tuic://* ]]; then
+        local main_part userinfo_raw userinfo server_part uuid password sni cc alpn
+        main_part="${link#tuic://}"
+        main_part="${main_part%%#*}"
+        if [[ "$main_part" != *@* ]]; then
+            err "TUIC 链接格式错误，缺少 @"
+            return
+        fi
+        userinfo_raw="${main_part%%@*}"
+        server_part="${main_part#*@}"
+        userinfo=$(sb_url_decode "$userinfo_raw")
+        if [[ "$userinfo" == *:* ]]; then
+            uuid="${userinfo%%:*}"
+            password="${userinfo#*:}"
+        else
+            uuid="$userinfo"
+            password="$userinfo"
+        fi
+        server_part="${server_part%%\?*}"
+        server_part="${server_part%%#*}"
+        sb_parse_host_port "$server_part" || { err "TUIC 链接 host/port 解析失败"; return; }
+        server="$SB_PARSED_HOST"
+        port="$SB_PARSED_PORT"
+        sni=""
+        cc="bbr"
+        alpn="h3"
+        if sb_url_param_get "$link" "sni"; then
+            sni="$SB_PARAM_VALUE"
+        elif sb_url_param_get "$link" "peer"; then
+            sni="$SB_PARAM_VALUE"
+        fi
+        if sb_url_param_get "$link" "congestion_control"; then
+            cc="$SB_PARAM_VALUE"
+        fi
+        if sb_url_param_get "$link" "alpn"; then
+            alpn="$SB_PARAM_VALUE"
+        fi
+        if [[ -n "$sni" ]]; then
+            new_node=$(jq -n --arg t "$out_tag" --arg s "$server" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sni "$sni" --arg cc "$cc" --arg alpn "$alpn" '{type: "tuic", tag: $t, server: $s, server_port: ($p|tonumber), uuid: $u, password: $pw, congestion_control: $cc, udp_relay_mode: "native", tls: { enabled: true, server_name: $sni, alpn: [$alpn], insecure: true }}')
+        else
+            new_node=$(jq -n --arg t "$out_tag" --arg s "$server" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg cc "$cc" --arg alpn "$alpn" '{type: "tuic", tag: $t, server: $s, server_port: ($p|tonumber), uuid: $u, password: $pw, congestion_control: $cc, udp_relay_mode: "native", tls: { enabled: true, alpn: [$alpn], insecure: true }}')
+        fi
+
+    elif [[ "$link" == hy2://* || "$link" == hysteria2://* ]]; then
+        local main_part auth_raw auth server_part sni
+        if [[ "$link" == hy2://* ]]; then
+            main_part="${link#hy2://}"
+        else
+            main_part="${link#hysteria2://}"
+        fi
+        main_part="${main_part%%#*}"
+        if [[ "$main_part" != *@* ]]; then
+            err "HY2 链接格式错误，缺少 @"
+            return
+        fi
+        auth_raw="${main_part%%@*}"
+        auth=$(sb_url_decode "$auth_raw")
+        server_part="${main_part#*@}"
+        server_part="${server_part%%\?*}"
+        server_part="${server_part%%#*}"
+        sb_parse_host_port "$server_part" || { err "HY2 链接 host/port 解析失败"; return; }
+        server="$SB_PARSED_HOST"
+        port="$SB_PARSED_PORT"
+        sni="www.bing.com"
+        if sb_url_param_get "$link" "sni"; then
+            sni="$SB_PARAM_VALUE"
+        elif sb_url_param_get "$link" "peer"; then
+            sni="$SB_PARAM_VALUE"
+        fi
+        new_node=$(jq -n --arg t "$out_tag" --arg s "$server" --arg p "$port" --arg pw "$auth" --arg sni "$sni" '{type: "hysteria2", tag: $t, server: $s, server_port: ($p|tonumber), password: $pw, tls: { enabled: true, server_name: $sni, insecure: true }}')
+    else
+        err "无法识别的协议，请使用 ss:// tuic:// hy2:// hysteria2://"
+        return
+    fi
+
+    [[ -z "$new_node" ]] && { err "落地链接解析失败"; return; }
+
+    tmp_before=$(mktemp)
+    cp -f /etc/sing-box/config.json "$tmp_before"
+
+    sb_remove_old_binding_for_inbound "$sel_inbound"
+    sb_bind_outbound_to_inbound "$sel_inbound" "$new_node" "$out_tag"
+
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c /etc/sing-box/config.json >/tmp/sb_check.out 2>/tmp/sb_check.err; then
+            cp -f "$tmp_before" /etc/sing-box/config.json
+            err "Sing-box 配置校验失败，已自动回滚。"
+            [[ -s /tmp/sb_check.err ]] && sed -n '1,8p' /tmp/sb_check.err
+            rm -f "$tmp_before"
+            return 1
+        fi
+    fi
+
+    if sb_restart_service; then
+        ok "绑定成功：节点 [$sel_inbound] 已挂载落地 -> ${server}:${port}"
+    else
+        cp -f "$tmp_before" /etc/sing-box/config.json
+        systemctl restart sing-box >/dev/null 2>&1 || true
+        err "Sing-box 启动失败，已自动回滚到上一份可用配置。"
+        rm -f "$tmp_before"
+        return 1
+    fi
+    rm -f "$tmp_before"
+}
+
+
+view_sb_status() {
+    echo -e "\n${C_CYAN}=== Sing-box 节点与落地状态 ===${C_RESET}"
+    [[ ! -f "/etc/sing-box/config.json" ]] && { warn "未找到 Sing-box 配置，目前没有部署 Sing-box 节点。"; read -rp "按回车返回..." _; return; }
+
+    mapfile -t SB_LINES < <(sb_list_tuic_inbounds)
+    if [[ ${#SB_LINES[@]} -eq 0 ]]; then
+        echo -e "${C_GRAY}当前没有 TUIC 节点。${C_RESET}"
+        echo ""
+        read -rp "按回车返回..." _
+        return
+    fi
+
+    local line tag port outbound_tag outbound_desc
+    for line in "${SB_LINES[@]}"; do
+        tag="${line%%|*}"
+        port="${line##*|}"
+        outbound_tag=$(jq -r --arg t "$tag" '([.route.rules[]? | select(.inbound != null and .inbound[0] == $t) | .outbound][0]) // .route.final // "direct"' /etc/sing-box/config.json 2>/dev/null)
+        if [[ -z "$outbound_tag" || "$outbound_tag" == "direct" ]]; then
+            outbound_desc="原生直连"
+            echo -e " 🟢 节点：${C_YELLOW}${tag}${C_RESET} (端口: ${port}) ➜ ${C_GREEN}${outbound_desc}${C_RESET}"
+        else
+            outbound_desc=$(sb_get_outbound_desc "$outbound_tag")
+            [[ -z "$outbound_desc" ]] && outbound_desc="未知落地"
+            echo -e " 🟣 节点：${C_YELLOW}${tag}${C_RESET} (端口: ${port}) ➜ ${C_PURPLE}${outbound_desc}${C_RESET}"
+        fi
+    done
+
+    echo ""
+    read -rp "按回车返回..." _
+}
+
+
+# ==========================================================
 # 1. 落地出口主菜单
+# ==========================================================
 outbound_menu() {
-  while true; do
-    echo -e "\n${C_CYAN}=== 落地出口管理 (Outbounds) ===${C_RESET}"
-    say "1) 手动添加 SOCKS5 落地"
-    say "2) 手动添加 HTTP 落地"
-    say "3) 手动添加 Shadowsocks 落地 ${C_YELLOW}(推荐)${C_RESET}"
-    say "4) 链接导入 (SS / VLESS / VMESS)"
-    say "5) 查看/删除 现有落地"
-    echo -e "${C_BLUE}── 分流管理 ──────────────────────────────────${C_RESET}"
-    say "6) 设置节点落地关联 (Inbound ➔ Outbound)"
-    say "7) 查看/解除 关联规则"
-    say "8) 一键诊断并修复配置 (救急专用)"
-    say "9) 设置节点域名黑名单 (拦截/阻断) ${C_YELLOW}(New)${C_RESET}"
-    say "0) 返回主菜单"
-    
-    local ob_choice="" 
-    safe_read ob_choice " 请选择操作 [0-9]: "
-    case "$ob_choice" in
-      1|2) add_manual_proxy_outbound "$ob_choice" ;;
-      3) add_manual_ss_outbound ;;
-      4)
-        read -rp "请粘贴链接 (输入0返回): " link
-        [[ "$link" == "0" || -z "$link" ]] && continue
-        import_link_outbound "$link"
-        ;;
-      5) list_and_del_outbounds ;;
-      6) set_node_routing ;;
-      7) list_and_del_routing_rules ;;
-      8) repair_config_structure ;;
-      9) node_blacklist_menu ;; # <--- 新增的入口在这里
-      0) return ;;
-      *) warn "无效选项" ;;
-    esac
-  done
+    while true; do
+        echo -e "\n${C_CYAN}=== 落地出口管理 (Outbounds) ===${C_RESET}"
+
+        echo -e "${C_GRAY}── Xray 老节点管理区 (VLESS / VMESS / Trojan / SS 等) ────────${C_RESET}"
+        say "1) 手动添加 Xray 落地"
+        say "2) Xray 链接导入 (SS / VLESS / VMESS)"
+        say "3) 查看/删除 Xray 现有落地"
+        say "4) 设置 Xray 节点落地关联 (仅 Xray 入站)"
+        say "5) 查看/解除 Xray 关联规则"
+
+        echo -e "${C_BLUE}── Sing-box / TUIC 专属区 ───────────────────────────────${C_RESET}"
+        say "6) 导入落地链接并绑定 TUIC 节点 ${C_YELLOW}(支持 SS / TUIC / HY2)${C_RESET}"
+        say "7) 查看 TUIC 节点与落地绑定状态"
+        say "8) 解除 TUIC 节点落地，恢复原生直连"
+        say "0) 返回主菜单"
+
+        local ob_choice=""
+        safe_read ob_choice " 请选择操作 [0-8]: "
+        case "$ob_choice" in
+            1) add_manual_proxy_outbound "3" ;;
+            2)
+                read -rp "请粘贴链接 (输入0返回): " link
+                [[ "$link" == "0" || -z "$link" ]] && continue
+                import_link_outbound "$link"
+                ;;
+            3) list_and_del_outbounds ;;
+            4)
+                echo -e "${C_YELLOW}提示：这里只针对 Xray 入站，不用于 TUIC 节点。${C_RESET}"
+                set_node_routing
+                ;;
+            5) list_and_del_routing_rules ;;
+            6) import_sb_landing_link ;;
+            7) view_sb_status ;;
+            8) clear_sb_routing ;;
+            0) return ;;
+            *) warn "无效选项" ;;
+        esac
+    done
 }
 
 add_manual_ss_outbound() {

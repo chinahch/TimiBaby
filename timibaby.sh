@@ -512,7 +512,7 @@ get_node_letter_suffix() {
 }
 
 
-# 获取 IP 地理位置与类型 (中文增强版)
+# 获取 IP 地理位置与类型 (精简提速版：彻底移除家宽/机房探测)
 get_ip_country() {
     local ip="$1"
     # 处理空值或非法输入
@@ -529,38 +529,16 @@ get_ip_country() {
         echo "内网" && return
     fi
 
-    # 3) 获取中文国家名称 (ip-api.com)
+    # 3) 获取中文国家名称 (ip-api.com，这个接口响应在毫秒级)
     local country
-    country=$(curl -s -4 --connect-timeout 2 --max-time 3 "http://ip-api.com/json/${ip}?fields=country&lang=zh-CN" \
+    country=$(curl -s -4 --connect-timeout 2 --max-time 2 "http://ip-api.com/json/${ip}?fields=country&lang=zh-CN" \
         | jq -r '.country // empty' 2>/dev/null)
     [[ -z "$country" || "$country" == "null" ]] && country="未知国家"
 
-    # 4) 获取 IP 详细类型 (ipapi.is)
-    local type_label="通用"
-    local ip_data
-    ip_data=$(curl -s -4 --connect-timeout 2 --max-time 3 "https://api.ipapi.is/?ip=${ip}" 2>/dev/null)
+    # --- 🔪 已整体切除 ipapi.is 的家宽/商宽/机房 API 探测逻辑 ---
+
+    local result="${country}"
     
-    if [[ -n "$ip_data" && "$ip_data" != "null" ]]; then
-        local is_hosting; is_hosting=$(echo "$ip_data" | jq -r '.is_hosting // false' 2>/dev/null)
-        local is_mobile; is_mobile=$(echo "$ip_data" | jq -r '.is_mobile // false' 2>/dev/null)
-        local is_business; is_business=$(echo "$ip_data" | jq -r '.is_business // false' 2>/dev/null)
-        local asn_type; asn_type=$(echo "$ip_data" | jq -r '.asn.type // "unknown"' 2>/dev/null | tr '[:upper:]' '[:lower:]')
-
-        # --- 判断逻辑优先级 ---
-        if [[ "$is_hosting" == "true" || "$asn_type" == "hosting" || "$asn_type" == "data center" ]]; then
-            type_label="机房"
-        elif [[ "$is_mobile" == "true" ]]; then
-            type_label="移动网"
-        elif [[ "$is_business" == "true" || "$asn_type" == "business" || "$asn_type" == "education" ]]; then
-            type_label="商宽"
-        elif [[ "$asn_type" == "isp" || "$asn_type" == "residential" ]]; then
-            type_label="家宽"
-        else
-            type_label="通用"
-        fi
-    fi
-
-    local result="${country} [${type_label}]"
     # 存入内存缓存
     GEO_CACHE["$ip"]="$result"
     echo "$result"
@@ -611,113 +589,70 @@ test_outbound_connection() {
 }
 
 
-# 获取所有可用 IP 列表 (多出口增强修复版)
+# 获取所有可用 IP 列表 (终极提速无卡顿版：彻底移除网卡级 curl 阻塞)
 get_all_ips_with_geo() {
     local proto="$1"   # "4" 或 "6"
     local -a out_lines=()
-    local -A seen_pub_ips     # 公网出口IP去重（仅用于公网口）
-    local -A seen_land_keys   # 落地口去重（iface+本地IP）
+    local -A seen_ips
+    local default_pub=""
     local api_url="https://api.ipify.org"
     [[ "$proto" == "6" ]] && api_url="https://api64.ipify.org"
 
-    # --- Step 1. 探测系统当前真正的默认公网出口 ---
-    local system_default_pub=""
+    # 1. 仅探测一次系统真正的默认出口，设置 2 秒硬超时
     if [[ "$proto" == "4" ]]; then
-        system_default_pub=$(curl -s -4 --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null | tr -d '\r\n')
+        default_pub=$(curl -s -4 --connect-timeout 2 --max-time 2 "$api_url" 2>/dev/null | tr -d '\r\n')
     else
-        system_default_pub=$(curl -s -6 --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null | tr -d '\r\n')
+        default_pub=$(curl -s -6 --connect-timeout 2 --max-time 2 "$api_url" 2>/dev/null | tr -d '\r\n')
     fi
 
-    # --- Step 2. 收集所有 UP 状态网卡的 IP ---
-    local -a all_addr_info=()
+    # 2. 本地极速读取网卡 IP，绝对不再使用 curl --interface 导致卡死
+    local ip_cmd
     if [[ "$proto" == "4" ]]; then
-        mapfile -t all_addr_info < <(ip -4 -o addr show | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
+        ip_cmd=$(ip -4 -o addr show | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
     else
-        # 注意：scope global 也会包含 ULA(fd/fc)，后面会再过滤
-        mapfile -t all_addr_info < <(ip -6 -o addr show scope global | grep -v "temporary" | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
+        ip_cmd=$(ip -6 -o addr show scope global | grep -v "temporary" | awk '$2 !~ /lo/ {split($4,a,"/"); print $2"\t"a[1]}')
     fi
 
-    for line in "${all_addr_info[@]}"; do
-        local iface
-iface=$(echo "$line" | awk '{print $1}')
-        local lip; lip=$(echo "$line" | awk '{print $2}')
+    while IFS=$'\t' read -r iface lip; do
         [[ -z "$lip" ]] && continue
 
-        # ========== 新增：先做“不可锁地址”过滤 ==========
+        # IPv6 过滤
         if [[ "$proto" == "6" ]]; then
-            # 过滤：link-local / ULA / loopback
             [[ "$lip" =~ ^(fe80:|fd|fc|::1) ]] && continue
-            # 仅允许 2000::/3（2xxx 或 3xxx 开头）
             [[ ! "$lip" =~ ^[23] ]] && continue
         fi
-        # ============================================
 
+        # IPv4 过滤
         local is_private=0
         if [[ "$proto" == "4" ]]; then
             [[ "$lip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|100\.) ]] && is_private=1
-        else
-            # 上面已经过滤掉 fe80/fd/fc/::1，这里保留逻辑不影响
-            [[ "$lip" =~ ^(fd|fc|fe80:|::1) ]] && is_private=1
-        fi
-
-        # ========== 新增：IPv4 NAT 私网(非 tun/wg/tap) 不显示 ==========
-        if [[ "$proto" == "4" && "$is_private" -eq 1 ]]; then
-            # 只有 tun/wg/tap 的私网才当“落地口”列出；eth0 上的 10.x/172/192/100.* 直接跳过
-            if [[ ! "$iface" =~ ^(tun|wg|tap) ]]; then
-                continue
+            if [[ "$is_private" -eq 1 && ! "$iface" =~ ^(tun|wg|tap) ]]; then
+                continue # 跳过 eth0 上的局域网 IP
             fi
         fi
-        # ===========================================================
 
-        local pub_ip=""
-        if [[ "$is_private" -eq 0 ]]; then
-            # 情况 A: 直接是公网 IP
-            pub_ip="$lip"
-        else
-            # 情况 B: 私有 IP (如 tun10)，强制探测出口
-            pub_ip=$(curl -s -"$proto" --interface "$lip"  --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null || \
-                     curl -s -"$proto" --interface "$iface" --connect-timeout 2 --max-time 3 "$api_url" 2>/dev/null)
-            pub_ip=$(echo "$pub_ip" | tr -d '\r\n')
-            [[ -n "$pub_ip" && ("$pub_ip" == *"HTML"* || "$pub_ip" == "FAILED") ]] && pub_ip=""
-        fi
+        [[ -n "${seen_ips[$lip]}" ]] && continue
+        seen_ips["$lip"]=1
 
-        # --- Step 3. 汇总逻辑 ---
+        # 构建极简显示字符串 (完全剥离了 get_ip_country 的调用)
+        local tag=""
+        [[ "$lip" == "$default_pub" ]] && tag=" \033[38;5;46m[系统默认]\033[0m"
+
         if [[ "$is_private" -eq 1 ]]; then
-            # ✅ 落地口：按 iface+本地IP 去重，且探测失败也要显示（不漏）
-            local land_key="${iface}|${lip}"
-            [[ -n "${seen_land_keys[$land_key]}" ]] && continue
-            seen_land_keys["$land_key"]=1
-
-            if [[ -n "$pub_ip" ]]; then
-                local detail; detail=$(get_ip_country "$pub_ip")
-                local tag=""
-                [[ "$pub_ip" == "$system_default_pub" ]] && tag=" ${C_GREEN}[系统默认]${C_RESET}"
-                out_lines+=("${lip} [落地] -> ${pub_ip} ${detail} (${iface})${tag}")
-            else
-                out_lines+=("${lip} [落地] -> (探测失败) 未知 (${iface})")
-            fi
+            out_lines+=("${lip} [落地网卡] (${iface})${tag}")
         else
-            # 公网口：仍按公网出口IP去重
-            if [[ -n "$pub_ip" && -z "${seen_pub_ips[$pub_ip]}" ]]; then
-                local detail; detail=$(get_ip_country "$pub_ip")
-                local tag=""
-                [[ "$pub_ip" == "$system_default_pub" ]] && tag=" ${C_GREEN}[系统默认]${C_RESET}"
-                out_lines+=("${pub_ip} ${detail}${tag}")
-                seen_pub_ips["$pub_ip"]=1
-            fi
+            out_lines+=("${lip} (${iface})${tag}")
         fi
-    done
+    done <<< "$ip_cmd"
 
-    # --- Step 4. 保底逻辑：确保默认出口一定出现 ---
-    if [[ -n "$system_default_pub" && -z "${seen_pub_ips[$system_default_pub]}" ]]; then
-        local detail; detail=$(get_ip_country "$system_default_pub")
-        out_lines+=("${system_default_pub} ${detail} ${C_GREEN}[系统默认]${C_RESET}")
-        seen_pub_ips["$system_default_pub"]=1
+    # 3. 如果通过网卡没抓到默认出口，单独补齐
+    if [[ -n "$default_pub" && -z "${seen_ips[$default_pub]}" ]]; then
+        out_lines+=("${default_pub} \033[38;5;46m[系统默认]\033[0m")
+        seen_ips["$default_pub"]=1
     fi
 
-    # --- Step 5. 最终输出 ---
     [[ ${#out_lines[@]} -eq 0 ]] && return 0
-    printf "%s\n" "${out_lines[@]}" | awk '!seen[$0]++'
+    printf "%b\n" "${out_lines[@]}"
 }
 
 
@@ -787,9 +722,15 @@ get_sys_status() {
     all_ips=$(who | grep -oE "\(([0-9a-fA-F.:]+)\)" | tr -d "()" | sort -u)
     combined_ips=$(printf '%s\n%s\n' "$cur_session_ip" "$all_ips" | sed '/^$/d' | sort -u)
 
+    # 优化：在循环外预先获取所有连接的统计信息，避免在循环内狂刷 ss 子进程
+    local full_ss_info
+    full_ss_info=$(ss -itn 2>/dev/null)
+
     while IFS= read -r ip; do
         [[ -z "$ip" ]] && continue
-        rtt=$(ss -itn dst "$ip" 2>/dev/null | grep -oE "rtt:[0-9.]+" | cut -d: -f2 | head -n1)
+        
+        # 优化：从预先缓存的文本中提取该 IP 的 rtt，极大减少进程创建
+        rtt=$(echo "$full_ss_info" | grep -A 1 "$ip" | grep -oE "rtt:[0-9.]+" | cut -d: -f2 | head -n1)
 
         if [[ -n "$rtt" ]]; then
             if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -847,6 +788,23 @@ get_sys_status() {
 }
 
 # ============= 2. 基础依赖与 Xray 管理 (保留原逻辑) =============
+
+
+is_openrc_system() {
+  command -v rc-service >/dev/null 2>&1 && [[ -d /run/openrc ]]
+}
+
+# 统一的进程探测函数 (解决 Alpine/LXC 环境下的探测盲区)
+is_xray_running() {
+    # 1. 尝试使用标准的 pgrep
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x xray >/dev/null 2>&1 && return 0
+        pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1 && return 0
+    fi
+    # 2. 兜底方案：直接扫描进程表路径 (Alpine/BusyBox 最稳)
+    ps aux | grep -v grep | grep -q "/usr/local/bin/xray" && return 0
+    return 1
+}
 
 is_real_systemd() {
   [[ -d /run/systemd/system ]] && ps -p 1 -o comm= 2>/dev/null | grep -q '^systemd$'
@@ -1417,21 +1375,83 @@ EOF
 # 修复功能保留
 check_and_repair_menu() {
   say "====== 系统检测与修复（合并） ======"
-  system_check # 原有检测逻辑
-  local status=$?
+
+  local status=0
+  local fix_rc=0
   local did_fix=0
+
+  local before_running=0
+  local after_running=0
+  local before_hash=""
+  local after_hash=""
+  local need_restart=0
+  local dofix=""
+
+  _cfg_hash_for_repair_menu() {
+    local f="/etc/xray/xray_config.json"
+    if [[ ! -f "$f" ]]; then
+      echo ""
+      return 0
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$f" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 "$f" | awk '{print $1}'
+    elif command -v md5sum >/dev/null 2>&1; then
+      md5sum "$f" | awk '{print $1}'
+    else
+      wc -c < "$f" 2>/dev/null | awk '{print $1}'
+    fi
+  }
+
+  _svc_running_for_repair_menu() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+      systemctl is-active --quiet xray
+      return $?
+    fi
+
+    if command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/xray ]]; then
+      rc-service xray status 2>/dev/null | grep -q started
+      return $?
+    fi
+
+    pgrep -x xray >/dev/null 2>&1
+    return $?
+  }
+
+  # --------------------------------------------------
+  # 1. 记录修复前状态
+  # --------------------------------------------------
+  if _svc_running_for_repair_menu; then
+    before_running=1
+  else
+    before_running=0
+  fi
+
+  before_hash="$(_cfg_hash_for_repair_menu)"
+
+  # --------------------------------------------------
+  # 2. 先做系统检查
+  # --------------------------------------------------
+  system_check
+  status=$?
 
   if (( status != 0 )); then
     say ""
-    warn "检测到异常，建议执行自动修复（安装缺依赖 / 修复服务 / 纠正证书等）。"
+    warn "检测到硬故障，建议执行自动修复（安装缺依赖 / 修复服务 / 修复配置等）。"
     read -rp "是否立即按建议修复？(Y/n): " dofix
-    dofix=${dofix:-Y}
+    dofix="${dofix:-Y}"
+
     if [[ "$dofix" == "Y" || "$dofix" == "y" ]]; then
-      fix_errors # 原有修复逻辑
+      fix_errors
+      fix_rc=$?
       did_fix=1
+
       say ""
-      ok "修复操作完成，正在重新检测..."
+      ok "修复操作已执行，正在重新检测..."
       system_check
+      status=$?
     else
       say "已跳过修复。"
     fi
@@ -1439,14 +1459,47 @@ check_and_repair_menu() {
     ok "系统状态良好，无需修复。"
   fi
 
+  # --------------------------------------------------
+  # 3. 若执行过修复，则判断是否真的需要重启
+  # --------------------------------------------------
   if (( did_fix == 1 )); then
-    say "正在重启 Xray 服务以应用修复..."
-    if ! restart_xray; then
-      warn "自动重启失败，请在 \"脚本服务\" 中手动选择 2) 重启 Xray 服务。"
+    if _svc_running_for_repair_menu; then
+      after_running=1
     else
-      ok "Xray 服务已重启。"
+      after_running=0
+    fi
+
+    after_hash="$(_cfg_hash_for_repair_menu)"
+
+    # 仅在以下情况才考虑重启：
+    # A. 修复前服务就没起来
+    # B. 修复后正式配置发生变化
+    if (( before_running == 0 )); then
+      need_restart=1
+    fi
+
+    if [[ "$before_hash" != "$after_hash" ]]; then
+      need_restart=1
+    fi
+
+    # 如果修复本身失败了，或者复检仍然有硬故障，则提示但不盲目继续重启
+    if (( fix_rc != 0 )); then
+      warn "自动修复过程中仍有未完成项，已跳过自动重启，请先检查上方报错。"
+    elif (( status != 0 )); then
+      warn "修复后复检仍存在硬故障，已跳过自动重启，请先处理剩余问题。"
+    elif (( need_restart == 1 )); then
+      say "检测到服务状态或正式配置发生变化，正在应用修复结果..."
+
+      if ! restart_xray; then
+        warn "自动应用失败，请在 \"脚本服务\" 中手动选择 2) 重启 Xray 服务。"
+      else
+        ok "Xray 服务已按需应用修复结果。"
+      fi
+    else
+      ok "修复已完成，主服务配置未变化且服务原本正常，已跳过无意义重启。"
     fi
   fi
+
   read -rp "修复完成，按回车返回..." _
   return
 }
@@ -1494,17 +1547,30 @@ LR
 }
 
 install_watchdog_cron() {
-  if ! command -v crontab >/dev/null 2>&1; then return 0; fi
+  if ! command -v crontab >/dev/null 2>&1; then
+    return 0
+  fi
+
   local marker="# xray-watchdog"
-  crontab -l >/dev/null 2>&1 || true
-  crontab -l 2>/dev/null | grep -v "$marker" > /tmp/crontab.tmp 2>/dev/null || true
-  echo "* * * * * /usr/local/bin/xray-singleton >/dev/null 2>&1  $marker" >> /tmp/crontab.tmp
-  crontab /tmp/crontab.tmp
-  rm -f /tmp/crontab.tmp
+  local tmp_cron
+  tmp_cron="$(mktemp /tmp/xray_crontab.XXXXXX)" || return 1
+
+  if ! crontab -l > "$tmp_cron" 2>/dev/null; then
+    : > "$tmp_cron"
+  fi
+
+  grep -vF "$marker" "$tmp_cron" > "${tmp_cron}.new" 2>/dev/null || true
+  mv -f "${tmp_cron}.new" "$tmp_cron"
+
+  cat >> "$tmp_cron" <<'EOF'
+* * * * * sleep $((RANDOM % 20)) && /usr/local/bin/xray-singleton >/dev/null 2>&1  # xray-watchdog
+EOF
+
+  crontab "$tmp_cron"
+  rm -f "$tmp_cron"
 }
 
 install_singleton_wrapper() {
- 
 
   # 1. 确保目录结构存在，并建立路径软链接
   mkdir -p /etc/xray /usr/local/etc/xray
@@ -1710,7 +1776,6 @@ jq --arg log "$LOG_PATH" \
        + (if (.protocol? != null) then { protocol:(if (.protocol|type)=="array" then .protocol else [.protocol] end) } else {} end)
       );
 
-
   def mk_global_override_rules(m):
     m
     | to_entries
@@ -1822,31 +1887,202 @@ jq --arg log "$LOG_PATH" \
 SYNC
   chmod +x /usr/local/bin/xray-sync
 
-  # 3. 生成 xray-singleton (单例管理脚本)
+  # 3. 生成 xray-singleton (守护检查器，不再是“每次执行就重启器”)
   cat > /usr/local/bin/xray-singleton <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
+
 XRAY_BASE_DIR="/etc/xray"
-PIDFILE="/run/xray.pid"
+MODEL_CFG="${XRAY_BASE_DIR}/config.json"
+META_CFG="${XRAY_BASE_DIR}/nodes_meta.json"
 OUT_CFG="${XRAY_BASE_DIR}/xray_config.json"
+TMP_CFG="/tmp/xray_singleton_candidate.json"
+LOCK_FILE="/tmp/xray_singleton.lock"
+STATE_DIR="${XRAY_BASE_DIR}/watchdog"
+PIDFILE="/run/xray.pid"
 BIN="/usr/local/bin/xray"
 LOG="/var/log/xray.log"
+FAIL_FILE="${STATE_DIR}/fail_count"
+LAST_HASH_FILE="${STATE_DIR}/last_cfg_hash"
+MAX_FAILS=3
 
-# 1. 尝试同步配置
-/usr/local/bin/xray-sync >/dev/null 2>&1 || true
+mkdir -p "$STATE_DIR"
 
-# 2. 配置自检，失败则报错退出
-if ! "$BIN" run -test -c "$OUT_CFG" >/dev/null 2>&1; then
-    echo "Xray config test failed! Check /etc/xray/config.json" >&2
-    exit 1
+cleanup() {
+  rm -f "$TMP_CFG" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  exit 0
 fi
 
-# 3. 杀死旧进程并启动新进程
-pkill -f "/usr/local/bin/xray run -c" >/dev/null 2>&1 || true
-setsid "$BIN" run -c "$OUT_CFG" >> "$LOG" 2>&1 &
-echo $! > "$PIDFILE"
+log_msg() {
+  printf '[%s] [xray-singleton] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+}
+
+is_real_systemd() {
+  [[ -d /run/systemd/system ]] && ps -p 1 -o comm= 2>/dev/null | grep -q '^systemd$'
+}
+
+is_openrc_ready() {
+  command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/xray ]]
+}
+
+service_is_running() {
+  if is_real_systemd && command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet xray
+    return $?
+  fi
+
+  if is_openrc_ready; then
+    rc-service xray status 2>/dev/null | grep -q started
+    return $?
+  fi
+
+  pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1
+  return $?
+}
+
+start_service_without_kill() {
+  if is_real_systemd && command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+      exit 1
+    fi
+    systemctl start xray >/dev/null 2>&1
+    return $?
+  fi
+
+  if is_openrc_ready; then
+    rc-service xray start >/dev/null 2>&1
+    return $?
+  fi
+
+  if pgrep -x xray >/dev/null 2>&1; then
+    return 0
+  fi
+
+  setsid "$BIN" run -c "$OUT_CFG" >> "$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 0.5
+  pgrep -x xray >/dev/null 2>&1
+}
+
+inc_fail() {
+  local n=0
+  if [[ -f "$FAIL_FILE" ]]; then
+    n="$(cat "$FAIL_FILE" 2>/dev/null || echo 0)"
+  fi
+  n="${n:-0}"
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$FAIL_FILE"
+  echo "$n"
+}
+
+reset_fail() {
+  printf '0\n' > "$FAIL_FILE"
+}
+
+sha_file() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v md5sum >/dev/null 2>&1; then
+    md5sum "$f" | awk '{print $1}'
+  else
+    wc -c < "$f" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+# --------------------------------------------------
+# 1. 先生成候选配置到临时文件，不直接改线上文件
+# --------------------------------------------------
+if ! MODEL_CFG="$MODEL_CFG" META_CFG="$META_CFG" OUT_CFG="$TMP_CFG" LOG_PATH="$LOG" /usr/local/bin/xray-sync >/dev/null 2>&1; then
+  log_msg "xray-sync 生成候选配置失败，跳过本轮。"
+  exit 0
+fi
+
+# --------------------------------------------------
+# 2. 候选配置校验失败时，不动线上运行中的服务
+# --------------------------------------------------
+if ! "$BIN" run -test -c "$TMP_CFG" >/dev/null 2>&1; then
+  log_msg "候选配置未通过 Xray 校验，跳过本轮，不触发重启。"
+  exit 0
+fi
+
+# --------------------------------------------------
+# 3. 比较新旧配置是否变化
+# --------------------------------------------------
+candidate_hash="$(sha_file "$TMP_CFG")"
+current_hash=""
+if [[ -f "$OUT_CFG" ]]; then
+  current_hash="$(sha_file "$OUT_CFG")"
+fi
+
+config_changed=0
+if [[ ! -f "$OUT_CFG" ]]; then
+  config_changed=1
+elif [[ "$candidate_hash" != "$current_hash" ]]; then
+  config_changed=1
+fi
+
+# --------------------------------------------------
+# 4. 服务在线 + 配置没变 => 直接退出
+# --------------------------------------------------
+if service_is_running && [[ "$config_changed" -eq 0 ]]; then
+  reset_fail
+  printf '%s\n' "$candidate_hash" > "$LAST_HASH_FILE"
+  exit 0
+fi
+
+# --------------------------------------------------
+# 5. 配置变了：
+#    watchdog 这里只负责“落盘候选配置”，不负责主动 restart
+#    避免 cron 每分钟变成重启器
+# --------------------------------------------------
+if [[ "$config_changed" -eq 1 ]]; then
+  if install -m 0644 "$TMP_CFG" "$OUT_CFG"; then
+    printf '%s\n' "$candidate_hash" > "$LAST_HASH_FILE"
+    log_msg "检测到配置变化，已更新 xray_config.json；不在 singleton 中主动重启。"
+  else
+    log_msg "配置变化存在，但写入正式配置失败。"
+    exit 0
+  fi
+fi
+
+# --------------------------------------------------
+# 6. 服务不在线：
+#    连续多次检测失败后，才尝试“拉起”，不是先杀再启
+# --------------------------------------------------
+if ! service_is_running; then
+  fail_now="$(inc_fail)"
+  log_msg "检测到 Xray 当前未运行，连续失败计数=${fail_now}。"
+
+  if [[ "${fail_now}" -lt "${MAX_FAILS}" ]]; then
+    exit 0
+  fi
+
+  if start_service_without_kill; then
+    reset_fail
+    log_msg "Xray 已成功拉起。"
+    exit 0
+  else
+    log_msg "Xray 拉起失败，请手动检查。"
+    exit 1
+  fi
+fi
+
+# --------------------------------------------------
+# 7. 服务在线，但此前有失败计数，清零
+# --------------------------------------------------
+reset_fail
+exit 0
 WRAP
   chmod +x /usr/local/bin/xray-singleton
+  install_watchdog_cron >/dev/null 2>&1 || true
 }
 
 
@@ -1889,33 +2125,99 @@ start_xray_legacy_nohup() {
 }
 
 start_xray_singleton_force() {
+  local cfg="/etc/xray/xray_config.json"
+  local model_cfg="/etc/xray/config.json"
+  local meta_cfg="/etc/xray/nodes_meta.json"
+  local lock_file="/tmp/start_xray_singleton_force.lock"
+  local tmp_cfg=""
+  local total_mem=0
+  local grace_waited=0
+  local tries=0
+  local alive_rounds=0
+  local is_alive=0
+  local pidfile="/run/xray.pid"
+  local bin="/usr/local/bin/xray"
+
   mkdir -p /usr/local/etc/xray /etc/xray
   ln -sf /etc/xray/xray_config.json /usr/local/etc/xray/config.json
 
-  # 1. 🚀 性能优化：只在主配置缺失时才尝试同步，避免每次重启都做重复的 JSON 读写
-  if [[ ! -f /etc/xray/xray_config.json ]] && [[ -x /usr/local/bin/xray-sync ]]; then
-  /usr/local/bin/xray-sync >/dev/null 2>&1 || warn "xray-sync 执行失败，继续尝试使用现有配置启动"
-fi
+  tmp_cfg="$(mktemp /tmp/xray_force_start.XXXXXX)" || {
+    err "无法创建临时配置文件"
+    return 1
+  }
+  tmp_cfg="${tmp_cfg}.json"
+  _start_xray_singleton_force_cleanup() {
+    rm -f "$tmp_cfg" 2>/dev/null || true
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+  }
 
-  # 2. 🛡️ 稳定性优化：先温和停止(TERM)释放端口，再必要时强杀(KILL)
-  pkill -TERM -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1 || true
-  sleep 0.5
-  if pgrep -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1; then
-      pkill -9 -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1 || true
-      sleep 0.2
+  exec 9>"$lock_file"
+  if ! flock -n 9; then
+    warn "检测到已有 Xray 强制拉起/重启任务正在进行，已跳过本次重复执行。"
+    rm -f "$tmp_cfg" 2>/dev/null || true
+    exec 9>&-
+    return 0
   fi
 
-  rm -f /run/xray.pid /var/run/xray.pid >/dev/null 2>&1 || true
-
-  # 3. 启动前语法自检
-  if ! /usr/local/bin/xray run -test -c /etc/xray/xray_config.json >/dev/null 2>&1; then
-      err "Xray 启动失败：配置文件校验未通过，请检查 /etc/xray/xray_config.json"
+  # --------------------------------------------------
+  # 1. 先确保候选配置存在
+  #    优先用 xray-sync 重新生成到临时文件，而不是直接覆盖线上配置
+  # --------------------------------------------------
+  if [[ -x /usr/local/bin/xray-sync ]]; then
+    if ! MODEL_CFG="$model_cfg" META_CFG="$meta_cfg" OUT_CFG="$tmp_cfg" /usr/local/bin/xray-sync >/dev/null 2>&1; then
+      if [[ -f "$cfg" ]]; then
+        cp -f "$cfg" "$tmp_cfg" >/dev/null 2>&1 || {
+          err "xray-sync 生成候选配置失败，且复制现有配置也失败。"
+          _start_xray_singleton_force_cleanup
+          return 1
+        }
+        warn "xray-sync 执行失败，已回退为使用现有配置尝试启动。"
+      else
+        err "xray-sync 执行失败，且当前无可用配置文件。"
+        _start_xray_singleton_force_cleanup
+        return 1
+      fi
+    fi
+  else
+    if [[ -f "$cfg" ]]; then
+      cp -f "$cfg" "$tmp_cfg" >/dev/null 2>&1 || {
+        err "无法复制现有配置到临时文件。"
+        _start_xray_singleton_force_cleanup
+        return 1
+      }
+    else
+      err "未找到 xray-sync，且 /etc/xray/xray_config.json 不存在。"
+      _start_xray_singleton_force_cleanup
       return 1
+    fi
   fi
 
+  # --------------------------------------------------
+  # 2. 启动前先做语法自检
+  #    注意：必须在停旧进程之前完成
+  # --------------------------------------------------
+  if ! "$bin" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+    err "Xray 启动失败：候选配置校验未通过，请检查 /etc/xray/config.json 或 nodes_meta.json"
+    _start_xray_singleton_force_cleanup
+    return 1
+  fi
+
+  # --------------------------------------------------
+  # 3. 候选配置校验通过后，再原子替换正式配置
+  # --------------------------------------------------
+  if ! install -m 0644 "$tmp_cfg" "$cfg"; then
+    err "写入正式配置失败，已取消强制拉起。"
+    _start_xray_singleton_force_cleanup
+    return 1
+  fi
+
+  # --------------------------------------------------
   # 4. 动态内存压制策略
-  local total_mem
-  total_mem=$(free -m | awk '/Mem:/ {print $2}')
+  # --------------------------------------------------
+  total_mem="$(free -m | awk '/Mem:/ {print $2}')"
+  total_mem="${total_mem:-0}"
+
   export XRAY_LOCATION_ASSET=/usr/local/bin/
 
   if [[ "$total_mem" -le 300 ]]; then
@@ -1925,46 +2227,76 @@ fi
   else
     export GOMEMLIMIT=128MiB
     export GOGC=50
+    unset GODEBUG 2>/dev/null || true
   fi
 
-  # 5. 🧹 防堆叠优化：清理旧的后台延迟任务，防止高频重启导致并发错乱
-  pkill -f "sleep 30 && update_ip_async" >/dev/null 2>&1 || true
-  (sleep 30 && update_ip_async) >/dev/null 2>&1 &
+  # --------------------------------------------------
+  # 5. 尝试优雅停止旧进程
+  #    这里只用于 fallback 兜底路径，不与 systemd/OpenRC 正常管理混用
+  # --------------------------------------------------
+  pkill -TERM -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1 || true
 
-  # 6. 执行启动并捕获执行错误
-  if ! daemonize /usr/local/bin/xray run -c /etc/xray/xray_config.json; then
-      err "Xray 启动命令执行失败"
-      return 1
+  grace_waited=0
+  while pgrep -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1 && (( grace_waited < 15 )); do
+    sleep 0.2
+    grace_waited=$((grace_waited + 1))
+  done
+
+  if pgrep -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1; then
+    pkill -9 -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1 || true
+    sleep 0.2
   fi
 
-  # 7. ⏱️ 智能探活优化：连续存活 3 轮 (0.6秒) 即判定成功，拒绝无意义的死等
-  local tries=0
-  local alive_rounds=0
-  local is_alive=0
+  rm -f /run/xray.pid /var/run/xray.pid >/dev/null 2>&1 || true
+
+  # --------------------------------------------------
+  # 6. 不再在这里堆叠后台 sleep/update_ip_async
+  #    由外层 restart_xray() 成功后统一触发 update_ip_async
+  # --------------------------------------------------
+
+  # --------------------------------------------------
+  # 7. 执行启动
+  # --------------------------------------------------
+  if ! daemonize "$bin" run -c "$cfg"; then
+    err "Xray 启动命令执行失败"
+    _start_xray_singleton_force_cleanup
+    return 1
+  fi
+
+  # --------------------------------------------------
+  # 8. 智能探活：连续存活 3 轮判定成功
+  # --------------------------------------------------
+  tries=0
+  alive_rounds=0
+  is_alive=0
+
   while (( tries < 15 )); do
-      sleep 0.2
-      # 使用精确的进程匹配，防止误判
-      if pgrep -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1; then
-          is_alive=1
-          alive_rounds=$((alive_rounds + 1))
-          if (( alive_rounds >= 3 )); then
-              break
-          fi
-      else
-          is_alive=0
-          alive_rounds=0
-          break
+    sleep 0.2
+
+    if pgrep -f "/usr/local/bin/xray run -c /etc/xray/xray_config.json" >/dev/null 2>&1; then
+      is_alive=1
+      alive_rounds=$((alive_rounds + 1))
+      if (( alive_rounds >= 3 )); then
+        break
       fi
-      tries=$((tries + 1))
+    else
+      is_alive=0
+      alive_rounds=0
+      break
+    fi
+
+    tries=$((tries + 1))
   done
 
   if (( is_alive == 0 )); then
     err "启动失败：/etc/xray/xray_config.json 对应进程未能稳定存活，可能是 OOM、端口占用或运行期崩溃"
     [[ -f /var/log/xray.log ]] && tail -n 3 /var/log/xray.log
+    _start_xray_singleton_force_cleanup
     return 1
   fi
 
   ok "Xray 核心服务已强制拉起成功。"
+  _start_xray_singleton_force_cleanup
   return 0
 }
 
@@ -1978,116 +2310,585 @@ auto_optimize_cpu() {
 }
 
 sync_and_restart_argo() {
-    # 1. 获取当前最新的全局出口偏好
-    local pref ds lock_ip
+    local global_lock_file="/tmp/sync_and_restart_argo.lock"
+    local global_lock_fd=8
+
+    local pref=""
+    local ds=""
+    local lock_ip=""
+    local outbound_json=""
+    local tags=""
+
+    local total_count=0
+    local changed_count=0
+    local skipped_count=0
+    local failed_count=0
+
+    # --------------------------------------------------
+    # 0. 获取全局锁，防止批量同步并发执行
+    # --------------------------------------------------
+    eval "exec ${global_lock_fd}>\"$global_lock_file\""
+    if ! flock -n "$global_lock_fd"; then
+        warn "检测到已有 Argo 固定隧道同步任务正在进行，已跳过本次重复操作。"
+        eval "exec ${global_lock_fd}>&-"
+        return 0
+    fi
+
+    _sync_and_restart_argo_cleanup_global() {
+        flock -u "$global_lock_fd" 2>/dev/null || true
+        eval "exec ${global_lock_fd}>&-"
+    }
+
+    # --------------------------------------------------
+    # 1. 获取当前全局出口偏好，并构造目标 outbound
+    # --------------------------------------------------
     IFS=$'\t' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
 
-    # 构造新的 Outbound JSON
-    local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
-    [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
+    if [[ -n "$lock_ip" ]]; then
+        outbound_json="$(
+            jq -cn \
+                --arg ds "$ds" \
+                --arg ip "$lock_ip" \
+                '{protocol:"freedom",settings:{domainStrategy:$ds},sendThrough:$ip}'
+        )"
+    else
+        outbound_json="$(
+            jq -cn \
+                --arg ds "$ds" \
+                '{protocol:"freedom",settings:{domainStrategy:$ds}}'
+        )"
+    fi
 
-    # 2. 精准清理：只杀固定隧道，跳过临时隧道 (*_temp)
-    pkill -f "cloudflared.*--token" >/dev/null 2>&1
-    pkill -f "/root/agsbx/xray.*argo_users" >/dev/null 2>&1
-    sleep 0.5
+    if [[ -z "$outbound_json" || "$outbound_json" == "null" ]]; then
+        err "Argo 同步失败：无法生成新的出站配置。"
+        _sync_and_restart_argo_cleanup_global
+        return 1
+    fi
 
-    # 3. [已彻底移除] 临时隧道重启逻辑，确保其域名不断开
+    # --------------------------------------------------
+    # 2. 找出所有“固定隧道”
+    #    仅处理 type=argo 且 token 非空的项目
+    # --------------------------------------------------
+    tags="$(
+        jq -r '
+            to_entries[]
+            | select(.value.type=="argo" and (.value.token != null) and (.value.token != ""))
+            | .key
+        ' "$META" 2>/dev/null
+    )"
 
-    # 4. 仅同步重启所有固定隧道
-    local tags; tags=$(jq -r 'to_entries[] | select(.value.type=="argo" and .value.token!=null) | .key' "$META" 2>/dev/null)
+    if [[ -z "$tags" ]]; then
+        ok "未检测到需要同步的固定 Argo 隧道。"
+        _sync_and_restart_argo_cleanup_global
+        return 0
+    fi
+
+    # --------------------------------------------------
+    # 3. 逐个隧道精准处理
+    # --------------------------------------------------
+    local t
     for t in $tags; do
-        local p; p=$(jq -r --arg t "$t" '.[$t].port' "$META")
-        local tk; tk=$(jq -r --arg t "$t" '.[$t].token' "$META")
-        local f_cfg="/etc/xray/argo_users/${p}.json"
-        if [[ -f "$f_cfg" ]]; then
-            local f_tmp; f_tmp=$(mktemp)
-            jq --argjson out "[${outbound_json}]" '.outbounds = $out' "$f_cfg" > "$f_tmp" && mv "$f_tmp" "$f_cfg"
-            nohup /root/agsbx/xray run -c "$f_cfg" >/dev/null 2>&1 &
-            nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$tk" >/dev/null 2>&1 &
+        total_count=$((total_count + 1))
+
+        local p=""
+        local tk=""
+        local f_cfg=""
+        local lock_file=""
+        local lock_fd=9
+
+        local tmp_cfg=""
+        local old_outbound_norm=""
+        local new_outbound_norm=""
+
+        local xray_started=0
+        local cfd_started=0
+        local waited=0
+
+        p="$(jq -r --arg t "$t" '.[$t].port // empty' "$META" 2>/dev/null)"
+        tk="$(jq -r --arg t "$t" '.[$t].token // empty' "$META" 2>/dev/null)"
+        f_cfg="/etc/xray/argo_users/${p}.json"
+
+        if [[ -z "$p" || -z "$tk" || ! -f "$f_cfg" ]]; then
+            warn "固定隧道 [$t] 信息不完整，已跳过。"
+            skipped_count=$((skipped_count + 1))
+            continue
         fi
+
+        # ------------------------------
+        # 单隧道锁，避免并发重启同一条隧道
+        # ------------------------------
+        lock_file="/tmp/argo_sync_${p}.lock"
+        eval "exec ${lock_fd}>\"$lock_file\""
+        if ! flock -n "$lock_fd"; then
+            warn "固定隧道 [$t] 正在被其他任务处理，已跳过本次重复操作。"
+            skipped_count=$((skipped_count + 1))
+            eval "exec ${lock_fd}>&-"
+            continue
+        fi
+
+        _sync_and_restart_argo_cleanup_one() {
+            rm -f "$tmp_cfg" 2>/dev/null || true
+            flock -u "$lock_fd" 2>/dev/null || true
+            eval "exec ${lock_fd}>&-"
+        }
+
+        tmp_cfg="$(mktemp /tmp/argo_user_${p}.XXXXXX)" || {
+            err "固定隧道 [$t] 无法创建临时配置文件，已跳过。"
+            failed_count=$((failed_count + 1))
+            _sync_and_restart_argo_cleanup_one
+            continue
+        }
+        tmp_cfg="${tmp_cfg}.json"
+
+        # ------------------------------
+        # A. 规范化比较旧/新 outbounds
+        # ------------------------------
+        old_outbound_norm="$(jq -cS '.outbounds // []' "$f_cfg" 2>/dev/null)"
+        new_outbound_norm="$(jq -cS --argjson out "[$outbound_json]" '$out' 2>/dev/null)"
+
+        if [[ -z "$old_outbound_norm" || -z "$new_outbound_norm" ]]; then
+            err "固定隧道 [$t] 读取/生成出站配置失败，已跳过。"
+            failed_count=$((failed_count + 1))
+            _sync_and_restart_argo_cleanup_one
+            continue
+        fi
+
+        # ------------------------------
+        # B. 如果配置未变化，直接跳过，不断流
+        # ------------------------------
+        if [[ "$old_outbound_norm" == "$new_outbound_norm" ]]; then
+            skipped_count=$((skipped_count + 1))
+            _sync_and_restart_argo_cleanup_one
+            continue
+        fi
+
+        # ------------------------------
+        # C. 先生成“新配置到临时文件”
+        #    注意：这里先不杀旧进程
+        # ------------------------------
+        if ! jq --argjson out "[$outbound_json]" '.outbounds = $out' "$f_cfg" > "$tmp_cfg" 2>/dev/null; then
+            err "固定隧道 [$t] 生成新配置失败，旧隧道保持不动。"
+            failed_count=$((failed_count + 1))
+            _sync_and_restart_argo_cleanup_one
+            continue
+        fi
+
+        # ------------------------------
+        # D. 先用 Xray 校验临时配置
+        # ------------------------------
+        if ! _xray_test_config "$tmp_cfg" >/dev/null 2>&1; then
+            err "固定隧道 [$t] 新配置未通过 Xray 校验，已取消切换。"
+            failed_count=$((failed_count + 1))
+            _sync_and_restart_argo_cleanup_one
+            continue
+        fi
+
+        # ------------------------------
+        # E. 先备份旧配置，再原子覆盖正式配置
+        # ------------------------------
+        cp -f "$f_cfg" "${f_cfg}.bak.$(date +%s)" >/dev/null 2>&1 || true
+
+        if ! install -m 0644 "$tmp_cfg" "$f_cfg"; then
+            err "固定隧道 [$t] 写入新配置失败，旧隧道保持不动。"
+            failed_count=$((failed_count + 1))
+            _sync_and_restart_argo_cleanup_one
+            continue
+        fi
+
+        # ------------------------------
+        # F. 到这里才开始“精准重启”
+        #    只动当前这一个隧道
+        # ------------------------------
+        pkill -f "/root/agsbx/xray run -c $f_cfg" >/dev/null 2>&1 || true
+        pkill -f "cloudflared tunnel --no-autoupdate --protocol http2 run --token $tk" >/dev/null 2>&1 || true
+        pkill -f "cloudflared tunnel.*--token $tk" >/dev/null 2>&1 || true
+
+        sleep 0.2
+
+        nohup /root/agsbx/xray run -c "$f_cfg" >/dev/null 2>&1 &
+        nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$tk" >/dev/null 2>&1 &
+
+        # ------------------------------
+        # G. 等待进程拉起，避免“发了 nohup 就算成功”
+        # ------------------------------
+        waited=0
+        while (( waited < 30 )); do
+            if pgrep -f "/root/agsbx/xray run -c $f_cfg" >/dev/null 2>&1; then
+                xray_started=1
+                break
+            fi
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+
+        waited=0
+        while (( waited < 30 )); do
+            if pgrep -f "cloudflared tunnel.*--token $tk" >/dev/null 2>&1; then
+                cfd_started=1
+                break
+            fi
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+
+        if (( xray_started == 1 && cfd_started == 1 )); then
+            changed_count=$((changed_count + 1))
+            say "固定隧道 [$t] 出口已更新并完成精准重启。"
+        else
+            failed_count=$((failed_count + 1))
+            warn "固定隧道 [$t] 配置已更新，但进程拉起状态异常，请手动检查。"
+        fi
+
+        _sync_and_restart_argo_cleanup_one
     done
+
+    # --------------------------------------------------
+    # 4. 汇总输出
+    # --------------------------------------------------
+    if (( failed_count > 0 )); then
+        warn "固定隧道同步完成：总计 ${total_count} 个，更新 ${changed_count} 个，跳过 ${skipped_count} 个，异常 ${failed_count} 个。"
+        _sync_and_restart_argo_cleanup_global
+        return 1
+    fi
+
+    ok "固定隧道同步完成：总计 ${total_count} 个，更新 ${changed_count} 个，跳过 ${skipped_count} 个。未改动出口的隧道保持不断流。"
+    _sync_and_restart_argo_cleanup_global
+    return 0
 }
 
 restart_xray() {
   local mode="${1:-all}"
-  
-  # 1. 立即清理缓存和探测锁
-  rm -f "${IP_CACHE_FILE}_xray" "${IP_CACHE_FILE}_xray_status" /tmp/ip_probe.lock 2>/dev/null
-  install_singleton_wrapper >/dev/null 2>&1 || true
 
-  # 每次重启 Xray 时，重新下发底层的 tc 限速规则
-  apply_port_limits
+  local lock_file="/tmp/restart_xray.lock"
+  local lock_fd=9
 
-  # 2. 先同步主模型并做 Xray 语法校验
-  if ! sync_xray_config >/dev/null 2>&1; then
-    err "配置文件不合法（Xray 校验未通过）"
+  local model_cfg
+  local out_cfg
+  local tmp_out_cfg=""
+
+  local config_changed=0
+  local service_was_running=0
+  local need_main_restart=0
+  local main_restart_done=0
+  local main_started_only=0
+
+  local argo_done=0
+  local argo_failed=0
+
+  local success_msg=""
+  local rc=1
+
+  model_cfg="$(_model_cfg)"
+  out_cfg="$(_xray_cfg)"
+
+  tmp_out_cfg="$(mktemp /tmp/xray_restart.XXXXXX)" || {
+    err "无法创建临时配置文件"
     return 1
-  fi
+  }
+  tmp_out_cfg="${tmp_out_cfg}.json"
+  # -------------------------------
+  # 0. 清理函数：无论成功失败都释放锁和临时文件
+  # -------------------------------
+  _restart_xray_cleanup() {
+    rm -f "$tmp_out_cfg" 2>/dev/null || true
+    flock -u "$lock_fd" 2>/dev/null || true
+    eval "exec ${lock_fd}>&-"
+  }
 
-  # 3. 🚀 关键解耦：如果参数是 main_only，则跳过 Argo 隧道的重启
-  if [[ "$mode" != "main_only" ]]; then
-    sync_and_restart_argo
-  fi
-
-  local success_msg="主服务及所有 Argo 隧道已完成出口同步并重启"
-  [[ "$mode" == "main_only" ]] && success_msg="主服务已完成重启 (Argo 隧道不受影响)"
-
-  # --- 路径 A: systemd 托管 ---
-  if command -v systemctl >/dev/null 2>&1 && is_real_systemd; then
-    if ! systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
-      install_systemd_service >/dev/null 2>&1 || true
-    fi
-
-    systemctl restart xray >/dev/null 2>&1 || true
-    
-    # 🚀 优化：轮询等待，最快 0.1 秒即可放行，最长等 1.5 秒
-    local waited=0
-    while ! systemctl is-active --quiet xray && (( waited < 15 )); do
-        sleep 0.1
-        waited=$((waited + 1))
-    done
-    
-    if systemctl is-active --quiet xray; then
-      sync_hy2_network >/dev/null 2>&1 || true
-      update_ip_async  # 启动成功立即触发 IP 探测
-      ok "${success_msg} (systemd)"
-      return 0
-    fi
-  fi
-
-  # --- 路径 B: OpenRC 托管 ---
-  if command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/xray ]]; then
-    rc-service xray restart >/dev/null 2>&1 || true
-    
-    # 🚀 优化：轮询等待，告别硬 sleep
-    local waited=0
-    while ! rc-service xray status 2>/dev/null | grep -q started && (( waited < 15 )); do
-        sleep 0.1
-        waited=$((waited + 1))
-    done
-    
-    if rc-service xray status 2>/dev/null | grep -q started; then
-      sync_hy2_network >/dev/null 2>&1 || true
-      update_ip_async
-      ok "${success_msg} (OpenRC)"
-      return 0
-    fi
-  fi
-
-  # --- 路径 C: Fallback ---
-  pkill -x xray >/dev/null 2>&1 || true
-  if start_xray_singleton_force; then
-    sync_hy2_network >/dev/null 2>&1 || true
-    auto_optimize_cpu
-    update_ip_async
-    ok "${success_msg} (Fallback)"
+  # -------------------------------
+  # 1. 获取全局锁，防止并发重启
+  # -------------------------------
+  eval "exec ${lock_fd}>\"$lock_file\""
+  if ! flock -n "$lock_fd"; then
+    warn "检测到已有重启任务正在进行，已跳过本次重复重启。"
+    rm -f "$tmp_out_cfg" 2>/dev/null || true
+    eval "exec ${lock_fd}>&-"
     return 0
   fi
 
-  err "Xray 重启失败"
-  return 1
-}
+  # -------------------------------
+  # 2. 基础文件与包装器准备
+  # -------------------------------
+  install_singleton_wrapper >/dev/null 2>&1 || true
+  ensure_dirs >/dev/null 2>&1 || true
 
+  # -------------------------------
+  # 3. 先判断主服务当前是否在线
+  # -------------------------------
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+    if systemctl is-active --quiet xray; then
+      service_was_running=1
+    fi
+  elif is_openrc_system; then
+    if rc-service xray status 2>/dev/null | grep -q started; then
+      service_was_running=1
+    fi
+  else
+    if pgrep -x xray >/dev/null 2>&1; then
+      service_was_running=1
+    fi
+  fi
+
+  # -------------------------------
+  # 4. 先生成“临时目标配置”，不要直接覆盖正式配置
+  # -------------------------------
+  if ! _translate_model_to_xray "$model_cfg" "$tmp_out_cfg" >/dev/null 2>&1; then
+    err "配置同步失败：无法从模型配置生成临时 Xray 配置。"
+    _restart_xray_cleanup
+    return 1
+  fi
+
+  # -------------------------------
+  # 5. 先校验临时配置，确保语法完全正确
+  # -------------------------------
+  if ! _xray_test_config "$tmp_out_cfg" >/dev/null 2>&1; then
+    err "配置文件不合法（Xray 校验未通过），已取消重启。"
+    _restart_xray_cleanup
+    return 1
+  fi
+
+  # -------------------------------
+  # 6. 判断主配置是否真的变化
+  # -------------------------------
+  if [[ ! -f "$out_cfg" ]]; then
+    config_changed=1
+  elif ! cmp -s "$tmp_out_cfg" "$out_cfg"; then
+    config_changed=1
+  else
+    config_changed=0
+  fi
+
+  # -------------------------------
+  # 7. 只有配置真的变化时，才原子替换正式配置
+  # -------------------------------
+  if (( config_changed == 1 )); then
+    if ! install -m 0644 "$tmp_out_cfg" "$out_cfg"; then
+      err "写入正式配置失败，已取消重启。"
+      _restart_xray_cleanup
+      return 1
+    fi
+  fi
+
+  # -------------------------------
+  # 8. Argo 解耦：
+  #    main_only 时完全不碰 Argo
+  # -------------------------------
+  if [[ "$mode" != "main_only" ]]; then
+    if sync_and_restart_argo; then
+      argo_done=1
+      argo_failed=0
+    else
+      argo_done=0
+      argo_failed=1
+      warn "Argo 固定隧道同步过程中存在异常，请检查上方输出。"
+    fi
+  fi
+
+  # -------------------------------
+  # 9. 判断主 Xray 是否需要重启/拉起
+  #    规则：
+  #    A. 配置变了 -> 需要重启
+  #    B. 配置没变但服务离线 -> 需要补拉起
+  #    C. 配置没变且服务在线 -> 跳过主服务操作
+  # -------------------------------
+  if (( config_changed == 1 )); then
+    need_main_restart=1
+  elif (( service_was_running == 0 )); then
+    need_main_restart=1
+    main_started_only=1
+  else
+    need_main_restart=0
+  fi
+
+  # -------------------------------
+  # 10. 主 Xray 仅在“真的需要”时才重启/拉起
+  # -------------------------------
+  if (( need_main_restart == 1 )); then
+
+    # ---------- 路径 A：systemd ----------
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+      if ! systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+        install_systemd_service >/dev/null 2>&1 || true
+      fi
+
+      if (( config_changed == 1 )); then
+        if systemctl restart xray >/dev/null 2>&1; then
+          local waited=0
+          while ! systemctl is-active --quiet xray && (( waited < 30 )); do
+            sleep 0.1
+            waited=$((waited + 1))
+          done
+
+          if systemctl is-active --quiet xray; then
+            main_restart_done=1
+            rc=0
+          fi
+        fi
+      else
+        if systemctl start xray >/dev/null 2>&1; then
+          local waited=0
+          while ! systemctl is-active --quiet xray && (( waited < 30 )); do
+            sleep 0.1
+            waited=$((waited + 1))
+          done
+
+          if systemctl is-active --quiet xray; then
+            main_restart_done=1
+            rc=0
+          fi
+        fi
+      fi
+    fi
+
+    # ---------- 路径 B：OpenRC ----------
+    if (( rc != 0 )) && command -v rc-service >/dev/null 2>&1 && [[ -f /etc/init.d/xray ]]; then
+      if (( config_changed == 1 )); then
+        if rc-service xray restart >/dev/null 2>&1; then
+          local waited=0
+          while ! rc-service xray status 2>/dev/null | grep -q started && (( waited < 30 )); do
+            sleep 0.1
+            waited=$((waited + 1))
+          done
+
+          if rc-service xray status 2>/dev/null | grep -q started; then
+            main_restart_done=1
+            rc=0
+          fi
+        fi
+      else
+        if rc-service xray start >/dev/null 2>&1; then
+          local waited=0
+          while ! rc-service xray status 2>/dev/null | grep -q started && (( waited < 30 )); do
+            sleep 0.1
+            waited=$((waited + 1))
+          done
+
+          if rc-service xray status 2>/dev/null | grep -q started; then
+            main_restart_done=1
+            rc=0
+          fi
+        fi
+      fi
+    fi
+
+    # ---------- 路径 C：Fallback ----------
+    if (( rc != 0 )); then
+      if (( config_changed == 1 )); then
+        pkill -x xray >/dev/null 2>&1 || true
+      fi
+
+      if start_xray_singleton_force; then
+        local waited=0
+        while ! pgrep -x xray >/dev/null 2>&1 && (( waited < 30 )); do
+          sleep 0.1
+          waited=$((waited + 1))
+        done
+
+        if pgrep -x xray >/dev/null 2>&1; then
+          main_restart_done=1
+          rc=0
+        fi
+      fi
+    fi
+
+    if (( rc != 0 )); then
+      err "Xray 重启/拉起失败"
+      _restart_xray_cleanup
+      return 1
+    fi
+  else
+    rc=0
+  fi
+
+  # -------------------------------
+  # 11. 只有主服务正常后，才做这些后处理
+  #     避免“主流程失败但状态已污染”
+  # -------------------------------
+  if (( rc == 0 )); then
+  
+    if command -v rc-service >/dev/null 2>&1 && [[ -d /run/openrc ]] && [[ -f /etc/init.d/xray ]]; then
+    if pgrep -x xray >/dev/null 2>&1 && ! rc-service xray status 2>/dev/null | grep -q started; then
+      warn "检测到 xray 已运行但尚未被 OpenRC 接管，正在自动转交给 OpenRC..."
+      if rc-service xray restart >/dev/null 2>&1; then
+        local waited_openrc=0
+        while ! rc-service xray status 2>/dev/null | grep -q started && (( waited_openrc < 30 )); do
+          sleep 0.1
+          waited_openrc=$((waited_openrc + 1))
+        done
+
+        if rc-service xray status 2>/dev/null | grep -q started; then
+          ok "Xray 已自动转交给 OpenRC 接管。"
+        else
+          warn "OpenRC 接管尝试已执行，但状态仍未显示 started。"
+        fi
+      else
+        warn "自动转交 OpenRC 失败，当前仍保持进程运行状态。"
+      fi
+    fi
+  fi
+  
+    rm -f "${IP_CACHE_FILE}_xray" "${IP_CACHE_FILE}_xray_status" /tmp/ip_probe.lock 2>/dev/null || true
+
+    apply_port_limits >/dev/null 2>&1 || true
+    sync_hy2_network >/dev/null 2>&1 || true
+    auto_optimize_cpu >/dev/null 2>&1 || true
+    update_ip_async >/dev/null 2>&1 || true
+  fi
+
+  # -------------------------------
+  # 12. 生成更准确的成功消息
+  # -------------------------------
+  if (( need_main_restart == 0 )); then
+    if [[ "$mode" == "main_only" ]]; then
+      success_msg="主服务配置无变化，且服务已在线，已跳过重启；Argo 隧道未受影响"
+    else
+      if (( argo_done == 1 )); then
+        success_msg="主服务配置无变化，且服务已在线，已跳过重启；Argo 隧道已完成同步"
+      elif (( argo_failed == 1 )); then
+        success_msg="主服务配置无变化，且服务已在线，已跳过重启；但 Argo 隧道同步存在异常"
+      else
+        success_msg="主服务配置无变化，且服务已在线，已跳过重启"
+      fi
+    fi
+  else
+    if (( config_changed == 1 )); then
+      if [[ "$mode" == "main_only" ]]; then
+        success_msg="主服务配置已更新并完成重启，Argo 隧道未受影响"
+      else
+        if (( argo_done == 1 )); then
+          success_msg="主服务配置已更新并完成重启，Argo 隧道已完成同步"
+        elif (( argo_failed == 1 )); then
+          success_msg="主服务配置已更新并完成重启，但 Argo 隧道同步存在异常"
+        else
+          success_msg="主服务配置已更新并完成重启"
+        fi
+      fi
+    else
+      if [[ "$mode" == "main_only" ]]; then
+        success_msg="主服务配置无变化，但检测到服务离线，现已重新拉起；Argo 隧道未受影响"
+      else
+        if (( argo_done == 1 )); then
+          success_msg="主服务配置无变化，但检测到服务离线，现已重新拉起；Argo 隧道已完成同步"
+        elif (( argo_failed == 1 )); then
+          success_msg="主服务配置无变化，但检测到服务离线，现已重新拉起；但 Argo 隧道同步存在异常"
+        else
+          success_msg="主服务配置无变化，但检测到服务离线，现已重新拉起"
+        fi
+      fi
+    fi
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+    ok "${success_msg} (systemd)"
+  elif is_openrc_system; then
+    ok "${success_msg} (OpenRC)"
+  else
+    ok "${success_msg} (Fallback)"
+  fi
+
+  _restart_xray_cleanup
+  return 0
+}
 # ============= 新增：自动检测并修复 MTU / PMTUD 黑洞 =============
 auto_fix_mtu_mss() {
     say "正在检测 MTU / PMTUD 黑洞问题..."
@@ -2160,42 +2961,273 @@ auto_fix_mtu_mss() {
 }
 
 
-# --- System Check & Fix Logic from original script (Simplified integration) ---
 system_check() {
   local issues=0
-  if command -v xray >/dev/null 2>&1; then ok "xray 已安装"; else err "xray 未安装"; issues=1; fi
-  if ! sync_xray_config >/dev/null 2>&1; then err "Xray 配置同步/校验失败"; issues=1; else ok "Xray 配置可用"; fi
-  
-  # --- 新增 MTU 黑洞检测 ---
-  local iface current_mtu route_mtu
-  iface=$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-  if [[ -n "$iface" ]]; then
-      current_mtu=$(ip link show "$iface" 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')
-      route_mtu=$(ip route get 1.1.1.1 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')
-      
-      if [[ -n "$route_mtu" && "$route_mtu" -lt 1500 && "$current_mtu" != "$route_mtu" ]]; then
-          err "检测到网卡 $iface 存在 MTU 不匹配 (当前:$current_mtu -> 建议:$route_mtu)，易导致节点有延迟但不通"
-          issues=1
-      else
-          ok "网络 MTU 状态良好"
-      fi
+  local warnings=0
+
+  local bin
+  local tmp_cfg=""
+  local model_cfg
+  local meta_cfg
+  local iface=""
+  local current_mtu=""
+  local route_mtu=""
+  local svc_ok=0
+
+  bin="$(_xray_bin)"
+  model_cfg="$(_model_cfg)"
+  meta_cfg="$META"
+
+  tmp_cfg="$(mktemp /tmp/xray_system_check.XXXXXX)" || {
+    err "无法创建临时检测配置文件"
+    return 1
+  }
+  tmp_cfg="${tmp_cfg}.json"
+
+  _system_check_cleanup() {
+    rm -f "$tmp_cfg" 2>/dev/null || true
+  }
+
+  if [[ -x "$bin" ]]; then
+    ok "xray 已安装"
+  else
+    err "xray 未安装"
+    issues=1
   fi
-  
+
+  if [[ -s "$model_cfg" ]]; then
+    ok "模型配置文件存在"
+  else
+    err "模型配置文件缺失：$model_cfg"
+    issues=1
+  fi
+
+  if [[ -s "$meta_cfg" ]]; then
+    ok "节点元数据文件存在"
+  else
+    warn "节点元数据文件缺失或为空：$meta_cfg，将按空元数据处理"
+    warnings=1
+  fi
+
+  if [[ -x /usr/local/bin/xray-sync ]]; then
+    if MODEL_CFG="$model_cfg" META_CFG="$meta_cfg" OUT_CFG="$tmp_cfg" /usr/local/bin/xray-sync >/dev/null 2>&1; then
+      ok "Xray 候选配置生成成功"
+    else
+      err "Xray 候选配置生成失败"
+      issues=1
+    fi
+  else
+    err "xray-sync 未安装，无法生成候选配置"
+    issues=1
+  fi
+
+  if [[ "$issues" -eq 0 ]]; then
+    if [[ -x "$bin" ]] && "$bin" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+      ok "Xray 候选配置校验通过"
+    else
+      err "Xray 候选配置校验失败"
+      issues=1
+    fi
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+    if systemctl is-active --quiet xray; then
+      ok "Xray 主服务运行正常 (systemd)"
+      svc_ok=1
+    elif pgrep -x xray >/dev/null 2>&1; then
+      warn "检测到 xray 主进程存在，但 systemd 未接管为 active"
+      warnings=1
+      svc_ok=1
+    else
+      err "Xray 主服务未运行 (systemd)"
+      issues=1
+    fi
+  elif is_openrc_system && [[ -f /etc/init.d/xray ]]; then
+    if rc-service xray status 2>/dev/null | grep -q started; then
+      ok "Xray 主服务运行正常 (OpenRC)"
+      svc_ok=1
+    elif is_xray_running; then # <--- 使用新函数
+      warn "检测到 xray 主进程存在，但 OpenRC 服务未接管为 started"
+      warnings=1
+      svc_ok=1
+    else
+      err "Xray 主服务未运行 (OpenRC)"
+      issues=1
+    fi
+  else
+    if pgrep -x xray >/dev/null 2>&1; then
+      ok "Xray 主进程存在 (Fallback)"
+      svc_ok=1
+    else
+      err "Xray 主进程未运行 (Fallback)"
+      issues=1
+    fi
+  fi
+
+  iface="$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+
+  if [[ -n "$iface" ]]; then
+    current_mtu="$(ip link show "$iface" 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')"
+    route_mtu="$(ip route get 1.1.1.1 2>/dev/null | grep -ioE 'mtu [0-9]+' | awk '{print $2}')"
+
+    if [[ -n "$route_mtu" && -n "$current_mtu" && "$route_mtu" -lt "$current_mtu" ]]; then
+      warn "检测到网卡 $iface 可能存在 MTU 不匹配 (当前:$current_mtu -> 路径建议:$route_mtu)，这可能导致部分节点高延迟或不通"
+      warnings=1
+    else
+      ok "网络 MTU 状态良好"
+    fi
+  else
+    warn "未检测到默认 IPv4 出口网卡，已跳过 MTU 检查"
+    warnings=1
+  fi
+
+  if [[ -s /etc/xray/xray_config.json ]]; then
+    ok "正式 Xray 配置文件存在"
+  else
+    warn "正式 Xray 配置文件不存在，当前可能尚未应用候选配置"
+    warnings=1
+  fi
+
+  if [[ "$issues" -eq 0 && "$warnings" -eq 0 ]]; then
+    ok "系统检查通过：未发现异常"
+  elif [[ "$issues" -eq 0 && "$warnings" -gt 0 ]]; then
+    warn "系统检查完成：未发现硬故障，但存在 ${warnings} 项告警"
+  else
+    err "系统检查完成：发现硬故障 ${issues} 项，告警 ${warnings} 项"
+  fi
+
+  _system_check_cleanup
   return "$issues"
 }
-
+# 自动执行硬故障修复的核心函数
 fix_errors() {
-  ensure_runtime_deps
-  install_xray_if_needed
-  install_systemd_service
-  
-  # --- 新增触发自动修复 MTU 和 TCP MSS ---
-  auto_fix_mtu_mss
-  
-  # Hysteria 修复逻辑保留原脚本
-}
+  local fixed_any=0
+  local had_error=0
 
-# ============= 节点添加核心逻辑 (前缀记忆增强版) =============
+  local bin
+  local model_cfg
+  local meta_cfg
+  local tmp_cfg
+
+  bin="$(_xray_bin)"
+  model_cfg="$(_model_cfg)"
+  meta_cfg="$META"
+
+  # 创建临时文件用于校验
+  tmp_cfg="$(mktemp /tmp/xray_fix_errors.XXXXXX)" || {
+    err "无法创建临时修复配置文件"
+    return 1
+  }
+  tmp_cfg="${tmp_cfg}.json"
+
+  _fix_errors_cleanup() {
+    rm -f "$tmp_cfg" 2>/dev/null || true
+  }
+
+  # 1. 补全运行依赖 (curl, jq, iproute2 等)
+  if ensure_runtime_deps; then
+    ok "运行依赖检查/补全完成"
+  else
+    err "运行依赖补全失败"
+    had_error=1
+  fi
+
+  # 2. 检查并修复核心文件
+  bin="$(_xray_bin)"
+  if [[ -x "$bin" ]]; then
+    ok "Xray 核心已存在，无需重装"
+  else
+    warn "检测到 Xray 核心缺失，正在尝试安装..."
+    if install_xray_if_needed; then
+      ok "Xray 核心安装完成"
+      fixed_any=1
+    else
+      err "Xray 核心安装失败"
+      had_error=1
+    fi
+  fi
+
+  # 3. 修复服务守护文件与 OpenRC 状态接管
+  bin="$(_xray_bin)"
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
+    ok "systemd 服务已存在"
+  elif is_openrc_system; then
+    if [[ -f /etc/init.d/xray ]]; then
+      ok "OpenRC 服务已存在"
+      # === 关键：如果进程在跑但 OpenRC 没接管，直接在这里执行转交 ===
+      if is_xray_running && ! rc-service xray status 2>/dev/null | grep -q started; then
+          warn "检测到进程运行中但未被 OpenRC 接管，正在尝试自动同步状态..."
+          if rc-service xray restart >/dev/null 2>&1; then
+              ok "OpenRC 状态同步成功"
+              fixed_any=1
+          fi
+      fi
+    else
+      # === 修复原本缺失的 OpenRC 服务重装逻辑 ===
+      warn "检测到 OpenRC 环境缺少 xray 服务，正在修复..."
+      if ensure_service_openrc >/dev/null 2>&1; then
+        ok "OpenRC 服务修复完成"
+        fixed_any=1
+      else
+        err "OpenRC 服务修复失败"
+        had_error=1
+      fi
+    fi
+  else
+    warn "当前环境不是标准 systemd/OpenRC，已跳过服务文件修复，保留 fallback 启动方式"
+  fi
+
+  # 4. 检查并同步配置文件一致性
+  if [[ -x /usr/local/bin/xray-sync && -x "$bin" ]]; then
+    if MODEL_CFG="$model_cfg" META_CFG="$meta_cfg" OUT_CFG="$tmp_cfg" /usr/local/bin/xray-sync >/dev/null 2>&1; then
+      ok "候选配置生成成功"
+
+      if "$bin" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+        ok "候选配置校验通过"
+
+        # 如果正式配置文件不存在，或与生成的候选配置不一致，则覆盖
+        if [[ ! -f /etc/xray/xray_config.json ]] || ! cmp -s "$tmp_cfg" /etc/xray/xray_config.json; then
+          if install -m 0644 "$tmp_cfg" /etc/xray/xray_config.json; then
+            ok "正式配置已修复/更新"
+            fixed_any=1
+          else
+            err "正式配置写入失败"
+            had_error=1
+          fi
+        else
+          ok "正式配置已是最新，无需覆盖"
+        fi
+      else
+        err "候选配置校验失败，未写入正式配置"
+        had_error=1
+      fi
+    else
+      err "候选配置生成失败"
+      had_error=1
+    fi
+  else
+    warn "缺少 xray-sync 或 xray 核心，已跳过配置修复"
+  fi
+
+  # 5. 提示
+  warn "已跳过自动 MTU/MSS 修复；如确有网络黑洞问题，请在网络修复菜单中单独执行"
+
+  # 汇总结果
+  if [[ "$had_error" -ne 0 ]]; then
+    err "自动修复完成，但仍存在未修复的问题，请查看上方输出。"
+    _fix_errors_cleanup
+    return 1
+  fi
+
+  if [[ "$fixed_any" -eq 1 ]]; then
+    ok "自动修复完成：已修复一项或多项问题。"
+  else
+    ok "自动修复完成：未发现需要实际变更的项目。"
+  fi
+
+  _fix_errors_cleanup
+  return 0
+}
 add_node() {
     # 1. 环境预检与时间同步
     ensure_runtime_deps
@@ -2528,46 +3560,61 @@ argo_menu_wrapper() {
         fi
     }
 
-    # --- 增强版：重启并同步出口配置 ---
+    # --- 增强版：重启并同步出口配置 (智能重载版) ---
     restart_argo_services() {
-    say "正在重新同步固定隧道出口并重启 (临时隧道保持不动)..."
-    
-    # 1. 获取当前最新的全局出口偏好
-    local pref ds lock_ip
-    IFS=$'\t' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
+        say "正在智能同步固定隧道出口 (仅重启变动项)..."
 
-    local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
-    [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
+        # 1. 获取当前最新的全局出口偏好
+        local pref ds lock_ip
+        IFS=$'\t' read -r pref ds lock_ip < <(_get_global_egress_pref_and_lock)
 
-    # 2. 精准清理：只清理固定隧道进程，跳过带 _temp 后缀的临时进程
-    # 只针对带 token 的 cloudflared 和 argo_users 目录下的 xray 进行清理
-    pkill -f "cloudflared.*--token" >/dev/null 2>&1
-    pkill -f "/root/agsbx/xray.*argo_users" >/dev/null 2>&1
-    sleep 0.5
+        # 构造新的 Outbound JSON
+        local outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" } }'
+        [[ -n "$lock_ip" ]] && outbound_json='{ "protocol": "freedom", "settings": { "domainStrategy": "'$ds'" }, "sendThrough": "'$lock_ip'" }'
 
-    # 3. [已彻底删除] 临时隧道重启逻辑
-    # 此处不再操作 /root/agsbx/temp_node/，以确保临时隧道域名不断开
+        # 2. [已彻底移除] 暴力全杀逻辑 (pkill -f ...)，改为下文循环内精准判断
 
-    # 4. 重新重构所有固定隧道配置并拉起
-    local tags; tags=$(jq -r 'to_entries[] | select(.value.type=="argo" and .value.token!=null) | .key' "$META" 2>/dev/null)
-    for t in $tags; do
-        local p; p=$(jq -r --arg t "$t" '.[$t].port' "$META")
-        local tk; tk=$(jq -r --arg t "$t" '.[$t].token' "$META")
-        local f_cfg="/etc/xray/argo_users/${p}.json"
-        
-        if [[ -f "$f_cfg" ]]; then
-            # 更新固定隧道的出口绑定
-            local f_tmp; f_tmp=$(mktemp)
-            jq --argjson out "[${outbound_json}]" '.outbounds = $out' "$f_cfg" > "$f_tmp" && mv "$f_tmp" "$f_cfg"
-            
-            nohup /root/agsbx/xray run -c "$f_cfg" >/dev/null 2>&1 &
-            nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$tk" >/dev/null 2>&1 &
-            say "固定隧道 [$t] 已按新出口重启"
-        fi
-    done
-    ok "固定隧道已同步重启，临时隧道保持运行 (域名未变)"
-    read -rp "按回车继续..." _
-}
+        # 3. 仅对固定隧道进行滚动检测，跳过临时隧道确保域名不断开
+        local tags
+        tags=$(jq -r 'to_entries[] | select(.value.type=="argo" and .value.token!=null) | .key' "$META" 2>/dev/null)
+
+        for t in $tags; do
+            local p
+            p=$(jq -r --arg t "$t" '.[$t].port' "$META")
+            local tk
+            tk=$(jq -r --arg t "$t" '.[$t].token' "$META")
+            local f_cfg="/etc/xray/argo_users/${p}.json"
+
+            if [[ -f "$f_cfg" ]]; then
+                # 提取并比对旧配置
+                local old_outbound
+                old_outbound=$(jq -c '.outbounds' "$f_cfg" 2>/dev/null)
+                local new_outbound="[${outbound_json}]"
+
+                # 核心优化：如果配置未变，跳过该隧道，实现 0 毫秒不断流
+                if [[ "$old_outbound" == "$new_outbound" ]]; then
+                    continue
+                fi
+
+                # 只有检测到出口配置变动时，才精准清理这一个端口的进程
+                pkill -f "/root/agsbx/xray run -c $f_cfg" >/dev/null 2>&1
+                pkill -f "cloudflared tunnel.*--token $tk" >/dev/null 2>&1
+
+                # 更新该隧道的配置文件
+                local f_tmp
+                f_tmp=$(mktemp)
+                jq --argjson out "$new_outbound" '.outbounds = $out' "$f_cfg" > "$f_tmp" && mv "$f_tmp" "$f_cfg"
+
+                # 重新拉起受影响的隧道
+                nohup /root/agsbx/xray run -c "$f_cfg" >/dev/null 2>&1 &
+                nohup /root/agsbx/cloudflared tunnel --no-autoupdate --protocol http2 run --token "$tk" >/dev/null 2>&1 &
+                say "固定隧道 [$t] 出口已同步并重启"
+            fi
+        done
+
+        ok "智能同步完成，未改动出口的隧道保持 0 毫秒不断流。"
+        read -rp "按回车继续..." _
+    }
     # --- 3. 固定隧道 (支持自定义端口) ---
     add_argo_user() {
         ensure_argo_deps
@@ -2578,8 +3625,6 @@ argo_menu_wrapper() {
 
         # 新增：自定义端口逻辑
         read -rp "请输入本地监听端口 (留空则自动分配): " input_port
-        local link
-link="vmess://$(echo -n "$vm_json" | base64 -w 0)"
         
         # 简单检查端口占用
         if lsof -i:"$port" >/dev/null 2>&1; then
@@ -3571,8 +4616,7 @@ status_menu() {
         echo ""
 
         # 调用 safe_read，sc 已在顶部声明
-        local sc=""  # 👈 新增初始化
-safe_read sc " 请输入选项: "
+        safe_read sc " 请输入选项: "
 
         case "$sc" in
             1)
@@ -4633,7 +5677,7 @@ set_node_routing() {
 
     # domains 字符串拆成数组（按空格）
     local dom_json
-    dom_json=$(printf "%s\n" "$domains" | jq -R -s 'split("\n") | map(select(length>0))')
+    dom_json=$(echo "$domains" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s -c .)
 
     local rule
     rule=$(jq -n --arg inb "$selected_inbound" --arg out "$selected_outbound_tag" --arg kind "media-split-$key" --argjson dom "$dom_json" \

@@ -802,7 +802,7 @@ is_xray_running() {
         pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1 && return 0
     fi
     # 2. 兜底方案：直接扫描进程表路径 (Alpine/BusyBox 最稳)
-    ps aux | grep -v grep | grep -q "/usr/local/bin/xray" && return 0
+    pgrep -f "/usr/local/bin/xray" >/dev/null 2>&1 && return 0
     return 1
 }
 
@@ -1463,12 +1463,6 @@ check_and_repair_menu() {
   # 3. 若执行过修复，则判断是否真的需要重启
   # --------------------------------------------------
   if (( did_fix == 1 )); then
-    if _svc_running_for_repair_menu; then
-      after_running=1
-    else
-      after_running=0
-    fi
-
     after_hash="$(_cfg_hash_for_repair_menu)"
 
     # 仅在以下情况才考虑重启：
@@ -2135,7 +2129,6 @@ start_xray_singleton_force() {
   local tries=0
   local alive_rounds=0
   local is_alive=0
-  local pidfile="/run/xray.pid"
   local bin="/usr/local/bin/xray"
 
   mkdir -p /usr/local/etc/xray /etc/xray
@@ -2432,7 +2425,7 @@ sync_and_restart_argo() {
             eval "exec ${lock_fd}>&-"
         }
 
-        tmp_cfg="$(mktemp /tmp/argo_user_${p}.XXXXXX)" || {
+        tmp_cfg="$(mktemp "/tmp/argo_user_${p}.XXXXXX")" || {
             err "固定隧道 [$t] 无法创建临时配置文件，已跳过。"
             failed_count=$((failed_count + 1))
             _sync_and_restart_argo_cleanup_one
@@ -2569,8 +2562,6 @@ restart_xray() {
   local config_changed=0
   local service_was_running=0
   local need_main_restart=0
-  local main_restart_done=0
-  local main_started_only=0
 
   local argo_done=0
   local argo_failed=0
@@ -2695,11 +2686,9 @@ restart_xray() {
     need_main_restart=1
   elif (( service_was_running == 0 )); then
     need_main_restart=1
-    main_started_only=1
   else
     need_main_restart=0
   fi
-
   # -------------------------------
   # 10. 主 Xray 仅在“真的需要”时才重启/拉起
   # -------------------------------
@@ -2969,10 +2958,9 @@ system_check() {
   local tmp_cfg=""
   local model_cfg
   local meta_cfg
-  local iface=""
-  local current_mtu=""
-  local route_mtu=""
-  local svc_ok=0
+  local iface
+  local current_mtu
+  local route_mtu
 
   bin="$(_xray_bin)"
   model_cfg="$(_model_cfg)"
@@ -3030,14 +3018,13 @@ system_check() {
     fi
   fi
 
+  # 检查服务状态
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
     if systemctl is-active --quiet xray; then
       ok "Xray 主服务运行正常 (systemd)"
-      svc_ok=1
     elif pgrep -x xray >/dev/null 2>&1; then
-      warn "检测到 xray 主进程存在，但 systemd 未接管为 active"
+      warn "检测到 xray主进程存在，但 systemd 未接管为 active"
       warnings=1
-      svc_ok=1
     else
       err "Xray 主服务未运行 (systemd)"
       issues=1
@@ -3045,11 +3032,9 @@ system_check() {
   elif is_openrc_system && [[ -f /etc/init.d/xray ]]; then
     if rc-service xray status 2>/dev/null | grep -q started; then
       ok "Xray 主服务运行正常 (OpenRC)"
-      svc_ok=1
-    elif is_xray_running; then # <--- 使用新函数
+    elif is_xray_running; then
       warn "检测到 xray 主进程存在，但 OpenRC 服务未接管为 started"
       warnings=1
-      svc_ok=1
     else
       err "Xray 主服务未运行 (OpenRC)"
       issues=1
@@ -3057,13 +3042,13 @@ system_check() {
   else
     if pgrep -x xray >/dev/null 2>&1; then
       ok "Xray 主进程存在 (Fallback)"
-      svc_ok=1
     else
       err "Xray 主进程未运行 (Fallback)"
       issues=1
     fi
   fi
 
+  # 网络 MTU 检查 - 修复 SC2155
   iface="$(ip -4 route ls 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
 
   if [[ -n "$iface" ]]; then
@@ -3088,6 +3073,7 @@ system_check() {
     warnings=1
   fi
 
+  # 最终汇总
   if [[ "$issues" -eq 0 && "$warnings" -eq 0 ]]; then
     ok "系统检查通过：未发现异常"
   elif [[ "$issues" -eq 0 && "$warnings" -gt 0 ]]; then
@@ -4041,7 +4027,8 @@ delete_node() {
 
 import_link_outbound() {
     local link="$1"
-    local tag="IMP-$(date +%s)"
+    local tag
+tag="IMP-$(date +%s)"
     local type="" server="" port="" pass="" new_node=""
     
     say "正在启动专业级解析与内核预校验..."
@@ -4123,7 +4110,8 @@ import_link_outbound() {
             IFS='&' read -r -a _pairs <<< "$qs"
             for kv in "${_pairs[@]}"; do
                 local k="${kv%%=*}"
-                local v="$(_urldecode "${kv#*=}")"
+                local v
+                v="$(_urldecode "${kv#*=}")"
                 case "$k" in
                     flow) flow="$v" ;;
                     sni) sni="$v" ;;
@@ -4177,15 +4165,19 @@ import_link_outbound() {
         
         server=$(echo "$decoded" | jq -r '.add // empty')
         port=$(echo "$decoded" | jq -r '.port // empty')
-        local uuid=$(echo "$decoded" | jq -r '.id // empty')
         
+        # 将所有的局部变量统一在顶部声明
+        local uuid net path host tls sni
+        
+        uuid=$(echo "$decoded" | jq -r '.id // empty')
         [[ -z "$uuid" ]] && { err "VMess 链接解析失败：缺少 UUID"; return 1; }
         
-        local net=$(echo "$decoded" | jq -r '.net // "tcp"')
-        local path=$(echo "$decoded" | jq -r '.path // ""')
-        local host=$(echo "$decoded" | jq -r '.host // ""')
-        local tls=$(echo "$decoded" | jq -r '.tls // "none"')
-        local sni=$(echo "$decoded" | jq -r '.sni // ""')
+        # 下面只做赋值，去掉 local
+        net=$(echo "$decoded" | jq -r '.net // "tcp"')
+        path=$(echo "$decoded" | jq -r '.path // ""')
+        host=$(echo "$decoded" | jq -r '.host // ""')
+        tls=$(echo "$decoded" | jq -r '.tls // "none"')
+        sni=$(echo "$decoded" | jq -r '.sni // ""')
         
         new_node=$(jq -n --arg t "$tag" --arg s "$server" --arg p "$port" --arg u "$uuid" \
             --arg net "$net" --arg path "$path" --arg host "$host" --arg tls "$tls" --arg sni "$sni" '

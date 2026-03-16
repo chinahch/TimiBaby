@@ -5596,7 +5596,7 @@ set_node_routing() {
   done
   echo -e " ${C_GREEN}[g]${C_RESET} ${C_PURPLE}全局流量 (该入站所有流量都走该落地)${C_RESET}"
   echo -e " ${C_GREEN}[a]${C_RESET} 全选"
-  read -rp "请选择 (支持 g/a/数字, 逗号分隔): " sel_raw
+  read -rp "请选择 (支持 g/a/数字, 空格分隔): " sel_raw
   [[ -z "${sel_raw:-}" || "$sel_raw" == "0" ]] && return
 
   # --- 5) 写规则：先清理该 inbound 旧的 media-split 规则，再写入新规则 ---
@@ -5619,7 +5619,7 @@ set_node_routing() {
 
   # 解析选择
   local want_global=0
-  if echo "$sel_raw" | grep -qiE '(^|,)\s*g\s*(,|$)'; then
+  if echo "$sel_raw" | grep -qiE '(^|[[:space:]])g([[:space:]]|$)'; then
     want_global=1
   fi
 
@@ -5646,14 +5646,13 @@ set_node_routing() {
 
   # 分类模式：进入分类分流前，清理该入站的全局落地兜底，避免继续覆盖分类规则
   local -a selected_nums=()
-  if echo "$sel_raw" | grep -qiE '(^|,)\s*a\s*(,|$)'; then
+  if echo "$sel_raw" | grep -qiE '(^|[[:space:]])a([[:space:]]|$)'; then
     # 全选 -> 1..N
     local n="${#CAT_KEYS[@]}"
     for ((x=1; x<=n; x++)); do selected_nums+=("$x"); done
   else
-    IFS=',' read -ra parts <<<"$sel_raw"
-    for p in "${parts[@]}"; do
-      p="$(echo "$p" | tr -d '[:space:]')"
+    # 直接遍历 sel_raw，Bash 默认会按空格/换行切分单词
+    for p in $sel_raw; do
       [[ "$p" =~ ^[0-9]+$ ]] && selected_nums+=("$p")
     done
   fi
